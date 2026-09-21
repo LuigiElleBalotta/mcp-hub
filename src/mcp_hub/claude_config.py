@@ -12,6 +12,14 @@ from mcp_hub.config import Config, ServerConfig
 def backup_file(path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = path.with_name(f"{path.name}.bak-{timestamp}")
+    if backup.exists():
+        counter = 1
+        while True:
+            candidate = path.with_name(f"{path.name}.bak-{timestamp}-{counter}")
+            if not candidate.exists():
+                backup = candidate
+                break
+            counter += 1
     shutil.copy2(path, backup)
     return backup
 
@@ -66,9 +74,22 @@ def apply_servers(
         migrated.append(name)
 
     tmp_path = claude_config_path.with_suffix(claude_config_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp_path, claude_config_path)
+    try:
+        # Write to a staging file and validate ITS content before the live
+        # file is ever touched. If either the write or the validation fails
+        # (disk full, truncated write, interrupted process, etc.), the
+        # temp file is discarded and os.replace is never reached -- the
+        # live claude_config_path is left completely untouched (the backup
+        # taken above is also still there, unaffected).
+        tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        json.loads(tmp_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise ValueError(
+            f"refusing to update {claude_config_path}: staged write failed validation ({exc})"
+        ) from exc
 
-    # verify the write is valid JSON before declaring success
-    json.loads(claude_config_path.read_text(encoding="utf-8"))
+    # Only now, after the staged content has been proven to be valid JSON,
+    # does the atomic replace make the new content live.
+    os.replace(tmp_path, claude_config_path)
     return migrated
