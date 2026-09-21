@@ -799,6 +799,7 @@ from __future__ import annotations
 
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
+from starlette.responses import Response
 from starlette.routing import Mount, Route
 
 from mcp_hub.manager import HubManager
@@ -806,7 +807,13 @@ from mcp_hub.manager import HubManager
 
 def _mount_for(name: str, manager: HubManager) -> Mount:
     managed = manager.get(name)
-    transport = SseServerTransport(f"/{name}/messages")
+    # Endpoint is relative to THIS mount's root_path (Starlette sets it from
+    # the outer Mount(f"/{name}", ...) below) — do NOT repeat the server name
+    # here. Confirmed in Task 2's spike (scripts/spike_multi_mount.py):
+    # f"/{name}/messages" doubles the prefix into "/{name}/{name}/messages"
+    # and breaks every client POST. Trailing slash matches Mount("/messages/", ...)
+    # below and avoids an extra 307 redirect.
+    transport = SseServerTransport("/messages/")
 
     async def handle_sse(request):
         async def guarded_run():
@@ -814,10 +821,11 @@ def _mount_for(name: str, manager: HubManager) -> Mount:
             async with transport.connect_sse(request.scope, request.receive, request._send) as (read, write):
                 await _proxy(read, write, managed)
         await managed.guard.run(guarded_run)
+        return Response()  # avoids a TypeError on client disconnect (Task 2 spike finding)
 
     return Mount(f"/{name}", routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages", app=transport.handle_post_message),
+        Route("/sse", endpoint=handle_sse, methods=["GET"]),
+        Mount("/messages/", app=transport.handle_post_message),
     ])
 
 
@@ -845,14 +853,23 @@ def build_app(manager: HubManager) -> Starlette:
     return Starlette(routes=routes)
 ```
 
-Note: `_proxy`'s exact framing depends on what Task 2's spike confirmed about
-the SDK's `read`/`write` stream types — adjust the two inner functions to
-match the concrete stream API the spike exercised (the spike used
-`server.run(read, write, ...)` directly against an in-process `Server`; here
-`read`/`write` must instead be bridged to the managed subprocess's real
-stdio pipes). Treat this as the one place in the codebase where the Task 2
-spike's findings get codified for production use — if the spike's pattern
-differs from what's sketched here, follow the spike, not this snippet.
+**Resolved by Task 2's spike** (`scripts/spike_multi_mount.py`, commit
+`557f99a`; installed SDK is `mcp==2.2.0`): the mounting/routing mechanics
+above (`SseServerTransport("/messages/")`, the nested `Mount`, returning
+`Response()` from the SSE handler) are exactly what the spike proved works,
+copied verbatim from the working spike code — not a guess. The one thing
+the spike did NOT exercise is `_proxy` itself: the spike ran an in-process
+`mcp.server.lowlevel.Server(name, on_list_tools=..., on_call_tool=...)` and
+called `server.run(read, write, ...)` against it, whereas `_proxy` here
+bridges `read`/`write` to a **real external subprocess's stdio** instead of
+an in-process `Server` object — there is no in-process `Server` in the hub's
+real design, `_proxy` is a raw byte/frame pump. Treat `_proxy`'s body as the
+one part of this task still needing implementation-time verification: the
+`read`/`write` objects yielded by `transport.connect_sse(...)` are the
+stream types `mcp.server.sse` provides for this pattern — write against
+their actual iteration/`send` API as installed, matching the spike's
+demonstrated usage of the same call (`async with transport.connect_sse(...)
+as (read, write)`), and confirm with Step 2's smoke test before moving on.
 
 - [ ] **Step 2: Write the manual smoke-test script**
 
