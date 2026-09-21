@@ -30,6 +30,7 @@
 """
 import asyncio
 import contextlib
+import importlib.util
 import sys
 import time
 from pathlib import Path
@@ -44,6 +45,7 @@ from mcp_hub.hub_app import _proxy
 from mcp_hub.manager import ManagedServer
 
 FAKE_SERVER = str(Path(__file__).parent / "fixtures" / "fake_stdio_server.py")
+CONCURRENCY_CHECK_SCRIPT = Path(__file__).parent.parent / "scripts" / "concurrency_check.py"
 
 
 def _server_config(concurrency: str) -> ServerConfig:
@@ -535,6 +537,70 @@ async def test_orphaned_hub_id_response_is_not_broadcast_to_other_clients():
         await conn_b.close()
     finally:
         await server.stop()
+
+
+def _load_concurrency_check_module():
+    """`scripts/` isn't a package (no `__init__.py`, not installed), so this
+    loads `concurrency_check.py` directly from its file path -- reusing its
+    actual `_DISPATCH_RE` rather than a hand-copied duplicate, so THIS test
+    fails the moment the two files' regex and log-line format drift apart,
+    instead of two maintained-separately copies silently agreeing with each
+    other while disagreeing with the real log line hub_app.py writes."""
+    spec = importlib.util.spec_from_file_location("concurrency_check", CONCURRENCY_CHECK_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_hub_dispatch_log_lines_are_parseable_by_concurrency_check():
+    """Task 13 follow-up (review finding): `scripts/concurrency_check.py`'s
+    proof that an `exclusive` server's dispatch is genuinely serialized
+    depends entirely on `write_and_maybe_wait()` (hub_app.py) writing
+    `[hub-dispatch] phase=.../id=.../method=.../t=...` lines into
+    `managed.logs` in a shape the script's `_DISPATCH_RE` can parse. Nothing
+    else couples these two files together -- if hub_app.py's log line format
+    ever drifts, the script would silently start reporting "hub-side
+    dispatch windows OVERLAP" (or "found 0 windows"), i.e. it would look like
+    the concurrency GUARD broke, which is a worse failure mode than the
+    misleading-client-timestamps problem this whole fix exists to close.
+
+    Drives one real request through `_proxy` against the fake subprocess and
+    asserts `managed.logs` contains a start/done pair for it that the
+    script's OWN regex parses out cleanly, with matching ids -- i.e. this
+    fails if either side of the contract moves without the other.
+    """
+    concurrency_check = _load_concurrency_check_module()
+    server = await _start_managed("exclusive")
+    try:
+        conn = _Connection(server)
+        conn.open()
+        await conn.send(1, "test/echo", {"value": "hello"})
+        reply = await conn.recv(timeout=5.0)
+        assert reply["result"] == {"echo": "hello"}
+        await conn.close()
+    finally:
+        await server.stop()
+
+    starts, dones = [], []
+    for line in server.logs:
+        m = concurrency_check._DISPATCH_RE.search(line)
+        if not m or m.group("method") != "test/echo":
+            continue
+        (starts if m.group("phase") == "start" else dones).append(m.group("id"))
+
+    assert starts, (
+        "expected a '[hub-dispatch] phase=start ... method=test/echo' line "
+        f"parseable by concurrency_check.py's own regex in managed.logs, got: {list(server.logs)}"
+    )
+    assert dones, (
+        "expected a '[hub-dispatch] phase=done ... method=test/echo' line "
+        f"parseable by concurrency_check.py's own regex in managed.logs, got: {list(server.logs)}"
+    )
+    assert len(starts) == 1 and starts == dones, (
+        "expected exactly one start/done pair, both reporting the SAME "
+        f"hub-generated id for this one request; got starts={starts} dones={dones}"
+    )
 
 
 @pytest.mark.asyncio

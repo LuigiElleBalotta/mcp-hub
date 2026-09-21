@@ -189,23 +189,19 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                     f"[hub-dispatch] phase=start id={hub_id} method={obj.get('method')} "
                     f"t={time.monotonic():.6f}"
                 )
+            # Tracks whether "done" was already logged, so the broad
+            # `except Exception` below (covering the stdin write/drain AND
+            # the awaited response, not just the latter) can't double-log an
+            # "error" after a successful dispatch that only failed later,
+            # during `deliver()`'s SSE send -- that's a delivery problem, not
+            # a dispatch one, and this timing is specifically NOT about the
+            # delivery leg (see comment above `deliver` below).
+            dispatch_done_logged = False
             try:
                 managed.process.stdin.write((payload_text + "\n").encode("utf-8"))
                 await managed.process.stdin.drain()
                 if fut is not None:
-                    try:
-                        response_obj = await fut
-                    except Exception:
-                        # Log the "error" outcome too (not just the happy
-                        # path): a reader waiting to pair this id's
-                        # start/done lines must not hang or mis-parse if the
-                        # subprocess died or the guard's wait was otherwise
-                        # rejected mid-flight (see `_reject_pending`).
-                        managed.append_log(
-                            f"[hub-dispatch] phase=error id={hub_id} method={obj.get('method')} "
-                            f"t={time.monotonic():.6f}"
-                        )
-                        raise
+                    response_obj = await fut
                     # Logged BEFORE `deliver(...)`: `deliver` hands the
                     # response to the SSE transport, which is exactly the
                     # downstream leg this timing is meant to exclude from the
@@ -214,8 +210,22 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                         f"[hub-dispatch] phase=done id={hub_id} method={obj.get('method')} "
                         f"t={time.monotonic():.6f}"
                     )
+                    dispatch_done_logged = True
                     response_obj = {**response_obj, "id": client_id}
                     await deliver(response_obj)
+            except Exception:
+                # Log the "error" outcome too (not just the happy path): a
+                # reader waiting to pair this id's start/outcome lines must
+                # not hang or mis-parse if the stdin write/drain itself
+                # raises, or the subprocess died, or the guard's wait was
+                # otherwise rejected mid-flight (see `_reject_pending`) --
+                # any of those leaves `fut` without a "done".
+                if fut is not None and not dispatch_done_logged:
+                    managed.append_log(
+                        f"[hub-dispatch] phase=error id={hub_id} method={obj.get('method')} "
+                        f"t={time.monotonic():.6f}"
+                    )
+                raise
             finally:
                 if fut is not None:
                     managed.pending.pop(hub_id, None)
