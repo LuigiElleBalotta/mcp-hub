@@ -10,6 +10,7 @@ from starlette.applications import Starlette
 from starlette.responses import Response
 from starlette.routing import Mount, Route
 
+from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
 
 
@@ -190,4 +191,5 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
 
 def build_app(manager: HubManager) -> Starlette:
     routes = [_mount_for(name, manager) for name, sc in manager.config.servers.items() if sc.enabled]
+    routes += management_routes(manager)
     return Starlette(routes=routes)
