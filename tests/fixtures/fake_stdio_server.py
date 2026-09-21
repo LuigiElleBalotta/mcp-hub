@@ -13,8 +13,12 @@ Supported methods:
   - "test/sleep": {"params": {"seconds": N}} -> waits N seconds, then
     {"result": {"slept": N}} (used to observe request-level, not
     session-level, serialization under an "exclusive" guard)
+  - "test/die": exits the process immediately, WITHOUT writing any response
+    (used to simulate a subprocess crashing/dying while a request is still
+    in flight, per the round-2 review's Critical finding)
 """
 import json
+import os
 import sys
 import time
 
@@ -36,6 +40,11 @@ def main() -> None:
         elif method == "test/sleep":
             time.sleep(float(params.get("seconds", 0)))
             result = {"slept": params.get("seconds", 0)}
+        elif method == "test/die":
+            # Hard-exit with no response and no clean shutdown: closes stdout
+            # immediately, simulating a crash while this request is still
+            # registered as in-flight on the hub side.
+            os._exit(1)
         else:
             result = {}
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import itertools
 import json
 import os
 import re
@@ -51,12 +52,42 @@ class ManagedServer:
     pending: dict[Any, asyncio.Future] = field(default_factory=dict, init=False, repr=False)
     subscribers: set[Callable[[dict], Awaitable[None]]] = field(default_factory=set, init=False, repr=False)
     _reader_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    # Backs `next_request_id()` (round-2 review fix, see below): a hub-owned,
+    # monotonically increasing counter scoped to this ManagedServer instance.
+    # Never reset (including across a stop()/start() restart reusing the same
+    # object), so a value it has ever handed out is never handed out again --
+    # that is what rules out a NEW id collision being introduced by the
+    # rewriting scheme itself.
+    _id_counter: itertools.count = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
 
     def append_log(self, line: str) -> None:
         self.logs.append(_redact_line(line))
+
+    def next_request_id(self) -> str:
+        """Returns a hub-generated JSON-RPC request id, unique for the
+        lifetime of this ManagedServer, to use in place of a client-supplied
+        id when writing a request to the subprocess's shared stdin.
+
+        Round-2 review fix (Important finding): client-supplied JSON-RPC ids
+        are only unique *within* one client's own session, not across the
+        multiple concurrently-connected clients a `parallel` server allows.
+        Two independent MCP ClientSessions commonly both start numbering at
+        1 (e.g. `initialize`), so trusting the raw client id as the key into
+        the single shared `pending` dict lets one client's registration
+        silently overwrite another's, misrouting or hanging a request. The
+        hub-generated id here is prefixed with this server's name and drawn
+        from a private, ever-incrementing counter, so it is unique both
+        across concurrently in-flight requests (the property this fix is
+        for) and across the ManagedServer's entire lifetime (a stronger
+        guarantee than required, but it is what rules out the rewriting
+        scheme introducing a *new* collision between two different real
+        subprocess requests: a value this counter has ever produced is never
+        produced again, full stop).
+        """
+        return f"hub:{self.name}:{next(self._id_counter)}"
 
     def ensure_stdout_reader(self) -> None:
         """Starts the single background task that owns reading this
@@ -79,30 +110,63 @@ class ManagedServer:
         A JSON-RPC response is distinguished from a request/notification by
         shape, not by tracking directions: it carries an `id` and either
         `result` or `error`, and never a `method`.
+
+        Round-2 review fix (Critical finding): when this loop ends -- for
+        ANY reason: the subprocess crashed, `stop()` deliberately terminated
+        it, or anything else that closes stdout -- every future still in
+        `self.pending` is rejected with an exception in the `finally` below,
+        instead of being left to hang forever. `write_and_maybe_wait()` in
+        hub_app.py awaits exactly one of these futures directly inside
+        `async with self._lock:` (via `ConcurrencyGuard.run`), so making the
+        future raise, by itself, also releases an `exclusive` server's guard
+        for the next caller: `async with` releases its lock on any exception
+        propagating out of the body, not only on clean return -- no separate
+        lock-release logic is needed. `stop()` goes through this same path
+        for free: `terminate()`/`kill()` ends the subprocess, which closes
+        its stdout, which ends this loop, which lands here -- there is no
+        separate "deliberate stop" rejection path to keep in sync.
         """
         assert self.process is not None and self.process.stdout is not None
-        async for raw in self.process.stdout:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            msg_id = obj.get("id")
-            is_response = msg_id is not None and "method" not in obj and ("result" in obj or "error" in obj)
-            fut = self.pending.get(msg_id) if is_response else None
-            if fut is not None and not fut.done():
-                fut.set_result(obj)
-                continue
-            for sub in list(self.subscribers):
+        try:
+            async for raw in self.process.stdout:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
                 try:
-                    await sub(obj)
-                except Exception:
-                    # One dead/misbehaving subscriber (e.g. a connection
-                    # that's mid-teardown) must not stop delivery to the
-                    # others, nor kill this shared reader task.
-                    pass
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg_id = obj.get("id")
+                is_response = msg_id is not None and "method" not in obj and ("result" in obj or "error" in obj)
+                fut = self.pending.get(msg_id) if is_response else None
+                if fut is not None and not fut.done():
+                    fut.set_result(obj)
+                    continue
+                for sub in list(self.subscribers):
+                    try:
+                        await sub(obj)
+                    except Exception:
+                        # One dead/misbehaving subscriber (e.g. a connection
+                        # that's mid-teardown) must not stop delivery to the
+                        # others, nor kill this shared reader task.
+                        pass
+        finally:
+            self._reject_pending()
+
+    def _reject_pending(self) -> None:
+        """Rejects every future still waiting in `self.pending` (subprocess
+        gone, so nothing will ever resolve them) and clears the dict. Safe to
+        call even if `self.pending` is empty. See `_read_stdout`'s docstring
+        for why this is sufficient to also unblock an `exclusive` guard."""
+        pending, self.pending = self.pending, {}
+        if not pending:
+            return
+        exc = ConnectionError(
+            f"managed server {self.name!r} subprocess exited while this request was in flight"
+        )
+        for fut in pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
 
     async def start(self) -> None:
         self.status = "starting"

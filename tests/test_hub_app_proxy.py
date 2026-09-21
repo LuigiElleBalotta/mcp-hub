@@ -1,5 +1,5 @@
 # tests/test_hub_app_proxy.py
-"""Regression tests for the two Task 6 review findings:
+"""Regression tests for the Task 6 review findings (round 1 and round 2):
 
 1. The concurrency guard must gate one JSON-RPC request's turn on the
    subprocess, not an entire SSE connection's lifetime. Proven by driving
@@ -10,6 +10,14 @@
 2. A JSON-RPC response line longer than asyncio.StreamReader's default 64 KiB
    limit must not crash the reader. Proven with a synthetic subprocess
    (tests/fixtures/fake_stdio_server.py) that echoes back an oversized line.
+3. (Round 2, Critical) A request in flight when the subprocess dies must be
+   rejected with an exception, not hang forever -- and for an `exclusive`
+   server, a subsequent request (e.g. after a restart) must not be stuck
+   behind a permanently-deadlocked guard.
+4. (Round 2, Important) Two concurrently-connected clients on a `parallel`
+   server that happen to use the same JSON-RPC id must each get their OWN
+   response, not misroute onto each other or hang, even though the hub
+   shares one `pending` dict per subprocess across all connections.
 """
 import asyncio
 import sys
@@ -130,6 +138,113 @@ async def test_exclusive_still_serializes_individual_requests():
         # Serialized: >= ~0.6s. Generous floor to avoid flakiness while still
         # clearly ruling out concurrent (~0.3s) execution.
         assert elapsed >= 0.5, f"expected serialized (~0.6s), got {elapsed:.2f}s -- requests ran concurrently"
+
+        await conn_a.close()
+        await conn_b.close()
+    finally:
+        await server.stop()
+
+
+def _exception_messages(exc: BaseException) -> list[str]:
+    """Flattens an exception (possibly a nested exception group, which is
+    how anyio task groups surface a child task's error) into every message
+    string it or its sub-exceptions carry, so a test can assert on the
+    substance of the failure regardless of how deeply anyio wraps it."""
+    msgs = [str(exc)]
+    for sub in getattr(exc, "exceptions", ()):
+        msgs.extend(_exception_messages(sub))
+    return msgs
+
+
+@pytest.mark.asyncio
+async def test_subprocess_death_rejects_pending_request_and_unblocks_exclusive_guard():
+    """Round 2, Critical finding: a request in flight when the managed
+    subprocess dies (crash, or any other cause of stdout EOF) must be
+    rejected with an exception -- not left to hang forever with `await fut`
+    inside `write_and_maybe_wait()`. For an `exclusive` server this is also
+    what must release the guard's lock (`write_and_maybe_wait` runs directly
+    inside `async with self._lock:`), so a SUBSEQUENT request against a
+    fresh/restarted server on the same ManagedServer isn't stuck behind a
+    permanently-deadlocked guard.
+    """
+    server = await _start_managed("exclusive")
+
+    conn = _Connection(server)
+    conn.open()
+    await conn.send(1, "test/die", {})
+    # The fake subprocess exits immediately without ever writing a response
+    # to this request. The waiting connection must see an exception
+    # propagate out of `_proxy`, not hang. `conn.close()` has its own
+    # internal 5s `anyio.fail_after` around awaiting the proxy task -- relied
+    # on here as the sole timeout (nesting a second `fail_after` at the same
+    # deadline around it is unreliable: the two cancel scopes can race, and
+    # the outer one can end up swallowing the inner's exception instead of
+    # observing it, which is exactly what happened when this test was first
+    # written -- caught by manually reverting the fix and finding this
+    # version reported a false "test passed" via `DID NOT RAISE`).
+    caught: BaseException | None = None
+    try:
+        await conn.close()
+    except BaseException as exc:  # noqa: BLE001 -- intentionally broad, see below
+        caught = exc
+    assert caught is not None, (
+        "expected _proxy to raise once the subprocess died with this "
+        "request in flight -- got no exception at all (hang or silent drop)"
+    )
+    assert any("subprocess exited" in m for m in _exception_messages(caught))
+
+    # Simulate a restart: a fresh subprocess on the SAME ManagedServer, so
+    # the SAME ConcurrencyGuard/lock is reused. If the prior request's
+    # exception hadn't released the exclusive lock, this would hang forever
+    # instead of completing within the timeout below.
+    await server.start()
+    try:
+        conn2 = _Connection(server)
+        conn2.open()
+        await conn2.send(2, "test/echo", {"value": "still alive"})
+        reply = await conn2.recv(timeout=5.0)
+        assert reply["result"] == {"echo": "still alive"}
+        await conn2.close()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_colliding_client_ids_on_parallel_server_do_not_misroute():
+    """Round 2, Important finding: two independently-connected clients on a
+    `parallel` server can legitimately pick the same JSON-RPC id (e.g. both
+    starting their own numbering at 1 for `initialize`) while both have a
+    request genuinely in flight at once. Each must receive its OWN correct
+    response -- not the other's, and not hang -- even though both requests
+    are, at the hub-protocol level, id=1 sharing one subprocess's single
+    `pending` dict.
+
+    Connection A's request is deliberately slower (`test/sleep`) than B's
+    (`test/echo`) so that both registrations are genuinely concurrent in
+    `managed.pending` -- widening the window in which the pre-fix code (keyed
+    by the raw client id) would have let B's registration overwrite A's,
+    per the review's exact described failure mode.
+    """
+    server = await _start_managed("parallel")
+    try:
+        conn_a = _Connection(server)
+        conn_a.open()
+        conn_b = _Connection(server)
+        conn_b.open()
+
+        await conn_a.send(1, "test/sleep", {"seconds": 0.3})
+        await conn_b.send(1, "test/echo", {"value": "B"})
+
+        reply_a = await conn_a.recv(timeout=5.0)
+        reply_b = await conn_b.recv(timeout=5.0)
+
+        # Each client must see ITS OWN client-supplied id (1) echoed back --
+        # the hub-generated id used internally must never leak to a client --
+        # and ITS OWN result, not the other connection's.
+        assert reply_a["id"] == 1
+        assert reply_b["id"] == 1
+        assert reply_a["result"] == {"slept": 0.3}
+        assert reply_b["result"] == {"echo": "B"}
 
         await conn_a.close()
         await conn_b.close()

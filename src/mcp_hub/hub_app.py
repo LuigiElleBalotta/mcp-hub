@@ -61,9 +61,11 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
     more than one consumer racing to read lines off the shared stream, no
     matter how many SSE connections are open concurrently. That reader
     correlates a JSON-RPC response back to whichever `_proxy` call sent the
-    matching request (by `id`, via `managed.pending`), and broadcasts
-    anything else (notifications, or a response with no matching in-flight
-    request) to every currently-connected client via `managed.subscribers`.
+    matching request, keyed by a hub-generated id (see `next_request_id` /
+    `handle_message` below) rather than the client-supplied one, via
+    `managed.pending`, and broadcasts anything else (notifications, or a
+    response with no matching in-flight request) to every currently-connected
+    client via `managed.subscribers`.
 
     Each incoming client message is handled by its own task (`handle_message`,
     spawned per message into this connection's task group) rather than
@@ -86,27 +88,45 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         assert managed.process is not None and managed.process.stdin is not None
         payload_text = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
         obj = json.loads(payload_text)
-        msg_id = obj.get("id")
+        client_id = obj.get("id")
         # A JSON-RPC request (expects a response) has both an id and a
         # method; a notification has no id; a client's response to a
         # server-initiated request has an id but no method — none of the
         # latter two get a future registered, since nothing will resolve it.
-        is_request = msg_id is not None and "method" in obj
+        is_request = client_id is not None and "method" in obj
+
+        # Round-2 review fix (Important finding): the client-supplied `id` is
+        # only unique within that one client's own session, not across the
+        # multiple SSE connections a `parallel` server allows to share this
+        # one subprocess (and `managed.pending`) concurrently. Two
+        # independent clients commonly both start numbering at 1, which would
+        # otherwise let one client's registration in `managed.pending`
+        # silently clobber another's in-flight request. Rewrite to a
+        # hub-generated id (unique for this ManagedServer's whole lifetime,
+        # see `next_request_id`) before writing to the subprocess, and
+        # restore the client's own id on the response before delivering it
+        # back — the client expects its own id echoed, per JSON-RPC, and has
+        # no knowledge of the hub-generated one.
+        hub_id = managed.next_request_id() if is_request else None
+        if hub_id is not None:
+            obj["id"] = hub_id
+            payload_text = json.dumps(obj)
 
         async def write_and_maybe_wait() -> None:
             fut: asyncio.Future | None = None
-            if is_request:
+            if hub_id is not None:
                 fut = asyncio.get_running_loop().create_future()
-                managed.pending[msg_id] = fut
+                managed.pending[hub_id] = fut
             try:
                 managed.process.stdin.write((payload_text + "\n").encode("utf-8"))
                 await managed.process.stdin.drain()
                 if fut is not None:
                     response_obj = await fut
+                    response_obj = {**response_obj, "id": client_id}
                     await deliver(response_obj)
             finally:
                 if fut is not None:
-                    managed.pending.pop(msg_id, None)
+                    managed.pending.pop(hub_id, None)
 
         await managed.guard.run(write_and_maybe_wait)
 
