@@ -29,6 +29,11 @@ class MainWindow(QMainWindow):
         add_btn.clicked.connect(self._add_server)
         layout.addWidget(add_btn)
 
+        from PySide6.QtWidgets import QCheckBox
+        self.autostart_checkbox = QCheckBox("Avvia con Windows")
+        self.autostart_checkbox.toggled.connect(self._toggle_autostart)
+        layout.addWidget(self.autostart_checkbox)
+
         self.setCentralWidget(central)
 
         from mcp_hub.gui.log_panel import LogPanel
@@ -80,6 +85,13 @@ class MainWindow(QMainWindow):
                 return
             self.client.upsert(name, dialog.result_config())
             self.refresh()
+
+    def _toggle_autostart(self, checked: bool) -> None:
+        import subprocess
+        from pathlib import Path
+        script = Path(__file__).resolve().parents[3] / "scripts" / "install_task.ps1"
+        flag = "-Enable" if checked else "-Disable"
+        subprocess.run(["powershell", "-File", str(script), flag], check=False)
 
     def _on_row_selected(self) -> None:
         row = self.table.currentRow()
