@@ -31,6 +31,11 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
+        from mcp_hub.gui.log_panel import LogPanel
+        self.log_panel = LogPanel()
+        self.table.itemSelectionChanged.connect(self._on_row_selected)
+        layout.addWidget(self.log_panel)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(2000)
@@ -75,3 +80,10 @@ class MainWindow(QMainWindow):
                 return
             self.client.upsert(name, dialog.result_config())
             self.refresh()
+
+    def _on_row_selected(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        name = self.table.item(row, 0).text()
+        self.log_panel.show_logs(name, self.client.logs(name))
