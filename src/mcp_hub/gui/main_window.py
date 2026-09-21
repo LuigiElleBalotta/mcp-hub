@@ -24,6 +24,11 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addWidget(self.table)
+
+        add_btn = QPushButton("Add server")
+        add_btn.clicked.connect(self._add_server)
+        layout.addWidget(add_btn)
+
         self.setCentralWidget(central)
 
         self.timer = QTimer(self)
@@ -58,3 +63,15 @@ class MainWindow(QMainWindow):
     def _stop(self, name: str) -> None:
         self.client.stop(name)
         self.refresh()
+
+    def _add_server(self) -> None:
+        from mcp_hub.gui.server_dialog import ServerDialog
+        from PySide6.QtWidgets import QMessageBox
+        dialog = ServerDialog(parent=self)
+        if dialog.exec():
+            name = dialog.result_name()
+            if not name:
+                QMessageBox.warning(self, "Add server", "Name cannot be empty.")
+                return
+            self.client.upsert(name, dialog.result_config())
+            self.refresh()
