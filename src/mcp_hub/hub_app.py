@@ -132,6 +132,33 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                 raise ConnectionError(
                     f"managed server {managed.name!r} subprocess is not running"
                 )
+            # Round-3 review fix: `ensure_stdout_reader()` is otherwise only
+            # called once per connection, at connection-open, before this
+            # per-message loop even starts. If the subprocess dies mid
+            # connection, that ONE shared reader observes EOF, rejects
+            # whatever was pending at that instant, and exits -- no new
+            # reader is spawned for this still-open connection. A second
+            # message pipelined on the SAME connection after that point then
+            # depended entirely on the `returncode` check above to avoid
+            # registering an orphaned future, but `returncode` is only
+            # updated once asyncio's subprocess transport notices the child
+            # exited -- not guaranteed to have happened yet at the exact
+            # instant stdout EOF was observed by the reader. Calling
+            # `ensure_stdout_reader()` again here, immediately before
+            # registering anything in `pending`, closes that window
+            # regardless of `returncode` timing: it is idempotent (a no-op
+            # while a reader is already running), so this is cheap on the
+            # hot path, but if the previous reader already ran to completion
+            # it spawns a fresh one *before* the future below exists. That
+            # new reader, whether it finds the process still alive or
+            # already dead (immediate EOF), always ends in `_reject_pending()`
+            # once it exits -- and since spawning it and registering the
+            # future are both synchronous statements with no `await` between
+            # them, the new reader cannot get a turn to run (and reject
+            # `pending`) until this coroutine's next `await`, by which time
+            # the future is already registered. So the future is always
+            # either resolved normally or rejected -- never orphaned.
+            managed.ensure_stdout_reader()
             fut: asyncio.Future | None = None
             if hub_id is not None:
                 fut = asyncio.get_running_loop().create_future()

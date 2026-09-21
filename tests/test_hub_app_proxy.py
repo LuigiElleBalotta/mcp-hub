@@ -21,6 +21,12 @@
    shares one `pending` dict per subprocess across all connections -- and a
    response to an abandoned hub-generated request must never leak to some
    other, unrelated client.
+5. (Round 3) `ensure_stdout_reader()` is only called once per connection, at
+   connection-open, before the per-message loop -- not per message. A SECOND
+   message pipelined on the SAME, already-open connection, sent after that
+   connection's one shared reader has already exited (subprocess died), must
+   not depend solely on `returncode` (updated asynchronously, not guaranteed
+   to have flipped yet) to avoid registering an orphaned future.
 """
 import asyncio
 import contextlib
@@ -61,6 +67,16 @@ def _request(req_id, method: str, params: dict) -> SessionMessage:
     return SessionMessage(jsonrpc_message_adapter.validate_python(obj))
 
 
+def _notification(method: str, params: dict) -> SessionMessage:
+    # No "id" key at all (a real JSON-RPC notification): `write_and_maybe_wait`
+    # never registers a future for one (`is_request` requires an id), so
+    # sending this doesn't make `handle_message`'s task await anything -- it
+    # can't itself raise/fail, which is what keeps a connection's task group
+    # alive so a genuinely SECOND message can still reach it afterward.
+    obj = {"jsonrpc": "2.0", "method": method, "params": params}
+    return SessionMessage(jsonrpc_message_adapter.validate_python(obj))
+
+
 class _Connection:
     """One simulated SSE client: owns its own read/write memory streams and
     drives `_proxy` against a shared ManagedServer, exactly like one
@@ -77,6 +93,9 @@ class _Connection:
 
     async def send(self, req_id, method: str, params: dict) -> None:
         await self._read_send.send(_request(req_id, method, params))
+
+    async def send_notification(self, method: str, params: dict) -> None:
+        await self._read_send.send(_notification(method, params))
 
     async def recv(self, timeout: float = 5.0) -> dict:
         with anyio.fail_after(timeout):
@@ -263,6 +282,150 @@ async def test_request_after_dead_reader_fails_fast_without_a_restart():
         )
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_second_message_on_same_open_connection_after_reader_exit_does_not_hang(monkeypatch):
+    """Round 3 review finding: `ensure_stdout_reader()` was only called once
+    per connection, at connection-open, before the per-message loop -- not
+    per message. If the subprocess dies mid-connection, that one shared
+    reader observes EOF, rejects whatever was pending at that instant, and
+    exits; no new reader is spawned for this SAME, still-open connection. A
+    SECOND message pipelined on that same connection then depended entirely
+    on `write_and_maybe_wait()`'s `returncode`-based fail-fast check to avoid
+    registering an orphaned future -- and `returncode` is only updated once
+    asyncio's subprocess transport notices the child exited, asynchronously,
+    not guaranteed to have happened yet at the exact instant stdout EOF was
+    observed by the reader.
+
+    This drives that exact scenario end-to-end on ONE `_Connection` (per the
+    review's explicit instruction not to rely on a brand-new `_proxy()`/
+    connection). Message 1 is a *notification* (`test/die`, no `id`), which
+    kills the subprocess WITHOUT registering a future of its own --
+    `write_and_maybe_wait` never awaits anything for a notification, so its
+    task can't itself raise and tear down this connection's task group,
+    which is what lets a genuinely second message still reach the SAME
+    connection afterward (a request as message 1 would fail and cancel the
+    whole group the moment the old reader rejected it, masking the very
+    thing this test needs to observe).
+
+    Once the original shared reader has fully exited (polled below), the
+    test forces the exact race the finding describes -- reader already gone,
+    `returncode` still observably `None` -- by monkeypatching this specific
+    subprocess's `returncode` to stay `None`, rather than hoping real OS
+    timing happens to land in that window (unreliable: `returncode` can
+    already be set for real by the time polling detects the reader is done,
+    which would let the test pass for a reason unrelated to the fix under
+    test). Writing to the subprocess's stdin is ALSO neutralized (patched to
+    a no-op): on this platform, a write to an already-dead stdin pipe was
+    independently found (round 2 of this task's fix reports) to fail fast on
+    its own too, which would otherwise let this test pass even without the
+    round-3 fix, for that unrelated reason, rather than because
+    `ensure_stdout_reader()` respawned a reader. With both of those
+    short-circuits neutralized, the SECOND message's future can only ever be
+    resolved by a live stdout reader -- so this test is a clean, isolated
+    check of the one thing the round-3 fix actually changes.
+    """
+    server = await _start_managed("exclusive")
+    try:
+        await _drive_second_message_after_reader_exit(server, monkeypatch)
+    finally:
+        # Undo the `returncode`/stdin patches before cleanup: the subprocess
+        # is already dead for real, and `stop()` reading the patched
+        # (forced-`None`) `returncode` would try to `terminate()` a process
+        # that no longer exists, raising `ProcessLookupError` -- unrelated to
+        # this test. `monkeypatch.undo()` is safe to call even if pytest's
+        # fixture teardown will also call it.
+        monkeypatch.undo()
+        await server.stop()
+
+
+async def _drive_second_message_after_reader_exit(server, monkeypatch) -> None:
+    conn = _Connection(server)
+    conn.open()
+
+    await conn.send_notification("test/die", {})
+
+    # Wait for the ORIGINAL shared reader (spawned once at connection-open)
+    # to fully observe the subprocess's death and exit -- the precondition
+    # the finding describes ("no new reader will ever be spawned for this
+    # same, still-open connection" until something asks again).
+    for _ in range(50):
+        if server._reader_task is not None and server._reader_task.done():
+            break
+        await asyncio.sleep(0.05)
+    assert server._reader_task is not None and server._reader_task.done()
+
+    # Force the narrow window deterministically: the reader is provably gone
+    # (asserted above), but `returncode` still reads as `None`, exactly as
+    # the finding says can happen. This isolates the fix under test (the
+    # extra `ensure_stdout_reader()` call) from `write_and_maybe_wait()`'s
+    # pre-existing `returncode` check, which must NOT be what saves this
+    # request.
+    # `returncode` is a read-only property (`self._transport.get_returncode()`)
+    # with no setter, so it can't be assigned directly -- patch the
+    # underlying transport method it reads instead. This reaches into a
+    # CPython-private `asyncio.subprocess.Process._transport` attribute; if a
+    # future Python version changes that internal, this specific patch (not
+    # the fix under test) is the first thing to check.
+    assert server.process is not None
+    monkeypatch.setattr(server.process._transport, "get_returncode", lambda: None)
+
+    # Also neutralize the stdin write/drain path (see docstring above): a
+    # write to the already-dead subprocess's stdin must not be the thing
+    # that saves the second message either -- only a live reader may.
+    assert server.process.stdin is not None
+
+    async def _noop_drain() -> None:
+        return None
+
+    monkeypatch.setattr(server.process.stdin, "write", lambda data: None)
+    monkeypatch.setattr(server.process.stdin, "drain", _noop_drain)
+
+    # Second message, pipelined on the SAME already-open connection -- not a
+    # new `_Connection`/`_proxy()` call.
+    await conn.send(2, "test/echo", {"value": "still open"})
+    await conn._read_send.aclose()  # same as _Connection.close()'s first step
+
+    # NOTE: deliberately NOT using `_Connection.close()`'s own
+    # `anyio.fail_after(5.0)` here. Empirically (verified with a standalone
+    # repro while writing this test), on this environment, cancelling the
+    # coroutine that's doing `await conn.task` -- whether via
+    # `anyio.fail_after` or a bare `asyncio.wait_for` without `shield` --
+    # also cancels `conn.task` itself, because CPython's
+    # `Task.cancel()` forwards the cancellation to whatever future/task it is
+    # currently suspended on (`Task._fut_waiter`). That masks a genuine hang
+    # as a clean-looking early return instead of a timeout, which is exactly
+    # the ambiguity this test exists to rule out. `asyncio.shield(...)`
+    # prevents that forwarding, so a real hang in `conn.task` reliably
+    # surfaces here as `asyncio.TimeoutError`/`TimeoutError`, not silence.
+    start = time.monotonic()
+    caught: BaseException | None = None
+    try:
+        await asyncio.wait_for(asyncio.shield(conn.task), timeout=3.0)
+    except BaseException as exc:  # noqa: BLE001 -- see other tests in this file
+        caught = exc
+    elapsed = time.monotonic() - start
+
+    assert caught is not None, (
+        "a second message pipelined on the same already-open connection, "
+        "after its reader already exited, must fail fast -- got no "
+        "exception at all"
+    )
+    assert not isinstance(caught, (asyncio.TimeoutError, TimeoutError)), (
+        f"expected a fast failure well under the 3s wait, took {elapsed:.2f}s "
+        "and only surfaced via the outer timeout -- consistent with the "
+        "second message hanging forever (i.e. the original deadlock "
+        "reproduced), not with anything actually rejecting it"
+    )
+    assert elapsed < 2.0, (
+        f"expected a fast failure, took {elapsed:.2f}s"
+    )
+    # With stdin write/drain neutralized, the only remaining way for this to
+    # fail fast is a live reader rejecting the freshly-registered future --
+    # confirms it wasn't some other unrelated exception.
+    assert any("subprocess exited" in m for m in _exception_messages(caught))
+    assert conn.task.done()
 
 
 @pytest.mark.asyncio
