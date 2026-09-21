@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from mcp_hub.config import Config, ServerConfig
 from mcp_hub.concurrency import ConcurrencyGuard
@@ -14,6 +15,14 @@ _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
 
 Status = Literal["stopped", "starting", "running", "crashed"]
+
+# Default asyncio.StreamReader line-length limit is 64 KiB (65536), which
+# raises ValueError out of readline()/`async for` iteration on any single
+# line (one JSON-RPC frame on the subprocess's stdout) longer than that. Real
+# MCP responses (e.g. a mariadb query result set) can exceed 64 KiB even
+# though the small stats payloads used in earlier manual testing never did.
+# 10 MiB is comfortably above any response this hub is expected to proxy.
+_STDOUT_LIMIT = 10 * 1024 * 1024
 
 
 def _redact_line(line: str) -> str:
@@ -31,12 +40,69 @@ class ManagedServer:
     process: asyncio.subprocess.Process | None = None
     guard: ConcurrencyGuard = field(init=False)
     logs: collections.deque = field(default_factory=lambda: collections.deque(maxlen=500))
+    # `pending`/`subscribers`/`_reader_task` back the single shared stdout
+    # reader below (see `ensure_stdout_reader`/`_read_stdout`): exactly one
+    # task consumes `process.stdout` per subprocess, no matter how many SSE
+    # connections (hub_app._proxy calls) are proxying requests to it
+    # concurrently. `pending` correlates an outstanding request's JSON-RPC
+    # `id` to the asyncio.Future its caller is awaiting; anything read off
+    # stdout that isn't a response to a pending id (a notification, or a
+    # server-initiated request) is fanned out to every `subscribers` entry.
+    pending: dict[Any, asyncio.Future] = field(default_factory=dict, init=False, repr=False)
+    subscribers: set[Callable[[dict], Awaitable[None]]] = field(default_factory=set, init=False, repr=False)
+    _reader_task: asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
 
     def append_log(self, line: str) -> None:
         self.logs.append(_redact_line(line))
+
+    def ensure_stdout_reader(self) -> None:
+        """Starts the single background task that owns reading this
+        subprocess's stdout, if it isn't already running.
+
+        Must be called with the event loop running. Idempotent: safe to call
+        once per proxied connection (hub_app._proxy does), since only the
+        first call actually starts anything.
+        """
+        if self._reader_task is None or self._reader_task.done():
+            self._reader_task = asyncio.create_task(self._read_stdout())
+
+    async def _read_stdout(self) -> None:
+        """Reads newline-delimited JSON-RPC frames off `process.stdout` and
+        either resolves the matching pending request's future (a response)
+        or fans the message out to every subscriber (a notification, a
+        server-initiated request, or a response with no matching pending
+        entry, e.g. arrived after its waiter gave up).
+
+        A JSON-RPC response is distinguished from a request/notification by
+        shape, not by tracking directions: it carries an `id` and either
+        `result` or `error`, and never a `method`.
+        """
+        assert self.process is not None and self.process.stdout is not None
+        async for raw in self.process.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg_id = obj.get("id")
+            is_response = msg_id is not None and "method" not in obj and ("result" in obj or "error" in obj)
+            fut = self.pending.get(msg_id) if is_response else None
+            if fut is not None and not fut.done():
+                fut.set_result(obj)
+                continue
+            for sub in list(self.subscribers):
+                try:
+                    await sub(obj)
+                except Exception:
+                    # One dead/misbehaving subscriber (e.g. a connection
+                    # that's mid-teardown) must not stop delivery to the
+                    # others, nor kill this shared reader task.
+                    pass
 
     async def start(self) -> None:
         self.status = "starting"
@@ -52,12 +118,18 @@ class ManagedServer:
         # JSON-RPC frames -- any stderr line merged in would corrupt framing.
         # Diagnostic/log output belongs on stderr, which is what a well-behaved
         # MCP stdio server uses for it; that's what _watch() below now reads.
+        # limit=: asyncio.StreamReader's default is 65536 (64 KiB) and raises
+        # ValueError out of readline()/iteration for any single line past it.
+        # One JSON-RPC frame is one line on this wire format, and a real MCP
+        # response (e.g. a mariadb result set) can exceed 64 KiB even though
+        # small stats payloads used in earlier manual testing never did.
         self.process = await asyncio.create_subprocess_exec(
             self.config.command, *self.config.args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            limit=_STDOUT_LIMIT,
         )
         self.status = "running"
         asyncio.create_task(self._watch())

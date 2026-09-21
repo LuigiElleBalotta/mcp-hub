@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
 from mcp.server.sse import SseServerTransport
 from mcp.shared.message import SessionMessage
 from mcp_types import jsonrpc_message_adapter
@@ -7,7 +10,7 @@ from starlette.applications import Starlette
 from starlette.responses import Response
 from starlette.routing import Mount, Route
 
-from mcp_hub.manager import HubManager
+from mcp_hub.manager import HubManager, ManagedServer
 
 
 def _mount_for(name: str, manager: HubManager) -> Mount:
@@ -21,11 +24,16 @@ def _mount_for(name: str, manager: HubManager) -> Mount:
     transport = SseServerTransport("/messages/")
 
     async def handle_sse(request):
-        async def guarded_run():
-            assert managed.process is not None
-            async with transport.connect_sse(request.scope, request.receive, request._send) as (read, write):
-                await _proxy(read, write, managed)
-        await managed.guard.run(guarded_run)
+        assert managed.process is not None
+        # NOTE: no `managed.guard.run(...)` around this whole SSE lifetime.
+        # Task 6 review finding: an `exclusive` server's guard must gate one
+        # JSON-RPC request's turn talking to the subprocess, not an entire
+        # SSE session (sessions are opened once and kept alive for a whole
+        # client run). The guard is applied per-request inside `_proxy`
+        # instead, so two SSE clients can both connect to an `exclusive`
+        # server at once; what serializes is each individual request.
+        async with transport.connect_sse(request.scope, request.receive, request._send) as (read, write):
+            await _proxy(read, write, managed)
         return Response()  # avoids a TypeError on client disconnect (Task 2 spike finding)
 
     return Mount(f"/{name}", routes=[
@@ -34,70 +42,84 @@ def _mount_for(name: str, manager: HubManager) -> Mount:
     ])
 
 
-async def _proxy(read, write, managed) -> None:
-    """Pump JSON-RPC frames between the SSE client (read/write) and the
-    managed subprocess's stdio (managed.process.stdin/stdout).
+async def _proxy(read, write, managed: ManagedServer) -> None:
+    """Pump JSON-RPC frames between one SSE client (read/write) and the
+    managed subprocess's shared stdio (managed.process.stdin/stdout).
 
     `read`/`write` are the streams `SseServerTransport.connect_sse` yields
-    (installed mcp==2.2.0, see mcp.server.sse). They do NOT carry raw JSON or
+    (installed mcp SDK, see mcp.server.sse). They do NOT carry raw JSON or
     plain `JSONRPCMessage` objects: `read` yields `SessionMessage | Exception`
     (an `Exception` when the client sent something that failed to parse —
     those are dropped here rather than forwarded to the subprocess), and
-    `write` accepts `SessionMessage` sends. This matches
-    `mcp.shared.message.SessionMessage` used throughout the SDK's own client
-    and server transports.
+    `write` accepts `SessionMessage` sends.
 
-    Framing to/from the subprocess matches `mcp.client.stdio`'s stdio client
-    transport exactly (the reference implementation of the MCP stdio wire
-    format the brief pointed at): newline-delimited JSON, one JSON-RPC
-    envelope per line, encoded/decoded as UTF-8.
-      - to_process: for each `SessionMessage` read from the SSE client,
-        serialize with `.message.model_dump_json(by_alias=True,
-        exclude_unset=True)` (the exact call `mcp.client.stdio.stdin_writer`
-        uses) + "\n", encode, write to `managed.process.stdin`, then drain.
-      - from_process: for each line read off `managed.process.stdin`'s sibling
-        `managed.process.stdout` (an `asyncio.StreamReader`, so `async for`
-        yields one line at a time via `readline()`), strip the trailing
-        newline (headroom is a Windows binary and writes "\r\n"; blank lines
-        from that stripping are skipped), parse with
-        `jsonrpc_message_adapter.validate_json(...)` into a `JSONRPCMessage`,
-        wrap in a fresh `SessionMessage`, and `write.send(...)` it back to the
-        SSE client.
+    Concurrency (Task 6 review, finding 1): `managed.process.stdin`/`stdout`
+    is a single pipe shared by every connection currently proxying to this
+    server (there is one subprocess per server, not one per client). Reading
+    stdout is centralized in `ManagedServer._read_stdout` (one task per
+    subprocess, started lazily via `ensure_stdout_reader`) so there is never
+    more than one consumer racing to read lines off the shared stream, no
+    matter how many SSE connections are open concurrently. That reader
+    correlates a JSON-RPC response back to whichever `_proxy` call sent the
+    matching request (by `id`, via `managed.pending`), and broadcasts
+    anything else (notifications, or a response with no matching in-flight
+    request) to every currently-connected client via `managed.subscribers`.
 
-    The task group is NOT a plain "run both forever": when the SSE client
-    disconnects, `read` closes and `to_process` returns, but the managed
-    subprocess is long-lived and its stdout never ends on its own, so
-    `from_process` would otherwise block forever, the task group would never
-    exit, `handle_sse` would never return, and (for an "exclusive" guarded
-    server) the concurrency lock would stay held forever. So `from_process`
-    runs as a background task while `to_process` is awaited directly, and once
-    `to_process` finishes (client gone), the task group's scope is cancelled
-    to stop `from_process` too.
+    Each incoming client message is handled by its own task (`handle_message`,
+    spawned per message into this connection's task group) rather than
+    awaited inline in the read loop, so a client that pipelines multiple
+    requests within one SSE session isn't serialized against itself. The
+    actual write-to-stdin-and-await-the-response step for each message is
+    what goes through `managed.guard.run(...)`: for an `exclusive` server
+    that's the one thing that must serialize — one request's turn on the
+    subprocess at a time, across ALL connections — not this connection's
+    whole lifetime. For a `parallel` server `guard.run` is a no-op passthrough
+    (see ConcurrencyGuard), so this reduces to full concurrency as before.
     """
     import anyio
 
-    async def to_process():
+    async def deliver(obj: dict) -> None:
+        message = jsonrpc_message_adapter.validate_python(obj)
+        await write.send(SessionMessage(message))
+
+    async def handle_message(session_message: SessionMessage) -> None:
         assert managed.process is not None and managed.process.stdin is not None
-        async for session_message in read:
-            if isinstance(session_message, Exception):
-                continue
-            data = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
-            managed.process.stdin.write((data + "\n").encode("utf-8"))
-            await managed.process.stdin.drain()
+        payload_text = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
+        obj = json.loads(payload_text)
+        msg_id = obj.get("id")
+        # A JSON-RPC request (expects a response) has both an id and a
+        # method; a notification has no id; a client's response to a
+        # server-initiated request has an id but no method — none of the
+        # latter two get a future registered, since nothing will resolve it.
+        is_request = msg_id is not None and "method" in obj
 
-    async def from_process():
-        assert managed.process is not None and managed.process.stdout is not None
-        async for raw in managed.process.stdout:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            message = jsonrpc_message_adapter.validate_json(line, by_name=False)
-            await write.send(SessionMessage(message))
+        async def write_and_maybe_wait() -> None:
+            fut: asyncio.Future | None = None
+            if is_request:
+                fut = asyncio.get_running_loop().create_future()
+                managed.pending[msg_id] = fut
+            try:
+                managed.process.stdin.write((payload_text + "\n").encode("utf-8"))
+                await managed.process.stdin.drain()
+                if fut is not None:
+                    response_obj = await fut
+                    await deliver(response_obj)
+            finally:
+                if fut is not None:
+                    managed.pending.pop(msg_id, None)
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(from_process)
-        await to_process()
-        tg.cancel_scope.cancel()
+        await managed.guard.run(write_and_maybe_wait)
+
+    managed.subscribers.add(deliver)
+    managed.ensure_stdout_reader()
+    try:
+        async with anyio.create_task_group() as tg:
+            async for session_message in read:
+                if isinstance(session_message, Exception):
+                    continue
+                tg.start_soon(handle_message, session_message)
+    finally:
+        managed.subscribers.discard(deliver)
 
 
 def build_app(manager: HubManager) -> Starlette:
