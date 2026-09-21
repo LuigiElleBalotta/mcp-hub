@@ -30,11 +30,13 @@ def management_routes(manager: HubManager) -> list[Route]:
         name = request.path_params["name"]
         body = await request.json()
         server_config = ServerConfig(**body)
-        managed = manager.upsert(name, server_config)
+        # HubManager.upsert stops any previously-running process for `name`
+        # itself before replacing the entry (round-2 review fix), so the
+        # freshly-returned `managed` here is a brand-new ManagedServer with
+        # no old process to worry about -- just start it if enabled.
+        managed = await manager.upsert(name, server_config)
         save_config(manager.config)
         if server_config.enabled:
-            if managed.process is not None and managed.process.returncode is None:
-                await managed.stop()
             await managed.start()
         return JSONResponse({"status": managed.status})
 

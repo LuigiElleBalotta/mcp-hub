@@ -251,7 +251,21 @@ class HubManager:
     def status_snapshot(self) -> dict[str, str]:
         return {name: s.status for name, s in self._servers.items()}
 
-    def upsert(self, name: str, server_config: ServerConfig) -> ManagedServer:
+    async def upsert(self, name: str, server_config: ServerConfig) -> ManagedServer:
+        """Replaces (or creates) the `ManagedServer` entry for `name`.
+
+        Round-2 review fix (Important finding): if a `ManagedServer` already
+        exists for this name, its process -- if one is running -- is stopped
+        BEFORE the entry is replaced. Previously the old `ManagedServer` (and
+        any live subprocess it owned) was simply dropped from `_servers` with
+        nothing ever calling `stop()` on it, orphaning the subprocess every
+        time an already-running server was re-upserted. `ManagedServer.stop()`
+        is a no-op when there's nothing running, so this is safe to call
+        unconditionally for any pre-existing entry.
+        """
+        existing = self._servers.get(name)
+        if existing is not None:
+            await existing.stop()
         self.config.servers[name] = server_config
         self._servers[name] = ManagedServer(name, server_config)
         return self._servers[name]

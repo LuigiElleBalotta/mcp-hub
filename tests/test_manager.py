@@ -84,19 +84,49 @@ def test_append_log_redacts_secret_like_lines():
     assert "glpat-realsecret" not in server.logs[-1]
 
 
-def test_upsert_adds_a_new_server_to_both_config_and_manager():
+async def test_upsert_adds_a_new_server_to_both_config_and_manager():
     cfg = Config(hub=HubConfig(), servers={})
     manager = HubManager(cfg)
     new_server = _python_sleep_config()
-    managed = manager.upsert("b", new_server)
+    managed = await manager.upsert("b", new_server)
     assert managed.name == "b"
     assert manager.get("b") is managed
     assert cfg.servers["b"] is new_server
 
 
-def test_upsert_replaces_an_existing_server():
+async def test_upsert_replaces_an_existing_server():
     cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config()})
     manager = HubManager(cfg)
     replacement = _python_sleep_config(seconds=1)
-    manager.upsert("a", replacement)
+    await manager.upsert("a", replacement)
     assert manager.get("a").config is replacement
+
+
+async def test_upsert_stops_the_old_process_before_replacing_a_running_server():
+    """Round-2 review regression test (Important finding): re-upserting an
+    already-running server must stop the OLD ManagedServer's process before
+    it is dropped/replaced, not just swap in a new ManagedServer object and
+    orphan the old subprocess."""
+    cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config(seconds=5)})
+    manager = HubManager(cfg)
+    await manager.start_all()
+    await asyncio.sleep(0.05)
+    old_managed = manager.get("a")
+    old_process = old_managed.process
+    assert old_process is not None
+    assert old_process.returncode is None  # confirmed running before upsert
+
+    replacement = _python_sleep_config(seconds=5)
+    new_managed = await manager.upsert("a", replacement)
+
+    # The OLD ManagedServer object was actually stopped, not just discarded.
+    assert old_managed.status == "stopped"
+    assert old_process.returncode is not None  # the old OS process is gone
+
+    # A different ManagedServer/process is now registered under the same name.
+    assert new_managed is not old_managed
+    assert manager.get("a") is new_managed
+    assert new_managed.config is replacement
+    assert new_managed.process is None  # not started yet -- upsert doesn't auto-start
+
+    await manager.stop_all()
