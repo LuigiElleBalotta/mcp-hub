@@ -154,9 +154,45 @@ Apply is deliberately not automatic/continuous — the user reviews hub status
 first, then applies. This keeps a broken hub from ever silently taking over a
 working Claude Code config.
 
+## Cleanup of already-running legacy MCP processes
+
+`apply` only affects *future* Claude Code sessions — a session already open
+when `apply` runs keeps its own stdio-spawned MCP child processes, because it
+read `.claude.json` at startup and cannot hot-swap a live tool connection
+from stdio to remote mid-session. Killing one of those child processes while
+its owning session is still open breaks that specific tool for that session
+until it is restarted.
+
+To let the user reclaim that memory immediately instead of waiting for a
+natural restart, `apply` accepts an optional `--cleanup` flag (mirrored as a
+GUI checkbox, checked by scanning before the apply confirmation is even
+shown — i.e. the user is asked up front, before anything runs, not after):
+
+1. Scan running processes for child trees, rooted at any `claude.exe`
+   process, matching the `command`/`args` of a server being migrated.
+2. **Always exclude** the process tree that is an ancestor of the
+   `mcp-hub`/GUI process itself (self-protection — same ancestor-walk check
+   already implemented and proven today in `ProcessWatcher.ps1`, ported to
+   Python here).
+3. Present one summary upfront — which sessions, which servers, how much
+   memory — and ask a **single yes/no confirmation before starting anything**
+   (not a per-process checklist). A "no" aborts cleanup entirely; `apply`
+   itself (the config rewrite) still proceeds independently unless the user
+   also declines that.
+4. On "yes", kill exactly the matched MCP child processes (not the owning
+   `claude.exe` session itself, not unrelated children) for every matched
+   session except the caller's own.
+
+CLI: `mcp-hub apply --cleanup` prompts the same single upfront confirmation;
+`mcp-hub apply --cleanup --yes` skips the prompt for scripted/unattended use.
+
 ## GUI
 
-PySide6, single main window:
+PySide6, single main window. (PyQt6 was considered — functionally
+equivalent Qt bindings — but PySide6 is LGPL, which keeps licensing simple
+if this project is published on GitHub; PyQt6 requires GPL or a commercial
+license for closed distribution. Sticking with PySide6 unless a concrete
+reason to switch comes up.)
 
 - Server list: name, status dot (green=running, red=crashed, grey=stopped),
   concurrency mode, enabled toggle, per-row start/stop/restart.
@@ -205,7 +241,9 @@ Implementation and adoption proceed in verified steps, not big-bang:
 5. Task Scheduler autostart.
 6. Only after all of the above are verified working end-to-end: `apply` run
    against the real `.claude.json`, with backup, switching the migrated
-   servers from stdio to remote for real Claude Code sessions.
+   servers from stdio to remote for real Claude Code sessions. Optionally
+   run with `--cleanup` to also reclaim memory from already-open sessions'
+   legacy MCP child processes, after the single upfront confirmation.
 
 ## Testing strategy
 
