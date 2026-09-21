@@ -113,6 +113,25 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             payload_text = json.dumps(obj)
 
         async def write_and_maybe_wait() -> None:
+            # Fail fast if the subprocess is already gone *before* registering
+            # anything in `managed.pending`. Without this check there is a gap
+            # the Critical-finding fix doesn't otherwise close: if the
+            # subprocess died and its stdout reader already ran to completion
+            # (rejecting whatever was pending at the time and exiting), a
+            # request registered AFTER that point has no live reader left to
+            # ever reject its future -- `ensure_stdout_reader()` would spawn a
+            # new reader against the same dead process, which hits EOF
+            # immediately and exits again having rejected nothing (pending was
+            # still empty at that instant), and a write to a dead process's
+            # stdin pipe does not reliably raise synchronously. That future
+            # would then hang forever, deadlocking an `exclusive` guard again.
+            # Checking `returncode` here closes that window: no future is ever
+            # registered unless the process was observably still running at
+            # registration time.
+            if managed.process is None or managed.process.returncode is not None:
+                raise ConnectionError(
+                    f"managed server {managed.name!r} subprocess is not running"
+                )
             fut: asyncio.Future | None = None
             if hub_id is not None:
                 fut = asyncio.get_running_loop().create_future()

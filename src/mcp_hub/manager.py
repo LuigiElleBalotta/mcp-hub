@@ -142,6 +142,20 @@ class ManagedServer:
                 if fut is not None and not fut.done():
                     fut.set_result(obj)
                     continue
+                if is_response and isinstance(msg_id, str) and msg_id.startswith("hub:"):
+                    # A response shaped for a hub-generated id (see
+                    # `next_request_id`) that has no matching `pending` entry
+                    # is, by construction, a response to a request whose
+                    # waiter already gave up (e.g. its connection disconnected
+                    # before the reply arrived) -- every id this hub ever
+                    # writes to the subprocess is hub-generated, so this
+                    # cannot be a legitimate unsolicited message. It must be
+                    # dropped, not broadcast: `subscribers` fan-out is for
+                    # every OTHER currently-connected client too, and
+                    # forwarding this would leak the internal hub id onto an
+                    # unrelated client's connection and misattribute someone
+                    # else's abandoned response to it.
+                    continue
                 for sub in list(self.subscribers):
                     try:
                         await sub(obj)

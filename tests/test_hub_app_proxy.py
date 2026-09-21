@@ -11,15 +11,19 @@
    limit must not crash the reader. Proven with a synthetic subprocess
    (tests/fixtures/fake_stdio_server.py) that echoes back an oversized line.
 3. (Round 2, Critical) A request in flight when the subprocess dies must be
-   rejected with an exception, not hang forever -- and for an `exclusive`
-   server, a subsequent request (e.g. after a restart) must not be stuck
-   behind a permanently-deadlocked guard.
+   rejected with an exception, not hang forever -- whether the subprocess
+   crashed, was deliberately `stop()`ped, or died between requests with no
+   restart -- and for an `exclusive` server, a subsequent request (e.g.
+   after a restart) must not be stuck behind a permanently-deadlocked guard.
 4. (Round 2, Important) Two concurrently-connected clients on a `parallel`
    server that happen to use the same JSON-RPC id must each get their OWN
    response, not misroute onto each other or hang, even though the hub
-   shares one `pending` dict per subprocess across all connections.
+   shares one `pending` dict per subprocess across all connections -- and a
+   response to an abandoned hub-generated request must never leak to some
+   other, unrelated client.
 """
 import asyncio
+import contextlib
 import sys
 import time
 from pathlib import Path
@@ -210,6 +214,87 @@ async def test_subprocess_death_rejects_pending_request_and_unblocks_exclusive_g
 
 
 @pytest.mark.asyncio
+async def test_request_after_dead_reader_fails_fast_without_a_restart():
+    """Round 2, Critical finding, gap closed after advisor review: rejecting
+    futures already in `pending` when the reader exits is not enough on its
+    own. If a NEW request registers a future in `pending` AFTER the shared
+    reader has already run to completion (subprocess dead, no restart), no
+    reader is left alive to ever reject it -- `ensure_stdout_reader()` would
+    spawn a fresh reader against the same dead process, which hits EOF
+    immediately and exits having rejected nothing (because `pending` was
+    still empty at that instant). Without the fail-fast check in
+    `write_and_maybe_wait()` (before registering anything in `pending`), this
+    second request would hang forever -- the exact permanent-deadlock failure
+    mode the Critical finding describes, reachable even without ever calling
+    `server.start()` again.
+    """
+    server = await _start_managed("exclusive")
+    try:
+        conn = _Connection(server)
+        conn.open()
+        await conn.send(1, "test/die", {})
+        try:
+            await conn.close()
+        except BaseException:
+            pass  # already covered by the other test; just get past it here
+
+        # Give the shared reader time to actually observe EOF and finish
+        # (it rejects an already-empty `pending` and exits) before the next
+        # request tries to register anything -- this is the exact ordering
+        # the gap needed: reader fully done, no restart, pending currently
+        # empty.
+        for _ in range(50):
+            if server._reader_task is not None and server._reader_task.done():
+                break
+            await asyncio.sleep(0.05)
+        assert server._reader_task is not None and server._reader_task.done()
+
+        conn2 = _Connection(server)
+        conn2.open()  # deliberately NOT server.start() -- same dead process
+        await conn2.send(2, "test/echo", {"value": "x"})
+        caught: BaseException | None = None
+        try:
+            await conn2.close()
+        except BaseException as exc:
+            caught = exc
+        assert caught is not None, (
+            "a request registered after the reader already exited, with no "
+            "restart, must fail fast -- got no exception at all (hang)"
+        )
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_rejects_a_request_in_flight():
+    """Round 2, Critical finding: the review explicitly asked to verify --
+    not assume -- that `stop()`'s deliberate termination path rejects a
+    request in flight the same way a crash does. `test/sleep` keeps the fake
+    subprocess busy (and its response line unwritten) long enough for
+    `server.stop()` to terminate it while the request is still outstanding.
+    """
+    server = await _start_managed("exclusive")
+    conn = _Connection(server)
+    conn.open()
+    await conn.send(1, "test/sleep", {"seconds": 5.0})
+    await asyncio.sleep(0.1)  # let the request actually reach the subprocess
+
+    stop_task = asyncio.create_task(server.stop())
+    caught: BaseException | None = None
+    try:
+        await conn.close()
+    except BaseException as exc:
+        caught = exc
+    await stop_task
+
+    assert caught is not None, (
+        "expected the in-flight request to be rejected when stop() "
+        "terminates the subprocess, got no exception at all (hang)"
+    )
+    assert any("subprocess exited" in m for m in _exception_messages(caught))
+
+
+@pytest.mark.asyncio
 async def test_colliding_client_ids_on_parallel_server_do_not_misroute():
     """Round 2, Important finding: two independently-connected clients on a
     `parallel` server can legitimately pick the same JSON-RPC id (e.g. both
@@ -247,6 +332,43 @@ async def test_colliding_client_ids_on_parallel_server_do_not_misroute():
         assert reply_b["result"] == {"echo": "B"}
 
         await conn_a.close()
+        await conn_b.close()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_hub_id_response_is_not_broadcast_to_other_clients():
+    """Self-review fix (gap an advisor review caught after the two named
+    findings were addressed): a response to a hub-generated id whose waiter
+    already gave up (its connection was abruptly cancelled/disconnected
+    before the response arrived) must be dropped, not broadcast to every
+    OTHER currently-connected client via `subscribers`. Broadcasting it would
+    leak the internal hub id onto an unrelated client's connection and
+    misattribute someone else's abandoned response to it -- which is
+    reachable precisely because every id this hub writes to the subprocess
+    is now hub-generated (the Important-finding fix), so an unmatched
+    response's id is never a legitimate notification/server-request.
+    """
+    server = await _start_managed("parallel")
+    try:
+        conn_a = _Connection(server)
+        conn_a.open()
+        conn_b = _Connection(server)
+        conn_b.open()  # bystander: must never receive A's orphaned response
+
+        await conn_a.send(1, "test/sleep", {"seconds": 0.4})
+        await asyncio.sleep(0.1)  # let A's request actually register+write
+        assert conn_a.task is not None
+        conn_a.task.cancel()  # simulate an abrupt disconnect/give-up
+        with contextlib.suppress(BaseException):
+            await conn_a.task
+
+        # A's real response is still coming from the subprocess (~0.3s left
+        # to arrive). B, who never asked for anything, must never see it.
+        with pytest.raises(TimeoutError):
+            await conn_b.recv(timeout=1.0)
+
         await conn_b.close()
     finally:
         await server.stop()
