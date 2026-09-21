@@ -10,6 +10,8 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
 
+import psutil
+
 from mcp_hub.config import Config, ServerConfig
 from mcp_hub.concurrency import ConcurrencyGuard
 
@@ -232,12 +234,77 @@ class ManagedServer:
             self.status = "crashed" if code != 0 else "stopped"
 
     async def stop(self) -> None:
+        """Stops this server's subprocess AND every descendant it has spawned.
+
+        Task 13 live-verification fix (Critical finding): on Windows, some
+        commands are shims -- `npx.cmd`/`uvx.exe` -- that spawn a real
+        grandchild process (the actual MCP server) and stay alive themselves
+        as the parent. Terminating only `self.process` (the shim) does NOT
+        cascade to that grandchild -- Windows has no implicit process-group
+        kill the way POSIX SIGTERM-to-a-group can provide. Confirmed live:
+        stopping `windows-mcp` (launched via `uvx`) through the hub left a
+        real, orphaned `windows-mcp.exe` running every time, across 3
+        separate test runs. `gitlab`/`figma-bridge` (npx-based) happened not
+        to show this because their node.exe children self-terminate cleanly
+        on stdin EOF -- incidental, not a property of `stop()` that should be
+        relied on for any other shim-spawning command.
+
+        Fix: walk `self.process`'s full descendant tree via psutil BEFORE
+        terminating the shim (a process that's already dead enumerates no
+        children), terminate every descendant, terminate the shim itself,
+        then confirm the descendants are actually gone and `.kill()` any
+        survivor that ignored terminate().
+
+        This only covers descendants that are still alive when `stop()`
+        runs and rooted at a `self.process` that is still running -- a shim
+        that has already exited before `stop()` is called cannot be walked
+        (a dead process has no enumerable children) and is out of scope for
+        this fix; closing that gap would need a Windows Job Object with
+        `KILL_ON_JOB_CLOSE` assigned at spawn time, which is a bigger change
+        than this bug warrants.
+
+        psutil calls are wrapped broadly (`psutil.Error`, not just
+        `NoSuchProcess`): `AccessDenied` is also possible on Windows and must
+        not propagate out of `stop()` -- `stop_all()` calls this in a loop
+        and one uncaught exception here would abort shutdown for every
+        OTHER managed server too (the same bug class Task 7's serve()
+        try/finally already exists to prevent).
+
+        `psutil.wait_procs` blocks synchronously for up to its timeout; it's
+        offloaded via `asyncio.to_thread` so it doesn't stall the event loop
+        (and, transitively, this server's `_read_stdout` reader task/
+        `_reject_pending` finally, and every other managed server's own
+        stop() in a sequential `stop_all()`).
+        """
         if self.process is not None and self.process.returncode is None:
-            self.process.terminate()
+            children: list[psutil.Process] = []
+            try:
+                children = psutil.Process(self.process.pid).children(recursive=True)
+            except psutil.Error:
+                children = []
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.Error:
+                    pass
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                pass
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=5)
             except asyncio.TimeoutError:
-                self.process.kill()
+                try:
+                    self.process.kill()
+                except ProcessLookupError:
+                    pass
+            if children:
+                _gone, alive = await asyncio.to_thread(psutil.wait_procs, children, 5)
+                for child in alive:
+                    try:
+                        child.kill()
+                    except psutil.Error:
+                        pass
         self.status = "stopped"
 
 

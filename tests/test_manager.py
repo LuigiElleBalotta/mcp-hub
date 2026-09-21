@@ -2,6 +2,9 @@
 import asyncio
 import shutil
 import sys
+import time
+
+import psutil
 import pytest
 from mcp_hub.config import Config, HubConfig, ServerConfig
 from mcp_hub.manager import HubManager
@@ -198,3 +201,95 @@ async def test_start_passes_shutil_which_resolved_command_to_subprocess_exec(mon
     assert exec_calls[0][1] == "--flag"
 
     await manager.stop_all()
+
+
+# A synthetic parent script that spawns its own grandchild via subprocess.Popen
+# and then stays alive (sleeping) itself -- it never exits on its own within
+# the test's timeframe. It prints the grandchild's pid to stderr (funneled
+# into ManagedServer.logs by _watch()) so the test can identify exactly which
+# live process is the grandchild, rather than inferring it from process count.
+#
+# This models the real, CONFIRMED failure mode (Task 13 live testing):
+# `uvx.exe` (the parent/shim) stays running and spawns `windows-mcp.exe` (the
+# grandchild/real server) as a genuine child process. `ManagedServer.stop()`
+# previously only terminated `self.process` (the shim) -- Windows has no
+# implicit process-group kill, so terminate() on the parent does NOT cascade
+# to the grandchild, orphaning it. A "parent exits immediately, orphaning a
+# detached grandchild" variant was deliberately NOT used here: if the parent
+# has already exited by the time stop() runs, self.process.returncode is no
+# longer None and the entire tree-kill block (including the psutil enumerate-
+# children call, which requires a *live* parent PID) never runs -- that
+# scenario tests something no code path in this fix (or the brief's own
+# sketch) claims to handle, and would not actually exercise the fix at all.
+# Keeping the parent alive (as its own long-lived process) is what forces the
+# fix's tree-walk to do real work instead of relying on incidental cascade.
+_TREE_PARENT_SCRIPT = (
+    "import subprocess, sys, time\n"
+    "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+    "print(f'GRANDCHILD={gc.pid}', file=sys.stderr, flush=True)\n"
+    "time.sleep(30)\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_stop_kills_the_entire_process_tree_not_just_the_direct_child():
+    """Regression test for the Task 13 live-verification finding: stop() must
+    terminate descendants of self.process, not just self.process itself.
+
+    Without the fix, this reproduces the real orphaning bug directly: the
+    grandchild (still alive, still a live psutil.Process) would remain
+    running after stop() returns -- exactly what live-tested windows-mcp did
+    (confirmed 3 separate times) when only the `uvx` shim was terminated.
+    Run against the pre-fix stop() (single self.process.terminate()/kill(),
+    no tree walk), this test fails: the grandchild's pid is still alive when
+    checked after stop(), because ManagedServer.stop() had already returned
+    without ever looking at self.process's children.
+    """
+    cfg = Config(hub=HubConfig(), servers={
+        "a": ServerConfig(enabled=True, command=sys.executable,
+                           args=["-c", _TREE_PARENT_SCRIPT], env={}, concurrency="exclusive"),
+    })
+    manager = HubManager(cfg)
+    server = manager.get("a")
+    grandchild_pid: int | None = None
+    try:
+        await manager.start_all()
+
+        # Poll (deadline, not a fixed sleep) for the grandchild's pid to show
+        # up in this server's stderr-fed logs.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            for line in server.logs:
+                if line.startswith("GRANDCHILD="):
+                    grandchild_pid = int(line.split("=", 1)[1])
+                    break
+            if grandchild_pid is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert grandchild_pid is not None, "grandchild never reported its pid"
+
+        # Confirm the grandchild is a real, live descendant of self.process
+        # (proves the tree-walk would find the right process), not just some
+        # incidentally-alive pid.
+        assert psutil.pid_exists(grandchild_pid)
+        parent_pid = server.process.pid
+        descendant_pids = {p.pid for p in psutil.Process(parent_pid).children(recursive=True)}
+        assert grandchild_pid in descendant_pids
+
+        await server.stop()
+
+        assert server.status == "stopped"
+        assert not psutil.pid_exists(grandchild_pid) or not psutil.Process(grandchild_pid).is_running()
+    finally:
+        # Safety net: never leak a 30s sleeper even if an assertion above
+        # fails partway through.
+        if grandchild_pid is not None and psutil.pid_exists(grandchild_pid):
+            try:
+                psutil.Process(grandchild_pid).kill()
+            except psutil.Error:
+                pass
+        if server.process is not None and server.process.returncode is None:
+            try:
+                server.process.kill()
+            except ProcessLookupError:
+                pass
