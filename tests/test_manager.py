@@ -1,5 +1,6 @@
 # tests/test_manager.py
 import asyncio
+import shutil
 import sys
 import pytest
 from mcp_hub.config import Config, HubConfig, ServerConfig
@@ -128,5 +129,72 @@ async def test_upsert_stops_the_old_process_before_replacing_a_running_server():
     assert manager.get("a") is new_managed
     assert new_managed.config is replacement
     assert new_managed.process is None  # not started yet -- upsert doesn't auto-start
+
+    await manager.stop_all()
+
+
+@pytest.mark.skipif(shutil.which("npx") is None, reason="npx not installed on this machine")
+@pytest.mark.asyncio
+async def test_start_resolves_bare_command_via_pathext_shim():
+    """Regression test for Task 12's live-testing finding: on Windows,
+    asyncio.create_subprocess_exec passes the command straight to the Win32
+    CreateProcess API, which does NOT do PATHEXT probing the way cmd.exe
+    does. A bare "npx" (the real executable is the "npx.cmd" shim) used to
+    raise FileNotFoundError out of start(), which start_all() propagated --
+    crashing the whole hub for every enabled server that used npx/uvx, not
+    just the one at fault.
+
+    `npx` is exactly this shim-resolution case (confirmed via
+    shutil.which("npx") returning an "npx.CMD" path, not a bare .exe), so
+    this exercises the real bug end-to-end instead of a case (like
+    sys.executable, a real .exe) that would pass even without the fix.
+    """
+    cfg = Config(hub=HubConfig(), servers={
+        "a": ServerConfig(enabled=True, command="npx", args=["--version"], env={}),
+    })
+    manager = HubManager(cfg)
+    await manager.start_all()  # must not raise FileNotFoundError
+    assert manager.get("a").status == "running"
+    await asyncio.wait_for(manager.get("a").process.wait(), timeout=30)
+    await asyncio.sleep(0.1)
+    assert manager.get("a").status != "crashed"
+
+
+@pytest.mark.asyncio
+async def test_start_passes_shutil_which_resolved_command_to_subprocess_exec(monkeypatch):
+    """Deterministic, install-independent companion to the npx test above:
+    proves start() actually calls shutil.which() on self.config.command and
+    passes ITS result (not the raw bare string) to create_subprocess_exec."""
+    cfg = Config(hub=HubConfig(), servers={
+        "a": ServerConfig(enabled=True, command="totally-bare-command-name", args=["--flag"], env={}),
+    })
+    manager = HubManager(cfg)
+    server = manager.get("a")
+
+    which_calls = []
+
+    def fake_which(cmd):
+        which_calls.append(cmd)
+        return r"C:\resolved\path\totally-bare-command-name.cmd"
+
+    exec_calls = []
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        exec_calls.append(args)
+        return await real_create_subprocess_exec(
+            sys.executable, "-c", "pass", stdin=kwargs.get("stdin"),
+            stdout=kwargs.get("stdout"), stderr=kwargs.get("stderr"), env=kwargs.get("env"),
+            limit=kwargs.get("limit"),
+        )
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    await server.start()
+
+    assert which_calls == ["totally-bare-command-name"]
+    assert exec_calls[0][0] == r"C:\resolved\path\totally-bare-command-name.cmd"
+    assert exec_calls[0][1] == "--flag"
 
     await manager.stop_all()

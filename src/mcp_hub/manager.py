@@ -6,6 +6,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
 
@@ -201,8 +202,17 @@ class ManagedServer:
         # One JSON-RPC frame is one line on this wire format, and a real MCP
         # response (e.g. a mariadb result set) can exceed 64 KiB even though
         # small stats payloads used in earlier manual testing never did.
+        # Resolve via PATH (and, on Windows, PATHEXT: .cmd/.bat/.exe) ourselves.
+        # asyncio.create_subprocess_exec goes straight to CreateProcess on
+        # Windows, which does NOT do PATHEXT probing the way cmd.exe does --
+        # a bare "npx" (the real shim is "npx.cmd") raises FileNotFoundError,
+        # blocking start_all() -- and thus the whole hub -- for every server
+        # except the one (headroom) that happens to ship a real .exe. Falls
+        # back to the original string if not found, so a genuinely bad
+        # command still fails the same way it did before.
+        resolved_command = shutil.which(self.config.command) or self.config.command
         self.process = await asyncio.create_subprocess_exec(
-            self.config.command, *self.config.args,
+            resolved_command, *self.config.args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
