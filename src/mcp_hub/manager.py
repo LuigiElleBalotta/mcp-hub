@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Literal
@@ -39,10 +40,14 @@ class ManagedServer:
 
     async def start(self) -> None:
         self.status = "starting"
-        env = {**self.config.env}
+        # Merge with the parent's environment rather than replacing it: several
+        # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
+        # PATH to resolve at all. A bare `self.config.env` would silently drop
+        # PATH the moment any server sets custom env vars.
+        env = {**os.environ, **self.config.env}
         self.process = await asyncio.create_subprocess_exec(
             self.config.command, *self.config.args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env or None,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
         )
         self.status = "running"
         asyncio.create_task(self._watch())

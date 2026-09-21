@@ -52,6 +52,24 @@ async def test_crash_is_detected():
     assert manager.get("a").status == "crashed"
 
 
+@pytest.mark.asyncio
+async def test_start_merges_custom_env_with_parent_environment():
+    custom_env_config = ServerConfig(
+        enabled=True, command=sys.executable,
+        args=["-c", "import os; print('CUSTOM=' + os.environ.get('MCP_HUB_TEST_VAR', 'MISSING')); print('PATH_PRESENT=' + str(bool(os.environ.get('PATH'))))"],
+        env={"MCP_HUB_TEST_VAR": "hello"}, concurrency="exclusive",
+    )
+    cfg = Config(hub=HubConfig(), servers={"a": custom_env_config})
+    manager = HubManager(cfg)
+    await manager.start_all()
+    await asyncio.sleep(0.3)
+    server = manager.get("a")
+    logs = "\n".join(server.logs)
+    assert "CUSTOM=hello" in logs
+    assert "PATH_PRESENT=True" in logs
+    await manager.stop_all()
+
+
 def test_status_snapshot_reflects_all_servers():
     cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config(), "b": _python_sleep_config()})
     manager = HubManager(cfg)
