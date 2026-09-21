@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from mcp.server.sse import SseServerTransport
 from mcp.shared.message import SessionMessage
@@ -164,11 +165,55 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             if hub_id is not None:
                 fut = asyncio.get_running_loop().create_future()
                 managed.pending[hub_id] = fut
+                # Permanent hub-side dispatch timing (Task 13 review finding:
+                # scripts/concurrency_check.py's client-observed completion
+                # timestamps can appear near-simultaneous for two calls to an
+                # `exclusive` server even when dispatch itself was cleanly
+                # serialized -- that gap is real SSE response-delivery
+                # latency downstream of this point, in the `mcp` SDK's
+                # transport, not a guard failure). Logged here, which already
+                # runs under `managed.guard`'s lock for an `exclusive` server
+                # (`guard.run` wraps this whole coroutine -- see `_proxy`'s
+                # docstring above), this line and its matching "done"/"error"
+                # line below give a rerunnable, hub-side proof of
+                # serialization that is immune to that downstream latency.
+                # `id`/`method` let a reader (the script, or a human) pair a
+                # start with its outcome and isolate the specific request(s)
+                # it cares about from other traffic (initialize,
+                # notifications, etc.) that also passes through this same
+                # guarded path. `time.monotonic()`, not wall clock: the proof
+                # this backs is entirely intra-hub (one window's end vs the
+                # next window's start), so cross-process comparability is
+                # irrelevant and monotonic is immune to clock steps.
+                managed.append_log(
+                    f"[hub-dispatch] phase=start id={hub_id} method={obj.get('method')} "
+                    f"t={time.monotonic():.6f}"
+                )
             try:
                 managed.process.stdin.write((payload_text + "\n").encode("utf-8"))
                 await managed.process.stdin.drain()
                 if fut is not None:
-                    response_obj = await fut
+                    try:
+                        response_obj = await fut
+                    except Exception:
+                        # Log the "error" outcome too (not just the happy
+                        # path): a reader waiting to pair this id's
+                        # start/done lines must not hang or mis-parse if the
+                        # subprocess died or the guard's wait was otherwise
+                        # rejected mid-flight (see `_reject_pending`).
+                        managed.append_log(
+                            f"[hub-dispatch] phase=error id={hub_id} method={obj.get('method')} "
+                            f"t={time.monotonic():.6f}"
+                        )
+                        raise
+                    # Logged BEFORE `deliver(...)`: `deliver` hands the
+                    # response to the SSE transport, which is exactly the
+                    # downstream leg this timing is meant to exclude from the
+                    # measured dispatch window (see comment above).
+                    managed.append_log(
+                        f"[hub-dispatch] phase=done id={hub_id} method={obj.get('method')} "
+                        f"t={time.monotonic():.6f}"
+                    )
                     response_obj = {**response_obj, "id": client_id}
                     await deliver(response_obj)
             finally:
