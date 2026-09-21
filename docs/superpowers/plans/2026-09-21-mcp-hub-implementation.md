@@ -1448,7 +1448,7 @@ class LogPanel(QWidget):
 - [ ] **Step 2: Wire it into `MainWindow`**
 
 ```python
-# in src/mcp_hub/gui/main_window.py, __init__, replace central layout setup:
+# in src/mcp_hub/gui/main_window.py, __init__, add near the end (after self.setCentralWidget(central)):
         from mcp_hub.gui.log_panel import LogPanel
         self.log_panel = LogPanel()
         self.table.itemSelectionChanged.connect(self._on_row_selected)
@@ -2180,6 +2180,7 @@ Expected: reports migrated names; `%TEMP%\claude-test.json` now has a
 
 ```python
     def _import_from_claude(self) -> None:
+        from pathlib import Path
         from PySide6.QtWidgets import QFileDialog, QMessageBox
         path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
         if not path:
@@ -2193,6 +2194,7 @@ Expected: reports migrated names; `%TEMP%\claude-test.json` now has a
         self.refresh()
 
     def _apply_to_claude(self) -> None:
+        from pathlib import Path
         from PySide6.QtWidgets import QFileDialog, QMessageBox
         path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
         if not path:
