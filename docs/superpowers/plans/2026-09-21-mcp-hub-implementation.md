@@ -739,6 +739,17 @@ class ManagedServer:
             self.status = "crashed" if code != 0 else "stopped"
 
     async def stop(self) -> None:
+        # NOTE (found by Task 13's live testing against windows-mcp, a uvx-
+        # based server): on Windows, a shim command (npx.cmd/uvx.exe) can
+        # exit while a grandchild it spawned (the real server process) keeps
+        # running. self.process only ever refers to the shim -- terminate()
+        # on it does not touch that grandchild, orphaning a real, potentially
+        # desktop-controlling process. The actual implementation (evolved
+        # past this sketch through several fix rounds already) must kill the
+        # whole process tree, e.g. via psutil.Process(self.process.pid)
+        # .children(recursive=True) plus the process itself, not just
+        # self.process directly. Read the CURRENT manager.py before editing
+        # -- this note describes the requirement, not the exact code to paste.
         if self.process is not None and self.process.returncode is None:
             self.process.terminate()
             try:
