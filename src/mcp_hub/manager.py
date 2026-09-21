@@ -45,17 +45,27 @@ class ManagedServer:
         # PATH to resolve at all. A bare `self.config.env` would silently drop
         # PATH the moment any server sets custom env vars.
         env = {**os.environ, **self.config.env}
+        # stdin must be piped: the hub proxies MCP requests to this process
+        # over stdio (see hub_app._proxy), so there must be a write channel.
+        # stderr must be its own pipe, NOT merged into stdout (stderr=STDOUT):
+        # the MCP stdio protocol requires stdout to carry ONLY newline-delimited
+        # JSON-RPC frames -- any stderr line merged in would corrupt framing.
+        # Diagnostic/log output belongs on stderr, which is what a well-behaved
+        # MCP stdio server uses for it; that's what _watch() below now reads.
         self.process = await asyncio.create_subprocess_exec(
             self.config.command, *self.config.args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         self.status = "running"
         asyncio.create_task(self._watch())
 
     async def _watch(self) -> None:
         assert self.process is not None
-        if self.process.stdout is not None:
-            async for raw in self.process.stdout:
+        if self.process.stderr is not None:
+            async for raw in self.process.stderr:
                 self.append_log(raw.decode(errors="replace").rstrip())
         code = await self.process.wait()
         if self.status != "stopped":

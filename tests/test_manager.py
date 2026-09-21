@@ -56,7 +56,7 @@ async def test_crash_is_detected():
 async def test_start_merges_custom_env_with_parent_environment():
     custom_env_config = ServerConfig(
         enabled=True, command=sys.executable,
-        args=["-c", "import os; print('CUSTOM=' + os.environ.get('MCP_HUB_TEST_VAR', 'MISSING')); print('PATH_PRESENT=' + str(bool(os.environ.get('PATH'))))"],
+        args=["-c", "import os, sys; print('CUSTOM=' + os.environ.get('MCP_HUB_TEST_VAR', 'MISSING'), file=sys.stderr); print('PATH_PRESENT=' + str(bool(os.environ.get('PATH'))), file=sys.stderr)"],
         env={"MCP_HUB_TEST_VAR": "hello"}, concurrency="exclusive",
     )
     cfg = Config(hub=HubConfig(), servers={"a": custom_env_config})
