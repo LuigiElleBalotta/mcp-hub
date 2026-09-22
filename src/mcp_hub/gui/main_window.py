@@ -29,6 +29,13 @@ class MainWindow(QMainWindow):
         add_btn.clicked.connect(self._add_server)
         layout.addWidget(add_btn)
 
+        import_btn = QPushButton("Import from Claude Code config")
+        apply_btn = QPushButton("Apply to Claude Code config")
+        import_btn.clicked.connect(self._import_from_claude)
+        apply_btn.clicked.connect(self._apply_to_claude)
+        layout.addWidget(import_btn)
+        layout.addWidget(apply_btn)
+
         from PySide6.QtWidgets import QCheckBox
         self.autostart_checkbox = QCheckBox("Avvia con Windows")
         self.autostart_checkbox.toggled.connect(self._toggle_autostart)
@@ -99,3 +106,38 @@ class MainWindow(QMainWindow):
             return
         name = self.table.item(row, 0).text()
         self.log_panel.show_logs(name, self.client.logs(name))
+
+    def _import_from_claude(self) -> None:
+        from pathlib import Path
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
+        if not path:
+            return
+        from mcp_hub.config import load_config, save_config
+        from mcp_hub.claude_config import import_servers
+        config = load_config()
+        imported = import_servers(Path(path), config)
+        save_config(config)
+        QMessageBox.information(self, "Import", f"Imported (disabled): {', '.join(imported) or '(none)'}")
+        self.refresh()
+
+    def _apply_to_claude(self) -> None:
+        from pathlib import Path
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
+        if not path:
+            return
+        from mcp_hub.config import load_config
+        from mcp_hub.claude_config import apply_servers
+        config = load_config()
+        enabled_names = [n for n, s in config.servers.items() if s.enabled]
+        confirm = QMessageBox.question(
+            self, "Apply",
+            f"This will back up {path} and rewrite these servers to point at the hub:\n"
+            + "\n".join(enabled_names)
+            + "\n\nContinue?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        migrated = apply_servers(Path(path), config)
+        QMessageBox.information(self, "Apply", f"Migrated: {', '.join(migrated) or '(none)'}")
