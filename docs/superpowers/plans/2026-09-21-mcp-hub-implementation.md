@@ -2015,6 +2015,27 @@ def test_execute_cleanup_calls_kill_fn_for_each_match_and_counts():
     count = execute_cleanup(matches, kill_fn=killed.append)
     assert killed == [11, 12]
     assert count == 2
+
+
+def test_find_legacy_processes_does_not_over_protect_via_deep_shared_system_ancestor():
+    """Two independent sessions that both eventually trace back to the same
+    high-level system ancestor (explorer.exe here) must not cause one
+    session's legacy process to protect the other's -- self-protection must
+    anchor at the nearest claude.exe, not walk to a shared system root."""
+    processes = [
+        _p(1, 0, "explorer.exe", "explorer"),
+        _p(2, 1, "WindowsTerminal.exe", "wt"),
+        _p(3, 2, "cmd.exe", "cmd"),
+        _p(40, 3, "claude.exe", "claude"),          # self's session root
+        _p(41, 40, "npx.cmd", "npx -y @oleander/mcp-server-mariadb"),  # self, must be excluded
+        _p(4, 1, "WindowsTerminal.exe", "wt"),
+        _p(5, 4, "cmd.exe", "cmd"),
+        _p(50, 5, "claude.exe", "claude"),          # another, unrelated session
+        _p(51, 50, "npx.cmd", "npx -y @oleander/mcp-server-mariadb"),  # must be included
+    ]
+    migrated = {"mariadb": ServerConfig(enabled=True, command="npx", args=["-y", "@oleander/mcp-server-mariadb"], env={})}
+    matches = find_legacy_processes(processes, migrated, self_pid=41)
+    assert [m.pid for m in matches] == [51]
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2069,21 +2090,54 @@ def _matches_server(command_line: str, server: ServerConfig) -> bool:
     return server.command in command_line and all(arg in command_line for arg in server.args)
 
 
+def _descendant_pids(root_pid: int, processes: list[ProcessInfo]) -> set[int]:
+    by_parent: dict[int, list[int]] = {}
+    for p in processes:
+        by_parent.setdefault(p.ppid, []).append(p.pid)
+    result: set[int] = set()
+    queue = [root_pid]
+    while queue:
+        cur = queue.pop()
+        for child in by_parent.get(cur, []):
+            if child not in result:
+                result.add(child)
+                queue.append(child)
+    return result
+
+
 def find_legacy_processes(
     processes: list[ProcessInfo], migrated: dict[str, ServerConfig], self_pid: int
 ) -> list[ProcessInfo]:
-    protected = ancestor_pids(self_pid, processes) | {self_pid}
-    # anything whose ancestor chain touches the protected set is protected too
     by_pid = {p.pid: p for p in processes}
+    self_ancestors = ancestor_pids(self_pid, processes)
 
-    def is_protected(pid: int) -> bool:
-        if pid in protected:
-            return True
-        return bool(ancestor_pids(pid, processes) & protected)
+    # Anchor self-protection at the nearest claude.exe ancestor (self's own
+    # session root) instead of walking all the way up self's full ancestor
+    # chain. Two independent sessions commonly share a high-level ancestor
+    # (explorer.exe, a services host, or an unresolved/off-list pid) well
+    # within a 20-hop bound -- protecting based on ANY shared ancestor, at
+    # any depth (the original design here, and originally caught by live
+    # testing), made every other session's legacy processes look
+    # "protected" too. Stopping at the nearest claude.exe keeps the
+    # protected set scoped to this specific session.
+    session_root = None
+    for candidate_pid in (self_pid, *self_ancestors):
+        proc = by_pid.get(candidate_pid)
+        if proc is not None and proc.name == "claude.exe":
+            session_root = candidate_pid
+            break
+
+    protected = {self_pid} | self_ancestors
+    if session_root is not None:
+        protected |= _descendant_pids(session_root, processes)
+    # else: no resolvable claude.exe boundary found in self's ancestor
+    # chain -- fall back to protecting only self's own direct ancestor
+    # chain. This under-protects self's sibling processes in that edge
+    # case rather than risk over-protecting an unrelated session.
 
     matches = []
     for proc in processes:
-        if is_protected(proc.pid):
+        if proc.pid in protected:
             continue
         for server in migrated.values():
             if _matches_server(proc.command_line, server):
@@ -2115,7 +2169,7 @@ def execute_cleanup(matches: list[ProcessInfo], kill_fn: Callable[[int], None] |
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv\Scripts\pytest tests\test_cleanup.py -v`
-Expected: PASS (5 tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
