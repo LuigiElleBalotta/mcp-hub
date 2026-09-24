@@ -130,12 +130,15 @@ class MainWindow(QMainWindow):
 
         import_btn = QPushButton("Import from Claude Code config")
         apply_btn = QPushButton("Apply to Claude Code config")
+        reload_btn = QPushButton("Reload config.json")
         settings_btn = QPushButton("Settings")
         import_btn.clicked.connect(self._import_from_claude)
         apply_btn.clicked.connect(self._apply_to_claude)
+        reload_btn.clicked.connect(self._reload_config)
         settings_btn.clicked.connect(self._open_settings)
         layout.addWidget(import_btn)
         layout.addWidget(apply_btn)
+        layout.addWidget(reload_btn)
         layout.addWidget(settings_btn)
 
         self.setCentralWidget(central)
@@ -326,11 +329,13 @@ class MainWindow(QMainWindow):
         self._ever_connected = True
         self.connection_banner.setVisible(False)
         self.table.setRowCount(len(statuses))
-        for row, (name, status) in enumerate(sorted(statuses.items())):
+        for row, (name, info) in enumerate(sorted(statuses.items())):
+            status = info["status"]
             self.table.setItem(row, 0, QTableWidgetItem(name))
             status_item = QTableWidgetItem(status)
             status_item.setForeground(QColor(_STATUS_COLOR.get(status, "#000000")))
             self.table.setItem(row, 1, status_item)
+            self.table.setItem(row, 2, QTableWidgetItem(info["concurrency"]))
 
             actions = QWidget()
             actions_layout = QHBoxLayout(actions)
@@ -481,3 +486,25 @@ class MainWindow(QMainWindow):
             return
         migrated = apply_servers(Path(path), config)
         QMessageBox.information(self, "Apply", f"Migrated: {', '.join(migrated) or '(none)'}")
+
+    def _reload_config(self) -> None:
+        """Picks up config.json changes the running hub never saw happen --
+        a hand edit, or a script writing the file directly -- without a hub
+        restart. See `HubManager.reload_from_disk`/`POST /api/reload`."""
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            result = self.client.reload()
+        except Exception as exc:
+            QMessageBox.warning(self, "Reload config.json", f"Impossibile contattare l'hub: {exc}")
+            return
+        added, updated, removed = result["added"], result["updated"], result["removed"]
+        if not (added or updated or removed):
+            QMessageBox.information(self, "Reload config.json", "Nessuna modifica trovata.")
+        else:
+            QMessageBox.information(
+                self, "Reload config.json",
+                f"Aggiunti: {', '.join(added) or '(nessuno)'}\n"
+                f"Aggiornati: {', '.join(updated) or '(nessuno)'}\n"
+                f"Rimossi: {', '.join(removed) or '(nessuno)'}",
+            )
+        self.refresh()

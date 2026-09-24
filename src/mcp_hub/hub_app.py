@@ -244,7 +244,30 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         managed.subscribers.discard(deliver)
 
 
+def _server_mounts(manager: HubManager) -> list[Mount]:
+    return [_mount_for(name, manager) for name, sc in manager.config.servers.items() if sc.enabled]
+
+
 def build_app(manager: HubManager, shutdown_event: asyncio.Event | None = None) -> Starlette:
-    routes = [_mount_for(name, manager) for name, sc in manager.config.servers.items() if sc.enabled]
-    routes += management_routes(manager, shutdown_event)
-    return Starlette(routes=routes)
+    # Each enabled server's SSE/messages routes used to be computed ONCE here
+    # and baked into the Starlette app forever. That is the root cause of the
+    # "enable a server / flip enabled in config.json -> its route 404s until
+    # the whole hub process is restarted" bug: `upsert`/`remove` (management_
+    # api.py) always correctly started/stopped the SUBPROCESS, but never
+    # touched this route list, so a freshly-enabled server ran fine yet was
+    # unreachable over HTTP. Starlette's router just iterates `router.routes`
+    # per request (no compile/cache step), so reassigning that list live is
+    # enough to make a route change take effect on the very next request --
+    # no ASGI-level restart needed. `on_change` is threaded into
+    # `management_routes` and invoked at the end of `upsert`/`remove`, which
+    # is what actually closes the gap for the two ways servers change
+    # (GUI Add/Edit/Remove, and `HubManager.reload_from_disk` for a
+    # hand-edited config.json -- see `manager.py`).
+    app = Starlette(routes=[])
+
+    def rebuild_routes() -> None:
+        app.router.routes = _server_mounts(manager) + mgmt_routes
+
+    mgmt_routes = management_routes(manager, shutdown_event, on_change=rebuild_routes)
+    rebuild_routes()  # populates the initial route list (see docstring above)
+    return app
