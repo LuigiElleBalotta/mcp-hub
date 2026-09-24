@@ -346,3 +346,13 @@ class HubManager:
         self.config.servers[name] = server_config
         self._servers[name] = ManagedServer(name, server_config)
         return self._servers[name]
+
+    async def remove(self, name: str) -> None:
+        """Stops (if running) and drops the `ManagedServer` entry for `name`
+        from both the live manager and `self.config.servers`. A no-op if
+        `name` is unknown -- safe to call idempotently, mirroring `upsert`'s
+        existing stop-before-drop safety for a pre-existing entry."""
+        existing = self._servers.pop(name, None)
+        if existing is not None:
+            await existing.stop()
+        self.config.servers.pop(name, None)
