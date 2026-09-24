@@ -1,5 +1,7 @@
 # mcp-hub
 
+🇮🇹 [Leggi in italiano — README.it.md](README.it.md)
+
 One shared, long-running process that hosts local MCP servers (mariadb,
 headroom, gitlab, figma-bridge, chrome-real, windows-mcp, ...) and exposes
 each one over HTTP/SSE, so N Claude Code sessions connect to the same
@@ -250,6 +252,126 @@ mcp_hub import --from C:\Users\<you>\.claude.json
 mcp_hub serve                                    :: (leave running, or use Task Scheduler autostart)
 mcp_hub apply --to C:\Users\<you>\.claude.json --cleanup
 :: start a fresh Claude Code session and confirm the migrated tools still work
+```
+
+## Migration guide: making the USER-level config win everywhere
+
+`mcp_hub apply` (above) rewrites `mcpServers` entries to point at the hub, at
+whichever single scope you point it at (`.claude.json`'s top-level =
+**user** scope, applies to every project; `--project <path>` = **project**
+scope, applies only there). **Claude Code resolves a server name at
+project scope BEFORE user scope** — a project-level entry with the same
+name always wins, even if the user-level one already points at the hub.
+Left over from before you adopted the hub (or from an old per-project
+setup), these silently shadow your hub-backed entry: that project's
+sessions keep spawning their own local copy of the server instead of using
+the one shared instance. Symptom: `claude mcp list` in that project shows
+the raw `command`/`args` line, not the hub's `http://127.0.0.1:37450/<name>/sse`
+URL.
+
+### 1. Find the shadowing entries
+
+`.claude.json` also holds a lot of unrelated state (history, caches,
+per-project stats) — don't open it in an editor and start deleting by hand.
+Save this as `check-overrides.js` (inline `node -e "..."` one-liners get
+mangled differently by PowerShell/cmd/bash — a file sidesteps all of that).
+It reads the file structurally and only reports project-level server names
+that ALSO exist at user scope (i.e. genuine duplicates worth removing — a
+project-only server with no user-level counterpart is probably there on
+purpose, leave it alone):
+
+```js
+// check-overrides.js
+const fs = require("fs");
+const path = process.env.USERPROFILE + "/.claude.json";
+const c = JSON.parse(fs.readFileSync(path, "utf8"));
+const userNames = new Set(Object.keys(c.mcpServers || {}));
+for (const [proj, cfg] of Object.entries(c.projects || {})) {
+  const shadowed = Object.keys(cfg.mcpServers || {}).filter((n) => userNames.has(n));
+  if (shadowed.length) console.log(proj, "->", shadowed.join(", "));
+}
+```
+
+```
+node check-overrides.js
+```
+
+### 2. Remove them (after reviewing step 1's output)
+
+Save this as `clean-overrides.js`. It always backs up `.claude.json`
+first (with a timestamp, next to the original) before touching anything,
+and only deletes the project-level names that duplicate a user-level one:
+
+```js
+// clean-overrides.js
+const fs = require("fs");
+const path = process.env.USERPROFILE + "/.claude.json";
+fs.copyFileSync(path, `${path}.bak-${Date.now()}`);
+const c = JSON.parse(fs.readFileSync(path, "utf8"));
+const userNames = new Set(Object.keys(c.mcpServers || {}));
+for (const cfg of Object.values(c.projects || {})) {
+  if (!cfg.mcpServers) continue;
+  for (const name of Object.keys(cfg.mcpServers)) {
+    if (userNames.has(name)) delete cfg.mcpServers[name];
+  }
+}
+fs.writeFileSync(path, JSON.stringify(c, null, 2));
+console.log("done");
+```
+
+```
+node clean-overrides.js
+```
+
+### 3. Verify
+
+Restart any open Claude Code sessions in the affected project(s) (MCP
+config is read at session start, not hot-reloaded), then:
+
+```
+claude mcp list
+```
+
+The cleaned-up server should now show the hub's `http://127.0.0.1:37450/<name>/sse`
+URL instead of a local `command`/`args` line.
+
+### Prompt for an agent
+
+Paste this into a Claude Code session (adjust the paths/server names) to
+have an agent do the whole install-and-migrate flow, including this
+project-level cleanup, itself:
+
+```
+Install and adopt mcp-hub (https://github.com/LuigiElleBalotta/mcp-hub) on
+this Windows machine, then migrate my existing Claude Code MCP servers to
+it:
+
+1. Download the latest `mcp-hub.exe` and `mcp-hub-gui.exe` from the repo's
+   GitHub Releases page and put both in
+   `%LOCALAPPDATA%\Programs\mcp-hub\` (create it if missing).
+2. Run `mcp-hub.exe import --from %USERPROFILE%\.claude.json`, then show
+   me the resulting `%LOCALAPPDATA%\mcp-hub\config.json` and ask me which
+   imported servers to set `"enabled": true` on before continuing.
+3. Start the hub (`mcp-hub.exe serve`, or set up autostart via
+   `scripts\install_task.ps1 -Enable` from a checkout, or just launch
+   `mcp-hub-gui.exe`) and confirm `http://127.0.0.1:37450/api/status`
+   answers.
+4. Run `mcp-hub.exe apply --to %USERPROFILE%\.claude.json --cleanup`
+   (confirm the plan it prints before it closes any legacy processes) so
+   my USER-level `.claude.json` points enabled servers at the hub.
+5. Audit `.claude.json` for PROJECT-level `mcpServers` entries that
+   duplicate a name now defined at user scope (project scope wins over
+   user scope in Claude Code, so a leftover project-level entry would
+   silently keep bypassing the hub for that project). Show me the list
+   before touching anything. Back up `.claude.json` first, then remove
+   only the duplicate names from each project's `mcpServers` -- never
+   touch a project-level server that has no user-level counterpart.
+6. Tell me which sessions/projects need a restart to pick this up, and
+   verify with `claude mcp list` that the migrated servers now show the
+   hub's http URL instead of a local command.
+
+Ask before any destructive step (closing processes, deleting config
+entries). Stop and report if anything doesn't match what this describes.
 ```
 
 ## Autostart (Windows Task Scheduler)
