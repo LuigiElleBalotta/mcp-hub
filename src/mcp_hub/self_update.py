@@ -9,10 +9,25 @@ from mcp_hub.updater import UpdateInfo, download_asset
 HUB_EXE_NAME = "mcp-hub.exe"
 GUI_EXE_NAME = "mcp-hub-gui.exe"
 
-# CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS -- launches the helper
-# independent of this process's console/job, so it survives this process
-# (and the hub process) exiting.
-_DETACHED_FLAGS = 0x00000200 | 0x00000008
+# CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB --
+# launches the helper independent of this process's console AND its Job
+# Object, so it survives this process (and the hub process) exiting.
+#
+# Found live (Important finding): CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+# alone detaches from the console and process group, but NOT from a Windows
+# Job Object -- if this GUI process happens to be a descendant of a job with
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set (common: many terminal/IDE hosts
+# assign one to their child process tree for cleanup), the helper inherits
+# that job membership regardless of these flags, and dies WITH the rest of
+# the tree the moment it's torn down -- mid-script, before it ever reaches
+# Replace-WithRetry or the relaunch. Reproduced live: "Installa e riavvia"
+# showed "Download in corso...", both processes exited (the intended part),
+# but neither exe got replaced and nothing came back -- the detached helper
+# was gone too, with no trace, no error, nothing. CREATE_BREAKAWAY_FROM_JOB
+# on process creation is what actually escapes an existing job (subject to
+# the job allowing it, which is the default unless a job explicitly sets
+# JOB_OBJECT_LIMIT_BREAKAWAY_OK to false).
+_DETACHED_FLAGS = 0x00000200 | 0x00000008 | 0x01000000
 
 _HELPER_SCRIPT = """\
 param(
@@ -24,11 +39,23 @@ param(
     [string]$TargetGuiExe
 )
 
+# Logged to a fixed path next to the downloaded exes (not stdout/stderr --
+# this process is fully detached and hidden, nothing would ever see them)
+# so a failed update leaves a trace instead of the previous silent "nothing
+# happens" -- found live with zero diagnostic information to go on.
+$logPath = Join-Path (Split-Path -Parent $NewHubExe) "apply_update.log"
+function Log($msg) {
+    "$(Get-Date -Format o)  $msg" | Out-File -FilePath $logPath -Append -Encoding utf8
+}
+
+Log "start: HubPid=$HubPid GuiPid=$GuiPid"
+
 foreach ($p in @($HubPid, $GuiPid)) {
     if ($p -gt 0) {
         try { Wait-Process -Id $p -Timeout 30 -ErrorAction SilentlyContinue } catch {}
     }
 }
+Log "both processes exited (or timed out waiting)"
 
 # The old exes may stay locked for a moment after their process exits
 # (antivirus scan, handle release lag) -- retry instead of failing outright.
@@ -44,11 +71,22 @@ function Replace-WithRetry($source, $target) {
     return $false
 }
 
-Replace-WithRetry -source $NewHubExe -target $TargetHubExe | Out-Null
-Replace-WithRetry -source $NewGuiExe -target $TargetGuiExe | Out-Null
+$hubReplaced = Replace-WithRetry -source $NewHubExe -target $TargetHubExe
+$guiReplaced = Replace-WithRetry -source $NewGuiExe -target $TargetGuiExe
+Log "replace: hub=$hubReplaced gui=$guiReplaced"
 
-Start-Process -FilePath $TargetHubExe -ArgumentList "serve"
-Start-Process -FilePath $TargetGuiExe
+try {
+    Start-Process -FilePath $TargetHubExe -ArgumentList "serve"
+    Log "started hub"
+} catch {
+    Log "FAILED to start hub: $_"
+}
+try {
+    Start-Process -FilePath $TargetGuiExe
+    Log "started gui"
+} catch {
+    Log "FAILED to start gui: $_"
+}
 """
 
 
