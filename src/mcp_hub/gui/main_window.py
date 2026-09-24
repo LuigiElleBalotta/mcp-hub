@@ -26,6 +26,38 @@ class _UpdateCheckWorker(QThread):
         self.found.emit(check_for_update(mcp_hub.__version__, include_beta=self._include_beta))
 
 
+class _StatusWorker(QThread):
+    """Runs `client.status()` off the Qt main thread.
+
+    `HubApiClient.status()` is a synchronous httpx call; calling it directly
+    from `MainWindow.refresh()` (a 2s `QTimer` callback running ON the main
+    thread) blocks the entire GUI -- repaints, clicks, drags, everything --
+    for the call's full duration every single tick. That's mostly invisible
+    when the hub answers in a few ms, but when the hub is unreachable
+    (nothing listening on the port), Windows can take several seconds per
+    connection attempt to give up (no immediate RST), so the window sits
+    frozen for most of every 2s cycle -- exactly the "GUI molto lenta"
+    symptom, confirmed live: a GUI launched with no hub running spent most
+    of its time blocked in this call. httpx.Client is documented safe for
+    concurrent use across threads, so sharing `client` with the main
+    thread's own direct calls (start/stop/upsert/remove, all short-lived
+    and user-initiated) is fine.
+    """
+    done = Signal(bool, object)  # (ok, statuses dict | None)
+
+    def __init__(self, client: HubApiClient, parent=None):
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            statuses = self._client.status()
+        except Exception:
+            self.done.emit(False, None)
+        else:
+            self.done.emit(True, statuses)
+
+
 class _InstallUpdateWorker(QThread):
     finished_ok = Signal(bool, str)  # (success, error message)
 
@@ -58,6 +90,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(480, 320)
 
         self._ever_connected = False
+        self._last_hub_launch_attempt = 0.0
+        self._status_worker: _StatusWorker | None = None
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Server", "Status", "Concurrency", "Actions"])
@@ -178,13 +212,17 @@ class MainWindow(QMainWindow):
             super().closeEvent(event)
 
     def _check_for_updates(self) -> None:
-        try:
-            settings = self.client.settings()
-        except Exception:
+        # Reads config.json directly rather than through the hub API: this
+        # must still work when the hub is unreachable (arguably the most
+        # important time to tell the user a newer build exists, if that's
+        # why the hub isn't answering) -- `checkForUpdates`/
+        # `includeBetaUpdates` don't need the running hub's in-memory state,
+        # just what's on disk, same as `SettingsDialog` already reads.
+        from mcp_hub.config import load_config
+        hub_config = load_config().hub
+        if not hub_config.checkForUpdates:
             return
-        if not settings.get("checkForUpdates", True):
-            return
-        self._update_thread = _UpdateCheckWorker(settings.get("includeBetaUpdates", False), self)
+        self._update_thread = _UpdateCheckWorker(hub_config.includeBetaUpdates, self)
         self._update_thread.found.connect(self._on_update_check_result)
         self._update_thread.start()
 
@@ -241,27 +279,49 @@ class MainWindow(QMainWindow):
             return
         # The detached helper is now waiting for the hub's process and this
         # GUI's own process to exit before it replaces the exes and
-        # relaunches both -- shut the hub down gracefully, then close
-        # ourselves so its file lock is released too.
+        # relaunches both -- shut the hub down gracefully, then quit
+        # ourselves so its file lock is released too. Must be a REAL quit
+        # (QApplication.quit()), not self.close(): closeEvent() now hides to
+        # tray instead of exiting (R3), so a plain self.close() here would
+        # leave this process alive-but-hidden, the helper's `Wait-Process
+        # -Id $GuiPid` would sit out its full 30s timeout, and the file
+        # replace would then either fail (exe still locked) or race a still
+        # -running old GUI against the freshly relaunched new one.
+        from PySide6.QtWidgets import QApplication
         try:
             self.client.shutdown()
         except Exception:
             pass
-        self.close()
+        self.tray_icon.hide()
+        QApplication.quit()
 
     def refresh(self) -> None:
-        try:
-            statuses = self.client.status()
-        except Exception:
+        # Runs the actual HTTP call in `_StatusWorker` (see its docstring)
+        # instead of blocking this 2s QTimer callback -- and thus the whole
+        # GUI thread -- on `client.status()` directly. Skips spawning a new
+        # worker if one from a previous tick is still in flight (a slow/
+        # hung hub must not pile up overlapping requests).
+        if self._status_worker is not None and self._status_worker.isRunning():
+            return
+        self._status_worker = _StatusWorker(self.client, self)
+        self._status_worker.done.connect(self._on_status_result)
+        self._status_worker.start()
+
+    def _on_status_result(self, ok: bool, statuses: dict | None) -> None:
+        if not ok:
             # Hub unreachable -- could be the first-run wizard's freshly
             # spawned hub still starting up, or a transient blip on an
             # already-running hub. Only wipe the table if we've never had a
             # successful status yet; otherwise keep showing the last known
             # state instead of flashing it empty every failed 2s tick, and
             # surface a banner so the user knows why nothing is updating.
+            self.connection_banner.setText(
+                "Hub non raggiungibile — nuovo tentativo automatico in corso..."
+            )
             self.connection_banner.setVisible(True)
             if not self._ever_connected:
                 self.table.setRowCount(0)
+                self._maybe_launch_hub()
             return
         self._ever_connected = True
         self.connection_banner.setVisible(False)
@@ -288,6 +348,26 @@ class MainWindow(QMainWindow):
             actions_layout.addWidget(edit_btn)
             actions_layout.addWidget(remove_btn)
             self.table.setCellWidget(row, 3, actions)
+
+    def _maybe_launch_hub(self) -> None:
+        """Best-effort attempt to start the hub ourselves when it's never
+        answered at all in this GUI session -- covers every case past the
+        first run that `app.py`'s setup-wizard-only `_launch_hub()` call
+        doesn't: autostart disabled/failed, the hub crashed before this GUI
+        connected even once, or the user just launched the GUI without ever
+        starting the hub. Throttled to once per 10s (`time.monotonic()`) so
+        the 2s poll timer can't spawn a new hub process on every tick; never
+        fires again once `_ever_connected` is True (a hub that goes down
+        AFTER we've talked to it once -- e.g. mid self-update restart -- is
+        expected to come back on its own, not have us race it with a
+        second hub trying to bind the same port)."""
+        import time
+        now = time.monotonic()
+        if now - self._last_hub_launch_attempt < 10:
+            return
+        self._last_hub_launch_attempt = now
+        from mcp_hub.gui.app import _launch_hub
+        _launch_hub()
 
     def _start(self, name: str) -> None:
         self.client.start(name)
