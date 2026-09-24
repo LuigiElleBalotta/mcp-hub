@@ -293,3 +293,37 @@ async def test_stop_kills_the_entire_process_tree_not_just_the_direct_child():
                 server.process.kill()
             except ProcessLookupError:
                 pass
+
+
+@pytest.mark.asyncio
+async def test_remove_drops_from_manager_and_config():
+    cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config()})
+    manager = HubManager(cfg)
+    await manager.remove("a")
+    assert "a" not in cfg.servers
+    with pytest.raises(KeyError):
+        manager.get("a")
+
+
+@pytest.mark.asyncio
+async def test_remove_stops_a_running_server_before_dropping_it():
+    cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config(seconds=5)})
+    manager = HubManager(cfg)
+    await manager.start_all()
+    await asyncio.sleep(0.05)
+    process = manager.get("a").process
+    assert process is not None
+    assert process.returncode is None  # confirmed running before remove
+
+    await manager.remove("a")
+
+    assert process.returncode is not None
+    assert "a" not in cfg.servers
+
+
+@pytest.mark.asyncio
+async def test_remove_is_a_noop_for_an_unknown_name():
+    cfg = Config(hub=HubConfig(), servers={})
+    manager = HubManager(cfg)
+    await manager.remove("does-not-exist")  # must not raise
+    assert "does-not-exist" not in cfg.servers

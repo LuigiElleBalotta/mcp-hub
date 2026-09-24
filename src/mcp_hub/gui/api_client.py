@@ -22,8 +22,14 @@ class HubApiClient:
     def upsert(self, name: str, config: dict) -> str:
         return self._client.post(f"/api/servers/{name}", json=config).json()["status"]
 
+    def remove(self, name: str) -> None:
+        self._client.delete(f"/api/servers/{name}")
+
     def settings(self) -> dict:
         return self._client.get("/api/settings").json()
+
+    def update_settings(self, **fields) -> dict:
+        return self._client.put("/api/settings", json=fields).json()
 
     def pid(self) -> int:
         return self._client.get("/api/pid").json()["pid"]

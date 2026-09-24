@@ -21,6 +21,22 @@ def management_routes(manager: HubManager, shutdown_event: asyncio.Event | None 
             "includeBetaUpdates": manager.config.hub.includeBetaUpdates,
         })
 
+    async def update_settings(request: Request) -> JSONResponse:
+        # Only the fields the running hub actually reads live are accepted
+        # here -- host/port/authToken take effect only on the next hub
+        # start (the listening socket is already bound) and are edited by
+        # the GUI writing config.json directly instead (see settings_dialog.py).
+        body = await request.json()
+        if "checkForUpdates" in body:
+            manager.config.hub.checkForUpdates = bool(body["checkForUpdates"])
+        if "includeBetaUpdates" in body:
+            manager.config.hub.includeBetaUpdates = bool(body["includeBetaUpdates"])
+        save_config(manager.config)
+        return JSONResponse({
+            "checkForUpdates": manager.config.hub.checkForUpdates,
+            "includeBetaUpdates": manager.config.hub.includeBetaUpdates,
+        })
+
     async def pid(request: Request) -> JSONResponse:
         return JSONResponse({"pid": os.getpid()})
 
@@ -62,13 +78,21 @@ def management_routes(manager: HubManager, shutdown_event: asyncio.Event | None 
             await managed.start()
         return JSONResponse({"status": managed.status})
 
+    async def remove(request: Request) -> JSONResponse:
+        name = request.path_params["name"]
+        await manager.remove(name)
+        save_config(manager.config)
+        return JSONResponse({"status": "removed"})
+
     return [
         Route("/api/status", status, methods=["GET"]),
         Route("/api/settings", settings, methods=["GET"]),
+        Route("/api/settings", update_settings, methods=["PUT"]),
         Route("/api/pid", pid, methods=["GET"]),
         Route("/api/shutdown", shutdown, methods=["POST"]),
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),
         Route("/api/servers/{name}/logs", logs, methods=["GET"]),
         Route("/api/servers/{name}", upsert, methods=["POST"]),
+        Route("/api/servers/{name}", remove, methods=["DELETE"]),
     ]

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QHBoxLayout, QLabel,
+    QPushButton, QHBoxLayout, QLabel, QHeaderView, QMenu, QStyle,
+    QSystemTrayIcon,
 )
 
 from mcp_hub.gui.api_client import HubApiClient
@@ -54,8 +55,21 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"mcp-hub v{mcp_hub.__version__}")
         self.client = client or HubApiClient()
 
+        self.setMinimumSize(480, 320)
+
+        self._ever_connected = False
+
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Server", "Status", "Concurrency", "Actions"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.connection_banner = QLabel("Hub non raggiungibile — nuovo tentativo tra 2s...")
+        self.connection_banner.setVisible(False)
+        self.connection_banner.setStyleSheet("background-color: #f8d7da; padding: 6px;")
 
         self.update_banner = QLabel()
         self.update_banner.setOpenExternalLinks(True)
@@ -73,7 +87,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addLayout(update_row)
-        layout.addWidget(self.table)
+        layout.addWidget(self.connection_banner)
+        layout.addWidget(self.table, 2)
 
         add_btn = QPushButton("Add server")
         add_btn.clicked.connect(self._add_server)
@@ -81,26 +96,26 @@ class MainWindow(QMainWindow):
 
         import_btn = QPushButton("Import from Claude Code config")
         apply_btn = QPushButton("Apply to Claude Code config")
+        settings_btn = QPushButton("Settings")
         import_btn.clicked.connect(self._import_from_claude)
         apply_btn.clicked.connect(self._apply_to_claude)
+        settings_btn.clicked.connect(self._open_settings)
         layout.addWidget(import_btn)
         layout.addWidget(apply_btn)
-
-        from PySide6.QtWidgets import QCheckBox
-        self.autostart_checkbox = QCheckBox("Avvia con Windows")
-        self.autostart_checkbox.toggled.connect(self._toggle_autostart)
-        layout.addWidget(self.autostart_checkbox)
+        layout.addWidget(settings_btn)
 
         self.setCentralWidget(central)
 
         from mcp_hub.gui.log_panel import LogPanel
         self.log_panel = LogPanel()
         self.table.itemSelectionChanged.connect(self._on_row_selected)
-        layout.addWidget(self.log_panel)
+        layout.addWidget(self.log_panel, 1)
 
         version_label = QLabel(f"mcp-hub v{mcp_hub.__version__}")
         version_label.setStyleSheet("color: #888; padding: 2px 4px;")
         layout.addWidget(version_label)
+
+        self._init_tray()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -111,6 +126,56 @@ class MainWindow(QMainWindow):
         self._install_thread: _InstallUpdateWorker | None = None
         self._pending_update: UpdateInfo | None = None
         self._check_for_updates()
+
+    def _init_tray(self) -> None:
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        self.setWindowIcon(icon)
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip(self.windowTitle())
+
+        menu = QMenu()
+        open_action = menu.addAction("Apri")
+        open_action.triggered.connect(self._restore_from_tray)
+        quit_action = menu.addAction("Esci")
+        quit_action.triggered.connect(self._quit_from_tray)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        self.tray_icon.hide()
+        QApplication.quit()
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                self.windowTitle(), "mcp-hub è ancora attivo nel system tray.",
+                QSystemTrayIcon.MessageIcon.Information, 2000,
+            )
+            return
+        super().changeEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+        else:
+            super().closeEvent(event)
 
     def _check_for_updates(self) -> None:
         try:
@@ -188,11 +253,18 @@ class MainWindow(QMainWindow):
         try:
             statuses = self.client.status()
         except Exception:
-            # Hub not reachable yet -- e.g. the first-run wizard just spawned
-            # it and it hasn't finished starting up. The 2s timer retries on
-            # its own; nothing to show until then.
-            self.table.setRowCount(0)
+            # Hub unreachable -- could be the first-run wizard's freshly
+            # spawned hub still starting up, or a transient blip on an
+            # already-running hub. Only wipe the table if we've never had a
+            # successful status yet; otherwise keep showing the last known
+            # state instead of flashing it empty every failed 2s tick, and
+            # surface a banner so the user knows why nothing is updating.
+            self.connection_banner.setVisible(True)
+            if not self._ever_connected:
+                self.table.setRowCount(0)
             return
+        self._ever_connected = True
+        self.connection_banner.setVisible(False)
         self.table.setRowCount(len(statuses))
         for row, (name, status) in enumerate(sorted(statuses.items())):
             self.table.setItem(row, 0, QTableWidgetItem(name))
@@ -205,10 +277,16 @@ class MainWindow(QMainWindow):
             actions_layout.setContentsMargins(0, 0, 0, 0)
             start_btn = QPushButton("Start")
             stop_btn = QPushButton("Stop")
+            edit_btn = QPushButton("Edit")
+            remove_btn = QPushButton("Remove")
             start_btn.clicked.connect(lambda _, n=name: self._start(n))
             stop_btn.clicked.connect(lambda _, n=name: self._stop(n))
+            edit_btn.clicked.connect(lambda _, n=name: self._edit(n))
+            remove_btn.clicked.connect(lambda _, n=name: self._remove(n))
             actions_layout.addWidget(start_btn)
             actions_layout.addWidget(stop_btn)
+            actions_layout.addWidget(edit_btn)
+            actions_layout.addWidget(remove_btn)
             self.table.setCellWidget(row, 3, actions)
 
     def _start(self, name: str) -> None:
@@ -231,12 +309,39 @@ class MainWindow(QMainWindow):
             self.client.upsert(name, dialog.result_config())
             self.refresh()
 
-    def _toggle_autostart(self, checked: bool) -> None:
-        import subprocess
-        from pathlib import Path
-        script = Path(__file__).resolve().parents[3] / "scripts" / "install_task.ps1"
-        flag = "-Enable" if checked else "-Disable"
-        subprocess.run(["powershell", "-File", str(script), flag], check=False)
+    def _edit(self, name: str) -> None:
+        from dataclasses import asdict
+        from mcp_hub.config import load_config
+        from mcp_hub.gui.server_dialog import ServerDialog
+        from PySide6.QtWidgets import QMessageBox
+
+        config = load_config()
+        existing_sc = config.servers.get(name)
+        dialog = ServerDialog(name, existing=asdict(existing_sc) if existing_sc else None, parent=self)
+        if dialog.exec():
+            new_name = dialog.result_name()
+            if not new_name:
+                QMessageBox.warning(self, "Edit server", "Name cannot be empty.")
+                return
+            self.client.upsert(new_name, dialog.result_config())
+            self.refresh()
+
+    def _remove(self, name: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        confirm = QMessageBox.question(
+            self, "Remove server",
+            f"Rimuovere '{name}'? Il processo verrà fermato.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.client.remove(name)
+        self.refresh()
+
+    def _open_settings(self) -> None:
+        from mcp_hub.gui.settings_dialog import SettingsDialog
+        dialog = SettingsDialog(client=self.client, parent=self)
+        if dialog.exec():
+            dialog.apply()
 
     def _on_row_selected(self) -> None:
         row = self.table.currentRow()
