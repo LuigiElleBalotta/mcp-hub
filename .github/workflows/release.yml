@@ -47,6 +47,12 @@ jobs:
           python -m pip install -e .
           python -m pip install pyinstaller
 
+      - name: Stamp package version from the tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "__version__ = \"$VERSION\"" > src/mcp_hub/__init__.py
+
       - name: Build CLI exe (mcp-hub serve/import/apply)
         run: pyinstaller --onefile --name mcp-hub src/mcp_hub/__main__.py
 

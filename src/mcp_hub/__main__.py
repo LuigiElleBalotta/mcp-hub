@@ -8,6 +8,7 @@ from pathlib import Path
 
 import uvicorn
 
+import mcp_hub
 from mcp_hub.config import load_config, save_config
 from mcp_hub.hub_app import build_app
 from mcp_hub.manager import HubManager
@@ -62,6 +63,7 @@ async def _watch_shutdown(event: asyncio.Event, server: uvicorn.Server) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
+    print(f"mcp-hub v{mcp_hub.__version__}")
     config = load_config()
     localhost_names = {"127.0.0.1", "localhost"}
     if config.hub.host not in localhost_names and not config.hub.authToken:
@@ -111,6 +113,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="mcp_hub")
+    parser.add_argument("--version", action="version", version=f"mcp-hub {mcp_hub.__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve").set_defaults(func=cmd_serve)
 

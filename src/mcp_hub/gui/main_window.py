@@ -50,7 +50,8 @@ class _InstallUpdateWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self, client: HubApiClient | None = None):
         super().__init__()
-        self.setWindowTitle("mcp-hub")
+        import mcp_hub
+        self.setWindowTitle(f"mcp-hub v{mcp_hub.__version__}")
         self.client = client or HubApiClient()
 
         self.table = QTableWidget(0, 4)
@@ -96,6 +97,10 @@ class MainWindow(QMainWindow):
         self.log_panel = LogPanel()
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         layout.addWidget(self.log_panel)
+
+        version_label = QLabel(f"mcp-hub v{mcp_hub.__version__}")
+        version_label.setStyleSheet("color: #888; padding: 2px 4px;")
+        layout.addWidget(version_label)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
