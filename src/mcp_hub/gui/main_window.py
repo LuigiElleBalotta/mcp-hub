@@ -25,6 +25,28 @@ class _UpdateCheckWorker(QThread):
         self.found.emit(check_for_update(mcp_hub.__version__, include_beta=self._include_beta))
 
 
+class _InstallUpdateWorker(QThread):
+    finished_ok = Signal(bool, str)  # (success, error message)
+
+    def __init__(self, info: UpdateInfo, hub_pid: int, parent=None):
+        super().__init__(parent)
+        self._info = info
+        self._hub_pid = hub_pid
+
+    def run(self) -> None:
+        import os
+        from pathlib import Path
+
+        from mcp_hub import self_update
+
+        try:
+            work_dir = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mcp-hub" / "update-staging"
+            self_update.apply_update(self._info, self._hub_pid, work_dir)
+            self.finished_ok.emit(True, "")
+        except Exception as exc:
+            self.finished_ok.emit(False, str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, client: HubApiClient | None = None):
         super().__init__()
@@ -39,9 +61,17 @@ class MainWindow(QMainWindow):
         self.update_banner.setVisible(False)
         self.update_banner.setStyleSheet("background-color: #fff3cd; padding: 6px;")
 
+        self.install_update_btn = QPushButton("Installa e riavvia")
+        self.install_update_btn.setVisible(False)
+        self.install_update_btn.clicked.connect(self._install_update)
+
+        update_row = QHBoxLayout()
+        update_row.addWidget(self.update_banner)
+        update_row.addWidget(self.install_update_btn)
+
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.addWidget(self.update_banner)
+        layout.addLayout(update_row)
         layout.addWidget(self.table)
 
         add_btn = QPushButton("Add server")
@@ -73,6 +103,8 @@ class MainWindow(QMainWindow):
         self.refresh()
 
         self._update_thread: _UpdateCheckWorker | None = None
+        self._install_thread: _InstallUpdateWorker | None = None
+        self._pending_update: UpdateInfo | None = None
         self._check_for_updates()
 
     def _check_for_updates(self) -> None:
@@ -89,12 +121,63 @@ class MainWindow(QMainWindow):
     def _on_update_check_result(self, info: UpdateInfo | None) -> None:
         if info is None:
             return
+        self._pending_update = info
         kind = "beta" if info.prerelease else "release"
         self.update_banner.setText(
             f'Nuova versione {kind} disponibile: <b>{info.version}</b> — '
             f'<a href="{info.url}">scarica</a>'
         )
         self.update_banner.setVisible(True)
+
+        from mcp_hub import self_update
+        can_auto_install = (
+            self_update.is_frozen()
+            and self_update.HUB_EXE_NAME in info.assets
+            and self_update.GUI_EXE_NAME in info.assets
+        )
+        self.install_update_btn.setVisible(can_auto_install)
+
+    def _install_update(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        if self._pending_update is None:
+            return
+        confirm = QMessageBox.question(
+            self, "Installa aggiornamento",
+            f"Scarica e installa {self._pending_update.version}.\n\n"
+            "L'hub verrà riavviato: le sessioni Claude Code che lo usano ora "
+            "perderanno la connessione per qualche secondo, poi tornano "
+            "operative con la nuova versione.\n\nContinuare?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            hub_pid = self.client.pid()
+        except Exception as exc:
+            QMessageBox.warning(self, "Installa aggiornamento", f"Impossibile contattare l'hub: {exc}")
+            return
+
+        self.install_update_btn.setEnabled(False)
+        self.install_update_btn.setText("Download in corso...")
+        self._install_thread = _InstallUpdateWorker(self._pending_update, hub_pid, self)
+        self._install_thread.finished_ok.connect(self._on_install_result)
+        self._install_thread.start()
+
+    def _on_install_result(self, success: bool, error: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        if not success:
+            QMessageBox.warning(self, "Installa aggiornamento", f"Aggiornamento fallito: {error}")
+            self.install_update_btn.setEnabled(True)
+            self.install_update_btn.setText("Installa e riavvia")
+            return
+        # The detached helper is now waiting for the hub's process and this
+        # GUI's own process to exit before it replaces the exes and
+        # relaunches both -- shut the hub down gracefully, then close
+        # ourselves so its file lock is released too.
+        try:
+            self.client.shutdown()
+        except Exception:
+            pass
+        self.close()
 
     def refresh(self) -> None:
         statuses = self.client.status()

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import httpx
@@ -17,6 +18,7 @@ class UpdateInfo:
     version: str
     url: str
     prerelease: bool
+    assets: dict[str, str] = field(default_factory=dict)  # {filename: browser_download_url}
 
 
 def _version_key(tag: str) -> tuple[int, int, int, int, int] | None:
@@ -64,8 +66,36 @@ def check_for_update(
 
     if best_release is None:
         return None
+    assets = {
+        a["name"]: a["browser_download_url"]
+        for a in best_release.get("assets", [])
+        if "name" in a and "browser_download_url" in a
+    }
     return UpdateInfo(
         version=best_release["tag_name"],
         url=best_release["html_url"],
         prerelease=bool(best_release["prerelease"]),
+        assets=assets,
     )
+
+
+def download_asset(
+    url: str,
+    dest: Path,
+    fetch: Callable[[str], httpx.Response] | None = None,
+) -> None:
+    """Streams a release asset to `dest` (temp-file-then-rename, so a failed
+    or interrupted download never leaves a partial file at the final path)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    if fetch is not None:
+        response = fetch(url)
+        response.raise_for_status()
+        tmp.write_bytes(response.content)
+    else:
+        with httpx.stream("GET", url, follow_redirects=True, timeout=60.0) as response:
+            response.raise_for_status()
+            with tmp.open("wb") as f:
+                for chunk in response.iter_bytes():
+                    f.write(chunk)
+    tmp.replace(dest)

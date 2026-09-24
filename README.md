@@ -158,8 +158,13 @@ writes `config.json` directly.
   confirmation dialog before any write.
 - **Update banner**: if a newer version is published on GitHub Releases
   (and `hub.checkForUpdates` is true), a banner appears with a link to
-  download it. This is a manual-download notification only — it does not
-  download or replace the running exe/install for you.
+  download it.
+- **Installa e riavvia** (only shown when running as the built `.exe`, not
+  `python -m mcp_hub.gui`, and only when the release has both exe assets):
+  one click downloads `mcp-hub.exe`/`mcp-hub-gui.exe` for the new version,
+  then replaces the installed exes and relaunches both — see
+  [Auto-update](#auto-update) below for exactly what happens and why it
+  needs a click rather than running silently.
 
 ## Moving servers to/from Claude Code's config
 
@@ -240,6 +245,41 @@ Any other tag shape is ignored by the workflow.
 The GUI's update checker (`hub.checkForUpdates`) polls this same GitHub
 Releases list; set `hub.includeBetaUpdates: true` to also be notified about
 `x.y.z-n` prereleases, not just stable tags.
+
+## Auto-update
+
+**Install layout this depends on:** `mcp-hub.exe` and `mcp-hub-gui.exe`
+must sit in the same folder (exactly how the release workflow builds
+them and how you should unzip/place them). The GUI locates the hub exe as
+"the file named `mcp-hub.exe` next to my own exe" — `self_update.py`.
+
+Clicking **Installa e riavvia** in the update banner:
+
+1. Confirms once (this restarts the hub — see the warning it shows).
+2. Fetches `hub_pid` from the running hub (`GET /api/pid`).
+3. Downloads the new `mcp-hub.exe`/`mcp-hub-gui.exe` from the GitHub
+   Release's assets to `%LOCALAPPDATA%\mcp-hub\update-staging\`.
+4. Launches a detached PowerShell helper that waits for both the hub
+   process and this GUI process to actually exit (their exe files are
+   locked while running — Windows can't overwrite them in place), then
+   copies the new exes over the old ones and relaunches `mcp-hub.exe serve`
+   and `mcp-hub-gui.exe`.
+5. Tells the hub to shut down gracefully (`POST /api/shutdown` — this is
+   the same clean exit path as Ctrl-C, so every managed subprocess is
+   stopped rather than orphaned) and then closes its own window, so both
+   locks are released and the helper's wait in step 4 unblocks.
+
+This only ever runs after your click — nothing downloads or restarts
+anything on its own. It only appears at all when running the built exe
+(`sys.frozen`); in a dev checkout (`python -m mcp_hub.gui`) you still get
+the banner and its manual download link, since there's no installed exe
+for the GUI to replace.
+
+**What it does to other open Claude Code sessions:** the same thing the
+hub restarting for any other reason would — every session currently
+talking to the hub loses its connection for the few seconds the hub takes
+to relaunch, then reconnects automatically. This is exactly why the button
+requires a click and a warning instead of running unattended.
 
 ## Security notes
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import os
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -8,7 +11,7 @@ from mcp_hub.config import ServerConfig, save_config
 from mcp_hub.manager import HubManager
 
 
-def management_routes(manager: HubManager) -> list[Route]:
+def management_routes(manager: HubManager, shutdown_event: asyncio.Event | None = None) -> list[Route]:
     async def status(request: Request) -> JSONResponse:
         return JSONResponse({"servers": manager.status_snapshot()})
 
@@ -17,6 +20,19 @@ def management_routes(manager: HubManager) -> list[Route]:
             "checkForUpdates": manager.config.hub.checkForUpdates,
             "includeBetaUpdates": manager.config.hub.includeBetaUpdates,
         })
+
+    async def pid(request: Request) -> JSONResponse:
+        return JSONResponse({"pid": os.getpid()})
+
+    async def shutdown(request: Request) -> JSONResponse:
+        # Graceful: lets `serve_with_managed_shutdown`'s `finally` stop every
+        # managed subprocess before the process exits, instead of a caller
+        # killing the hub's OS process directly and orphaning them. Used by
+        # the GUI's self-update flow, which needs the hub's exe file
+        # unlocked (process exited) before it can be replaced on disk.
+        if shutdown_event is not None:
+            shutdown_event.set()
+        return JSONResponse({"status": "shutting down"})
 
     async def start(request: Request) -> JSONResponse:
         name = request.path_params["name"]
@@ -49,6 +65,8 @@ def management_routes(manager: HubManager) -> list[Route]:
     return [
         Route("/api/status", status, methods=["GET"]),
         Route("/api/settings", settings, methods=["GET"]),
+        Route("/api/pid", pid, methods=["GET"]),
+        Route("/api/shutdown", shutdown, methods=["POST"]),
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),
         Route("/api/servers/{name}/logs", logs, methods=["GET"]),

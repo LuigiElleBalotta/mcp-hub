@@ -24,3 +24,12 @@ class HubApiClient:
 
     def settings(self) -> dict:
         return self._client.get("/api/settings").json()
+
+    def pid(self) -> int:
+        return self._client.get("/api/pid").json()["pid"]
+
+    def shutdown(self) -> None:
+        try:
+            self._client.post("/api/shutdown")
+        except httpx.RemoteProtocolError:
+            pass  # hub closed the connection as it shut down -- expected

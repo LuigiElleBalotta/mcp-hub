@@ -244,7 +244,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         managed.subscribers.discard(deliver)
 
 
-def build_app(manager: HubManager) -> Starlette:
+def build_app(manager: HubManager, shutdown_event: asyncio.Event | None = None) -> Starlette:
     routes = [_mount_for(name, manager) for name, sc in manager.config.servers.items() if sc.enabled]
-    routes += management_routes(manager)
+    routes += management_routes(manager, shutdown_event)
     return Starlette(routes=routes)

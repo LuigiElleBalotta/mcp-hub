@@ -1,6 +1,6 @@
 import httpx
 
-from mcp_hub.updater import check_for_update
+from mcp_hub.updater import check_for_update, download_asset
 
 
 class _FakeResponse:
@@ -65,3 +65,32 @@ def test_returns_none_on_network_error():
     def fetch(url: str) -> httpx.Response:
         raise httpx.ConnectError("nope")
     assert check_for_update("1.2.0", fetch=fetch) is None
+
+
+def test_exposes_download_urls_for_release_assets():
+    releases = [{
+        "tag_name": "1.3.0", "html_url": "u", "prerelease": False, "draft": False,
+        "assets": [
+            {"name": "mcp-hub.exe", "browser_download_url": "https://dl/mcp-hub.exe"},
+            {"name": "mcp-hub-gui.exe", "browser_download_url": "https://dl/mcp-hub-gui.exe"},
+        ],
+    }]
+    info = check_for_update("1.2.0", fetch=_fake_fetch(releases))
+    assert info.assets == {
+        "mcp-hub.exe": "https://dl/mcp-hub.exe",
+        "mcp-hub-gui.exe": "https://dl/mcp-hub-gui.exe",
+    }
+
+
+def test_download_asset_writes_content_and_leaves_no_partial_file(tmp_path):
+    class _BytesResponse:
+        content = b"exe-bytes"
+
+        def raise_for_status(self):
+            pass
+
+    dest = tmp_path / "mcp-hub.exe"
+    download_asset("https://dl/mcp-hub.exe", dest, fetch=lambda url: _BytesResponse())
+
+    assert dest.read_bytes() == b"exe-bytes"
+    assert list(tmp_path.glob("*.part")) == []

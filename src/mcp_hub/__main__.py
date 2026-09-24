@@ -15,7 +15,9 @@ from mcp_hub.claude_config import import_servers, apply_servers
 from mcp_hub.cleanup import list_processes, find_legacy_processes, describe_plan, execute_cleanup
 
 
-async def serve_with_managed_shutdown(manager: HubManager, server: uvicorn.Server) -> None:
+async def serve_with_managed_shutdown(
+    manager: HubManager, server: uvicorn.Server, shutdown_event: asyncio.Event | None = None
+) -> None:
     """Starts every managed server, runs `server.serve()`, and guarantees
     every managed subprocess is stopped afterward.
 
@@ -41,9 +43,22 @@ async def serve_with_managed_shutdown(manager: HubManager, server: uvicorn.Serve
     """
     try:
         await manager.start_all()
+        watcher = None
+        if shutdown_event is not None:
+            watcher = asyncio.create_task(_watch_shutdown(shutdown_event, server))
         await server.serve()
+        if watcher is not None:
+            watcher.cancel()
     finally:
         await manager.stop_all()
+
+
+async def _watch_shutdown(event: asyncio.Event, server: uvicorn.Server) -> None:
+    """Lets `/api/shutdown` (self-update flow) trigger the same graceful
+    exit path as Ctrl-C, instead of requiring a caller to kill the process
+    and skip `manager.stop_all()`."""
+    await event.wait()
+    server.should_exit = True
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -55,10 +70,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
             "before binding anywhere other than 127.0.0.1/localhost."
         )
     manager = HubManager(config)
-    app = build_app(manager)
+    shutdown_event = asyncio.Event()
+    app = build_app(manager, shutdown_event)
     uvicorn_config = uvicorn.Config(app, host=config.hub.host, port=config.hub.port, log_level="info")
     server = uvicorn.Server(uvicorn_config)
-    asyncio.run(serve_with_managed_shutdown(manager, server))
+    asyncio.run(serve_with_managed_shutdown(manager, server, shutdown_event))
 
 
 def cmd_import(args: argparse.Namespace) -> None:
