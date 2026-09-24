@@ -1,15 +1,28 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QHBoxLayout,
+    QPushButton, QHBoxLayout, QLabel,
 )
 
 from mcp_hub.gui.api_client import HubApiClient
+from mcp_hub.updater import UpdateInfo, check_for_update
 
 _STATUS_COLOR = {"running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828", "starting": "#f9a825"}
+
+
+class _UpdateCheckWorker(QThread):
+    found = Signal(object)  # UpdateInfo | None
+
+    def __init__(self, include_beta: bool, parent=None):
+        super().__init__(parent)
+        self._include_beta = include_beta
+
+    def run(self) -> None:
+        import mcp_hub
+        self.found.emit(check_for_update(mcp_hub.__version__, include_beta=self._include_beta))
 
 
 class MainWindow(QMainWindow):
@@ -21,8 +34,14 @@ class MainWindow(QMainWindow):
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Server", "Status", "Concurrency", "Actions"])
 
+        self.update_banner = QLabel()
+        self.update_banner.setOpenExternalLinks(True)
+        self.update_banner.setVisible(False)
+        self.update_banner.setStyleSheet("background-color: #fff3cd; padding: 6px;")
+
         central = QWidget()
         layout = QVBoxLayout(central)
+        layout.addWidget(self.update_banner)
         layout.addWidget(self.table)
 
         add_btn = QPushButton("Add server")
@@ -52,6 +71,30 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh)
         self.timer.start(2000)
         self.refresh()
+
+        self._update_thread: _UpdateCheckWorker | None = None
+        self._check_for_updates()
+
+    def _check_for_updates(self) -> None:
+        try:
+            settings = self.client.settings()
+        except Exception:
+            return
+        if not settings.get("checkForUpdates", True):
+            return
+        self._update_thread = _UpdateCheckWorker(settings.get("includeBetaUpdates", False), self)
+        self._update_thread.found.connect(self._on_update_check_result)
+        self._update_thread.start()
+
+    def _on_update_check_result(self, info: UpdateInfo | None) -> None:
+        if info is None:
+            return
+        kind = "beta" if info.prerelease else "release"
+        self.update_banner.setText(
+            f'Nuova versione {kind} disponibile: <b>{info.version}</b> — '
+            f'<a href="{info.url}">scarica</a>'
+        )
+        self.update_banner.setVisible(True)
 
     def refresh(self) -> None:
         statuses = self.client.status()

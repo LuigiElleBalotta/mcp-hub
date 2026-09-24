@@ -31,6 +31,8 @@ class HubConfig:
     port: int = 37450
     authToken: str | None = None
     autostart: bool = False
+    checkForUpdates: bool = True
+    includeBetaUpdates: bool = False
 
 
 @dataclass

@@ -21,3 +21,6 @@ class HubApiClient:
 
     def upsert(self, name: str, config: dict) -> str:
         return self._client.post(f"/api/servers/{name}", json=config).json()["status"]
+
+    def settings(self) -> dict:
+        return self._client.get("/api/settings").json()

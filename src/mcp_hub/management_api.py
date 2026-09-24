@@ -12,6 +12,12 @@ def management_routes(manager: HubManager) -> list[Route]:
     async def status(request: Request) -> JSONResponse:
         return JSONResponse({"servers": manager.status_snapshot()})
 
+    async def settings(request: Request) -> JSONResponse:
+        return JSONResponse({
+            "checkForUpdates": manager.config.hub.checkForUpdates,
+            "includeBetaUpdates": manager.config.hub.includeBetaUpdates,
+        })
+
     async def start(request: Request) -> JSONResponse:
         name = request.path_params["name"]
         await manager.get(name).start()
@@ -42,6 +48,7 @@ def management_routes(manager: HubManager) -> list[Route]:
 
     return [
         Route("/api/status", status, methods=["GET"]),
+        Route("/api/settings", settings, methods=["GET"]),
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),
         Route("/api/servers/{name}/logs", logs, methods=["GET"]),

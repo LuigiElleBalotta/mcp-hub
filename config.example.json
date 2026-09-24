@@ -3,7 +3,9 @@
     "host": "127.0.0.1",
     "port": 37450,
     "authToken": null,
-    "autostart": false
+    "autostart": false,
+    "checkForUpdates": true,
+    "includeBetaUpdates": false
   },
   "servers": {
     "example-server": {
