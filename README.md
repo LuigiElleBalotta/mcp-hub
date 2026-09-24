@@ -55,7 +55,30 @@ Claude Code session N ─┘                 │
   handling in `cleanup.py`/`manager.py`)
 - Python 3.11+
 
-## Setup
+## Installing the exe (end users)
+
+No installer, no admin rights needed — it's two standalone files:
+
+1. Go to the repo's [Releases page](https://github.com/LuigiElleBalotta/mcp-hub/releases)
+   and download `mcp-hub.exe` and `mcp-hub-gui.exe` from whichever version
+   you want (a plain `x.y.z` tag is stable; `x.y.z-n` is beta).
+2. Put **both files in the same folder** (e.g.
+   `C:\Users\<you>\AppData\Local\Programs\mcp-hub\`) — the GUI's self-update
+   assumes `mcp-hub.exe` sits right next to it, and this is also the layout
+   the auto-updater writes back to.
+3. Copy `config.example.json` to `%LOCALAPPDATA%\mcp-hub\config.json` and
+   edit it (see [Configuration](#configuration)), or skip straight to
+   `mcp-hub.exe import --from <path to .claude.json>` to populate it from
+   an existing Claude Code setup.
+4. Run `mcp-hub-gui.exe` — it starts the GUI, from which you can start
+   servers, add new ones, and later update in place with one click (see
+   [Auto-update](#auto-update)). Run `mcp-hub.exe serve` directly instead if
+   you just want the hub without the GUI.
+
+From here on, new versions install with the GUI's **Installa e riavvia**
+button — no more manual downloads.
+
+## Setup (development)
 
 ```
 python -m venv .venv
@@ -68,6 +91,10 @@ Run the tests to confirm the install is sane:
 ```
 .venv\Scripts\pytest -q
 ```
+
+`python -m mcp_hub serve` and `python -m mcp_hub.gui` run the same code the
+built exes run, straight from source — see
+[Running the hub](#running-the-hub) / [Running the GUI](#running-the-gui).
 
 ## Configuration
 
