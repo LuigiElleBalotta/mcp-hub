@@ -185,7 +185,14 @@ class MainWindow(QMainWindow):
         self.close()
 
     def refresh(self) -> None:
-        statuses = self.client.status()
+        try:
+            statuses = self.client.status()
+        except Exception:
+            # Hub not reachable yet -- e.g. the first-run wizard just spawned
+            # it and it hasn't finished starting up. The 2s timer retries on
+            # its own; nothing to show until then.
+            self.table.setRowCount(0)
+            return
         self.table.setRowCount(len(statuses))
         for row, (name, status) in enumerate(sorted(statuses.items())):
             self.table.setItem(row, 0, QTableWidgetItem(name))

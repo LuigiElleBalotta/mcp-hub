@@ -66,6 +66,15 @@ def hub_exe_path() -> Path:
     return gui_exe_path().parent / HUB_EXE_NAME
 
 
+def launch_detached(args: list[str]) -> subprocess.Popen:
+    """Starts `args` independent of this process's console/job, so it keeps
+    running (or, for the update helper, keeps waiting) after this process
+    exits. Shared by `apply_update`'s helper launch and the GUI's first-run
+    wizard, which needs to start the hub the same detached way after
+    writing a fresh config.json."""
+    return subprocess.Popen(args, creationflags=_DETACHED_FLAGS, close_fds=True)
+
+
 def apply_update(
     info: UpdateInfo,
     hub_pid: int,
@@ -92,20 +101,16 @@ def apply_update(
     script_path = work_dir / "apply_update.ps1"
     script_path.write_text(_HELPER_SCRIPT, encoding="utf-8")
 
-    subprocess.Popen(
-        [
-            "powershell", "-NoProfile", "-WindowStyle", "Hidden",
-            "-File", str(script_path),
-            "-HubPid", str(hub_pid),
-            "-GuiPid", str(_current_pid()),
-            "-NewHubExe", str(new_hub),
-            "-NewGuiExe", str(new_gui),
-            "-TargetHubExe", str(hub_exe),
-            "-TargetGuiExe", str(gui_exe),
-        ],
-        creationflags=_DETACHED_FLAGS,
-        close_fds=True,
-    )
+    launch_detached([
+        "powershell", "-NoProfile", "-WindowStyle", "Hidden",
+        "-File", str(script_path),
+        "-HubPid", str(hub_pid),
+        "-GuiPid", str(_current_pid()),
+        "-NewHubExe", str(new_hub),
+        "-NewGuiExe", str(new_gui),
+        "-TargetHubExe", str(hub_exe),
+        "-TargetGuiExe", str(gui_exe),
+    ])
 
 
 def _current_pid() -> int:

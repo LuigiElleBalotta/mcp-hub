@@ -66,17 +66,21 @@ No installer, no admin rights needed — it's two standalone files:
    `C:\Users\<you>\AppData\Local\Programs\mcp-hub\`) — the GUI's self-update
    assumes `mcp-hub.exe` sits right next to it, and this is also the layout
    the auto-updater writes back to.
-3. Copy `config.example.json` to `%LOCALAPPDATA%\mcp-hub\config.json` and
-   edit it (see [Configuration](#configuration)), or skip straight to
-   `mcp-hub.exe import --from <path to .claude.json>` to populate it from
-   an existing Claude Code setup.
-4. Run `mcp-hub-gui.exe` — it starts the GUI, from which you can start
-   servers, add new ones, and later update in place with one click (see
-   [Auto-update](#auto-update)). Run `mcp-hub.exe serve` directly instead if
-   you just want the hub without the GUI.
+3. Run `mcp-hub-gui.exe`. With no `config.json` yet, it opens a **first-run
+   setup wizard** instead of an empty window: pick "Importa da un
+   .claude.json esistente" and choose which imported servers to enable, or
+   skip it to start from scratch (an empty config gets written either way,
+   editable later by hand or from the GUI). The wizard also starts the hub
+   for you, detached, so the GUI has something to connect to right away.
+   You can still copy `config.example.json` to
+   `%LOCALAPPDATA%\mcp-hub\config.json` yourself instead — the wizard only
+   appears when that file doesn't exist yet (see
+   [Configuration](#configuration)).
+4. From here on, start `mcp-hub-gui.exe` any time to manage servers, or
+   `mcp-hub.exe serve` directly if you just want the hub without the GUI.
 
-From here on, new versions install with the GUI's **Installa e riavvia**
-button — no more manual downloads.
+New versions install with the GUI's **Installa e riavvia** button — no more
+manual downloads.
 
 ## Setup (development)
 
@@ -133,7 +137,7 @@ it there and edit it by hand, or populate it from an existing
 | `port`               | `37450`       | Bind port. |
 | `authToken`          | `null`        | Required if `host` is not localhost. Not yet enforced on individual requests — binding restriction only. |
 | `autostart`          | `false`       | Informational flag mirrored by the GUI's "Avvia con Windows" checkbox, which registers/removes a Windows Task Scheduler entry (see below). |
-| `checkForUpdates`    | `true`        | GUI checks GitHub Releases for a newer version on startup and shows a banner if one exists. Never downloads or installs anything automatically. |
+| `checkForUpdates`    | `true`        | GUI checks GitHub Releases for a newer version on startup and shows a banner if one exists. Never downloads or installs anything without an explicit click on "Installa e riavvia" (see [Auto-update](#auto-update)). |
 | `includeBetaUpdates` | `false`       | If `true`, the update check also considers beta (prerelease) tags, not just stable releases. |
 
 **Per-server fields (`servers.<name>`):**
@@ -166,9 +170,18 @@ it there and edit it by hand, or populate it from an existing
 .venv\Scripts\python -m mcp_hub.gui
 ```
 
-The GUI is a thin client over the hub's management API — it never reads or
-writes `config.json` directly.
+The GUI is a thin client over the hub's management API for everything
+except first-run setup and importing from Claude Code (below) — those write
+`config.json` directly, since there's no hub running yet to route through
+the first time.
 
+- **First-run setup wizard**: if `%LOCALAPPDATA%\mcp-hub\config.json`
+  doesn't exist yet, launching the GUI shows this instead of an empty
+  window — offers to import servers from an existing `.claude.json` and
+  pick which ones to enable, or start from an empty config. Either way it
+  writes `config.json` and starts the hub for you (detached), so the
+  window that follows has something to connect to. Only runs once; after
+  `config.json` exists, the GUI opens straight to the server table.
 - **Server table**: live status (`stopped`/`starting`/`running`/`crashed`)
   for every configured server, refreshed every 2 seconds, with Start/Stop
   buttons per row.
