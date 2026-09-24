@@ -431,6 +431,7 @@ class MainWindow(QMainWindow):
         self.log_panel.show_logs(name, self.client.logs(name))
 
     def _import_from_claude(self) -> None:
+        from dataclasses import asdict
         from pathlib import Path
         from PySide6.QtWidgets import QFileDialog, QMessageBox
         path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
@@ -440,7 +441,23 @@ class MainWindow(QMainWindow):
         from mcp_hub.claude_config import import_servers
         config = load_config()
         imported = import_servers(Path(path), config)
-        save_config(config)
+        # Writing config.json alone isn't enough for the table to show
+        # these: it reflects the ALREADY-RUNNING hub's in-memory
+        # HubManager, which never re-reads config.json on its own -- an
+        # import that only touched disk stayed invisible until the next hub
+        # restart. Push each new (disabled) entry through the same upsert
+        # path Add/Edit use, so the live hub picks it up immediately;
+        # upsert's own handler already persists to config.json server-side,
+        # so only fall back to writing it here ourselves if the hub can't be
+        # reached at all (still get it on disk for the next hub start).
+        hub_unreachable = False
+        for name in imported:
+            try:
+                self.client.upsert(name, asdict(config.servers[name]))
+            except Exception:
+                hub_unreachable = True
+        if hub_unreachable:
+            save_config(config)
         QMessageBox.information(self, "Import", f"Imported (disabled): {', '.join(imported) or '(none)'}")
         self.refresh()
 
