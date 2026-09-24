@@ -2,16 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import os
+from typing import Callable
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from mcp_hub.config import ServerConfig, save_config
+from mcp_hub.config import CONFIG_PATH, ServerConfig, save_config
 from mcp_hub.manager import HubManager
 
 
-def management_routes(manager: HubManager, shutdown_event: asyncio.Event | None = None) -> list[Route]:
+def management_routes(
+    manager: HubManager,
+    shutdown_event: asyncio.Event | None = None,
+    on_change: Callable[[], None] | None = None,
+) -> list[Route]:
+    # `on_change` is `hub_app.build_app`'s `rebuild_routes`: called after
+    # anything that can change WHICH servers have a mounted SSE route
+    # (upsert/remove/reload), so the hub's HTTP-level routing stays in sync
+    # with `manager.config.servers` without a process restart. A no-op
+    # default keeps every existing caller (tests included) working
+    # unchanged.
+    def _notify_change() -> None:
+        if on_change is not None:
+            on_change()
+
     async def status(request: Request) -> JSONResponse:
         return JSONResponse({"servers": manager.status_snapshot()})
 
@@ -76,13 +91,25 @@ def management_routes(manager: HubManager, shutdown_event: asyncio.Event | None 
         save_config(manager.config)
         if server_config.enabled:
             await managed.start()
+        _notify_change()
         return JSONResponse({"status": managed.status})
 
     async def remove(request: Request) -> JSONResponse:
         name = request.path_params["name"]
         await manager.remove(name)
         save_config(manager.config)
+        _notify_change()
         return JSONResponse({"status": "removed"})
+
+    async def reload(request: Request) -> JSONResponse:
+        # Picks up a config.json edited by hand (or by `mcp_hub apply`/
+        # `import`, which both write the file directly without telling a
+        # running hub) without requiring a hub restart -- the same gap that
+        # `on_change`/`_notify_change` closes for GUI-driven upsert/remove,
+        # but for changes the hub never saw happen in the first place.
+        added, updated, removed = await manager.reload_from_disk(CONFIG_PATH)
+        _notify_change()
+        return JSONResponse({"added": added, "updated": updated, "removed": removed})
 
     return [
         Route("/api/status", status, methods=["GET"]),
@@ -90,6 +117,7 @@ def management_routes(manager: HubManager, shutdown_event: asyncio.Event | None 
         Route("/api/settings", update_settings, methods=["PUT"]),
         Route("/api/pid", pid, methods=["GET"]),
         Route("/api/shutdown", shutdown, methods=["POST"]),
+        Route("/api/reload", reload, methods=["POST"]),
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),
         Route("/api/servers/{name}/logs", logs, methods=["GET"]),

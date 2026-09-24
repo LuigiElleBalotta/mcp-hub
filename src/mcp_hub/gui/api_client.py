@@ -7,7 +7,7 @@ class HubApiClient:
     def __init__(self, base_url: str = "http://127.0.0.1:37450"):
         self._client = httpx.Client(base_url=base_url, timeout=5.0)
 
-    def status(self) -> dict[str, str]:
+    def status(self) -> dict[str, dict[str, str]]:
         return self._client.get("/api/status").json()["servers"]
 
     def start(self, name: str) -> str:
@@ -24,6 +24,9 @@ class HubApiClient:
 
     def remove(self, name: str) -> None:
         self._client.delete(f"/api/servers/{name}")
+
+    def reload(self) -> dict:
+        return self._client.post("/api/reload").json()
 
     def settings(self) -> dict:
         return self._client.get("/api/settings").json()

@@ -77,7 +77,10 @@ async def test_start_merges_custom_env_with_parent_environment():
 def test_status_snapshot_reflects_all_servers():
     cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config(), "b": _python_sleep_config()})
     manager = HubManager(cfg)
-    assert manager.status_snapshot() == {"a": "stopped", "b": "stopped"}
+    assert manager.status_snapshot() == {
+        "a": {"status": "stopped", "concurrency": "exclusive"},
+        "b": {"status": "stopped", "concurrency": "exclusive"},
+    }
 
 
 def test_append_log_redacts_secret_like_lines():
@@ -327,3 +330,71 @@ async def test_remove_is_a_noop_for_an_unknown_name():
     manager = HubManager(cfg)
     await manager.remove("does-not-exist")  # must not raise
     assert "does-not-exist" not in cfg.servers
+
+
+@pytest.mark.asyncio
+async def test_reload_from_disk_adds_updates_removes_and_skips_unchanged(tmp_path):
+    """Regression test for the live-reported bug: config.json changed by
+    something other than the hub's own API (hand-edited `enabled: true`, in
+    this incident) left the newly-enabled server's subprocess AND its HTTP
+    route invisible until the whole hub process was restarted, because
+    nothing re-read the file into the running manager. `reload_from_disk` is
+    the fix's manager-level half (the route-rebuild half lives in
+    `hub_app.py`/`management_api.py`, see test_management_api.py).
+
+    Also proves the "skip unchanged" claim in the docstring: an untouched
+    server's `ManagedServer` object identity survives a reload (no
+    stop/replace), so reloading never restarts servers nothing changed
+    about.
+    """
+    from mcp_hub.config import save_config
+
+    cfg = Config(hub=HubConfig(), servers={
+        "keep": _python_sleep_config(),
+        "drop_me": _python_sleep_config(seconds=5),
+    })
+    manager = HubManager(cfg)
+    keep_before = manager.get("keep")
+
+    disk_path = tmp_path / "config.json"
+    save_config(Config(hub=HubConfig(), servers={
+        "keep": _python_sleep_config(),  # value-equal to the live "keep" config
+        "new": _python_sleep_config(),
+    }), disk_path)
+
+    added, updated, removed = await manager.reload_from_disk(disk_path)
+
+    assert added == ["new"]
+    assert updated == []
+    assert removed == ["drop_me"]
+    assert manager.get("keep") is keep_before  # untouched -- not stopped/replaced
+    assert "drop_me" not in manager.config.servers
+    assert manager.get("new").status == "running"  # added server is auto-started
+
+    await manager.stop_all()
+
+
+@pytest.mark.asyncio
+async def test_reload_from_disk_restarts_a_server_whose_config_actually_changed(tmp_path):
+    from mcp_hub.config import save_config
+
+    cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config(seconds=5)})
+    manager = HubManager(cfg)
+    old_managed = manager.get("a")
+    await old_managed.start()
+
+    disk_path = tmp_path / "config.json"
+    save_config(Config(hub=HubConfig(), servers={
+        "a": _python_sleep_config(seconds=1),  # different args -> genuinely changed
+    }), disk_path)
+
+    added, updated, removed = await manager.reload_from_disk(disk_path)
+
+    assert added == []
+    assert updated == ["a"]
+    assert removed == []
+    assert manager.get("a") is not old_managed
+    assert old_managed.status == "stopped"  # old process was stopped, not orphaned
+    assert manager.get("a").status == "running"  # replacement was started
+
+    await manager.stop_all()
