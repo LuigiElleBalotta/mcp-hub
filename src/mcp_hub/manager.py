@@ -12,7 +12,9 @@ from typing import Any, Awaitable, Callable, Literal
 
 import psutil
 
-from mcp_hub.config import Config, ServerConfig
+from pathlib import Path
+
+from mcp_hub.config import Config, ServerConfig, load_config
 from mcp_hub.concurrency import ConcurrencyGuard
 
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
@@ -325,8 +327,12 @@ class HubManager:
         for server in self._servers.values():
             await server.stop()
 
-    def status_snapshot(self) -> dict[str, str]:
-        return {name: s.status for name, s in self._servers.items()}
+    def status_snapshot(self) -> dict[str, dict[str, str]]:
+        # `concurrency` is included alongside `status` (not a separate
+        # endpoint) so the GUI's 2s status poll is the one place both are
+        # kept current -- a server's concurrency mode can change via
+        # `upsert` (Edit dialog) same as its running status can.
+        return {name: {"status": s.status, "concurrency": s.config.concurrency} for name, s in self._servers.items()}
 
     async def upsert(self, name: str, server_config: ServerConfig) -> ManagedServer:
         """Replaces (or creates) the `ManagedServer` entry for `name`.
@@ -356,3 +362,47 @@ class HubManager:
         if existing is not None:
             await existing.stop()
         self.config.servers.pop(name, None)
+
+    async def reload_from_disk(self, path: Path) -> tuple[list[str], list[str], list[str]]:
+        """Re-reads `config.json` and applies the difference against the
+        live manager, for the case config.json was changed by something
+        other than this hub's own API (hand-edited, or written by
+        `mcp_hub apply`/`import`, which both go straight to the file) --
+        the exact gap that left a manually-`enabled`-then-saved server
+        404ing over HTTP until the whole hub process was restarted, because
+        nothing ever told the running hub anything had changed.
+
+        Added/changed servers go through `upsert` (which stops any old
+        process for that name, but -- unlike the `POST /api/servers/{name}`
+        route -- does NOT itself start the replacement; this method starts
+        it afterward if `enabled`, mirroring what that route does). Servers
+        identical to their current live config are deliberately
+        left untouched -- `upsert` unconditionally stops+replaces even when
+        nothing differs, which would restart every OTHER already-running
+        server's subprocess for no reason on every reload. Servers no
+        longer present in the file go through `remove`.
+
+        Returns `(added, updated, removed)` name lists (server names caught
+        by each case), so the API layer can report what actually changed.
+        """
+        new_config = load_config(path)
+        added: list[str] = []
+        updated: list[str] = []
+        removed: list[str] = []
+        for name, server_config in new_config.servers.items():
+            existing = self.config.servers.get(name)
+            if existing is None:
+                added.append(name)
+                await self.upsert(name, server_config)
+                if server_config.enabled:
+                    await self.get(name).start()
+            elif existing != server_config:
+                updated.append(name)
+                await self.upsert(name, server_config)
+                if server_config.enabled:
+                    await self.get(name).start()
+        for name in list(self.config.servers):
+            if name not in new_config.servers:
+                removed.append(name)
+                await self.remove(name)
+        return added, updated, removed
