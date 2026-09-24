@@ -1,0 +1,19 @@
+{
+  "hub": {
+    "host": "127.0.0.1",
+    "port": 37450,
+    "authToken": null,
+    "autostart": false,
+    "checkForUpdates": true,
+    "includeBetaUpdates": false
+  },
+  "servers": {
+    "example-server": {
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "some-mcp-server"],
+      "env": {},
+      "concurrency": "exclusive"
+    }
+  }
+}

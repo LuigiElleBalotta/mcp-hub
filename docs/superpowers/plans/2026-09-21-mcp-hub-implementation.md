@@ -669,7 +669,9 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -706,10 +708,23 @@ class ManagedServer:
 
     async def start(self) -> None:
         self.status = "starting"
-        env = {**self.config.env}
+        # Merge with the parent's environment rather than replacing it: several
+        # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
+        # PATH to resolve at all. A bare `self.config.env` would silently drop
+        # PATH the moment any server sets custom env vars.
+        env = {**os.environ, **self.config.env}
+        # Resolve via PATH (and, on Windows, PATHEXT: .cmd/.bat/.exe) ourselves.
+        # asyncio.create_subprocess_exec goes straight to CreateProcess on
+        # Windows, which does NOT do PATHEXT probing the way cmd.exe does --
+        # a bare "npx" (the real shim is "npx.cmd") raises FileNotFoundError,
+        # blocking start_all() -- and thus the whole hub -- for every server
+        # except the one (headroom) that happens to ship a real .exe. Falls
+        # back to the original string if not found, so a genuinely bad
+        # command still fails the same way it did before.
+        resolved_command = shutil.which(self.config.command) or self.config.command
         self.process = await asyncio.create_subprocess_exec(
-            self.config.command, *self.config.args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env or None,
+            resolved_command, *self.config.args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
         )
         self.status = "running"
         asyncio.create_task(self._watch())
@@ -724,6 +739,17 @@ class ManagedServer:
             self.status = "crashed" if code != 0 else "stopped"
 
     async def stop(self) -> None:
+        # NOTE (found by Task 13's live testing against windows-mcp, a uvx-
+        # based server): on Windows, a shim command (npx.cmd/uvx.exe) can
+        # exit while a grandchild it spawned (the real server process) keeps
+        # running. self.process only ever refers to the shim -- terminate()
+        # on it does not touch that grandchild, orphaning a real, potentially
+        # desktop-controlling process. The actual implementation (evolved
+        # past this sketch through several fix rounds already) must kill the
+        # whole process tree, e.g. via psutil.Process(self.process.pid)
+        # .children(recursive=True) plus the process itself, not just
+        # self.process directly. Read the CURRENT manager.py before editing
+        # -- this note describes the requirement, not the exact code to paste.
         if self.process is not None and self.process.returncode is None:
             self.process.terminate()
             try:
@@ -799,6 +825,7 @@ from __future__ import annotations
 
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
+from starlette.responses import Response
 from starlette.routing import Mount, Route
 
 from mcp_hub.manager import HubManager
@@ -806,7 +833,13 @@ from mcp_hub.manager import HubManager
 
 def _mount_for(name: str, manager: HubManager) -> Mount:
     managed = manager.get(name)
-    transport = SseServerTransport(f"/{name}/messages")
+    # Endpoint is relative to THIS mount's root_path (Starlette sets it from
+    # the outer Mount(f"/{name}", ...) below) — do NOT repeat the server name
+    # here. Confirmed in Task 2's spike (scripts/spike_multi_mount.py):
+    # f"/{name}/messages" doubles the prefix into "/{name}/{name}/messages"
+    # and breaks every client POST. Trailing slash matches Mount("/messages/", ...)
+    # below and avoids an extra 307 redirect.
+    transport = SseServerTransport("/messages/")
 
     async def handle_sse(request):
         async def guarded_run():
@@ -814,10 +847,11 @@ def _mount_for(name: str, manager: HubManager) -> Mount:
             async with transport.connect_sse(request.scope, request.receive, request._send) as (read, write):
                 await _proxy(read, write, managed)
         await managed.guard.run(guarded_run)
+        return Response()  # avoids a TypeError on client disconnect (Task 2 spike finding)
 
     return Mount(f"/{name}", routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages", app=transport.handle_post_message),
+        Route("/sse", endpoint=handle_sse, methods=["GET"]),
+        Mount("/messages/", app=transport.handle_post_message),
     ])
 
 
@@ -845,14 +879,23 @@ def build_app(manager: HubManager) -> Starlette:
     return Starlette(routes=routes)
 ```
 
-Note: `_proxy`'s exact framing depends on what Task 2's spike confirmed about
-the SDK's `read`/`write` stream types — adjust the two inner functions to
-match the concrete stream API the spike exercised (the spike used
-`server.run(read, write, ...)` directly against an in-process `Server`; here
-`read`/`write` must instead be bridged to the managed subprocess's real
-stdio pipes). Treat this as the one place in the codebase where the Task 2
-spike's findings get codified for production use — if the spike's pattern
-differs from what's sketched here, follow the spike, not this snippet.
+**Resolved by Task 2's spike** (`scripts/spike_multi_mount.py`, commit
+`557f99a`; installed SDK is `mcp==2.2.0`): the mounting/routing mechanics
+above (`SseServerTransport("/messages/")`, the nested `Mount`, returning
+`Response()` from the SSE handler) are exactly what the spike proved works,
+copied verbatim from the working spike code — not a guess. The one thing
+the spike did NOT exercise is `_proxy` itself: the spike ran an in-process
+`mcp.server.lowlevel.Server(name, on_list_tools=..., on_call_tool=...)` and
+called `server.run(read, write, ...)` against it, whereas `_proxy` here
+bridges `read`/`write` to a **real external subprocess's stdio** instead of
+an in-process `Server` object — there is no in-process `Server` in the hub's
+real design, `_proxy` is a raw byte/frame pump. Treat `_proxy`'s body as the
+one part of this task still needing implementation-time verification: the
+`read`/`write` objects yielded by `transport.connect_sse(...)` are the
+stream types `mcp.server.sse` provides for this pattern — write against
+their actual iteration/`send` API as installed, matching the spike's
+demonstrated usage of the same call (`async with transport.connect_sse(...)
+as (read, write)`), and confirm with Step 2's smoke test before moving on.
 
 - [ ] **Step 2: Write the manual smoke-test script**
 
@@ -1448,7 +1491,7 @@ class LogPanel(QWidget):
 - [ ] **Step 2: Wire it into `MainWindow`**
 
 ```python
-# in src/mcp_hub/gui/main_window.py, __init__, replace central layout setup:
+# in src/mcp_hub/gui/main_window.py, __init__, add near the end (after self.setCentralWidget(central)):
         from mcp_hub.gui.log_panel import LogPanel
         self.log_panel = LogPanel()
         self.table.itemSelectionChanged.connect(self._on_row_selected)
@@ -1972,6 +2015,27 @@ def test_execute_cleanup_calls_kill_fn_for_each_match_and_counts():
     count = execute_cleanup(matches, kill_fn=killed.append)
     assert killed == [11, 12]
     assert count == 2
+
+
+def test_find_legacy_processes_does_not_over_protect_via_deep_shared_system_ancestor():
+    """Two independent sessions that both eventually trace back to the same
+    high-level system ancestor (explorer.exe here) must not cause one
+    session's legacy process to protect the other's -- self-protection must
+    anchor at the nearest claude.exe, not walk to a shared system root."""
+    processes = [
+        _p(1, 0, "explorer.exe", "explorer"),
+        _p(2, 1, "WindowsTerminal.exe", "wt"),
+        _p(3, 2, "cmd.exe", "cmd"),
+        _p(40, 3, "claude.exe", "claude"),          # self's session root
+        _p(41, 40, "npx.cmd", "npx -y @oleander/mcp-server-mariadb"),  # self, must be excluded
+        _p(4, 1, "WindowsTerminal.exe", "wt"),
+        _p(5, 4, "cmd.exe", "cmd"),
+        _p(50, 5, "claude.exe", "claude"),          # another, unrelated session
+        _p(51, 50, "npx.cmd", "npx -y @oleander/mcp-server-mariadb"),  # must be included
+    ]
+    migrated = {"mariadb": ServerConfig(enabled=True, command="npx", args=["-y", "@oleander/mcp-server-mariadb"], env={})}
+    matches = find_legacy_processes(processes, migrated, self_pid=41)
+    assert [m.pid for m in matches] == [51]
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2026,21 +2090,54 @@ def _matches_server(command_line: str, server: ServerConfig) -> bool:
     return server.command in command_line and all(arg in command_line for arg in server.args)
 
 
+def _descendant_pids(root_pid: int, processes: list[ProcessInfo]) -> set[int]:
+    by_parent: dict[int, list[int]] = {}
+    for p in processes:
+        by_parent.setdefault(p.ppid, []).append(p.pid)
+    result: set[int] = set()
+    queue = [root_pid]
+    while queue:
+        cur = queue.pop()
+        for child in by_parent.get(cur, []):
+            if child not in result:
+                result.add(child)
+                queue.append(child)
+    return result
+
+
 def find_legacy_processes(
     processes: list[ProcessInfo], migrated: dict[str, ServerConfig], self_pid: int
 ) -> list[ProcessInfo]:
-    protected = ancestor_pids(self_pid, processes) | {self_pid}
-    # anything whose ancestor chain touches the protected set is protected too
     by_pid = {p.pid: p for p in processes}
+    self_ancestors = ancestor_pids(self_pid, processes)
 
-    def is_protected(pid: int) -> bool:
-        if pid in protected:
-            return True
-        return bool(ancestor_pids(pid, processes) & protected)
+    # Anchor self-protection at the nearest claude.exe ancestor (self's own
+    # session root) instead of walking all the way up self's full ancestor
+    # chain. Two independent sessions commonly share a high-level ancestor
+    # (explorer.exe, a services host, or an unresolved/off-list pid) well
+    # within a 20-hop bound -- protecting based on ANY shared ancestor, at
+    # any depth (the original design here, and originally caught by live
+    # testing), made every other session's legacy processes look
+    # "protected" too. Stopping at the nearest claude.exe keeps the
+    # protected set scoped to this specific session.
+    session_root = None
+    for candidate_pid in (self_pid, *self_ancestors):
+        proc = by_pid.get(candidate_pid)
+        if proc is not None and proc.name == "claude.exe":
+            session_root = candidate_pid
+            break
+
+    protected = {self_pid} | self_ancestors
+    if session_root is not None:
+        protected |= _descendant_pids(session_root, processes)
+    # else: no resolvable claude.exe boundary found in self's ancestor
+    # chain -- fall back to protecting only self's own direct ancestor
+    # chain. This under-protects self's sibling processes in that edge
+    # case rather than risk over-protecting an unrelated session.
 
     matches = []
     for proc in processes:
-        if is_protected(proc.pid):
+        if proc.pid in protected:
             continue
         for server in migrated.values():
             if _matches_server(proc.command_line, server):
@@ -2072,7 +2169,7 @@ def execute_cleanup(matches: list[ProcessInfo], kill_fn: Callable[[int], None] |
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv\Scripts\pytest tests\test_cleanup.py -v`
-Expected: PASS (5 tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2180,6 +2277,7 @@ Expected: reports migrated names; `%TEMP%\claude-test.json` now has a
 
 ```python
     def _import_from_claude(self) -> None:
+        from pathlib import Path
         from PySide6.QtWidgets import QFileDialog, QMessageBox
         path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
         if not path:
@@ -2193,6 +2291,7 @@ Expected: reports migrated names; `%TEMP%\claude-test.json` now has a
         self.refresh()
 
     def _apply_to_claude(self) -> None:
+        from pathlib import Path
         from PySide6.QtWidgets import QFileDialog, QMessageBox
         path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
         if not path:
