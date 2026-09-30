@@ -60,8 +60,8 @@ def apply_servers(
 
     migrated = []
     for name, server in hub_config.servers.items():
-        if not server.enabled:
-            continue
+        if not server.enabled or server.is_service:
+            continue  # services are not MCP servers: nothing to point Claude Code at
         if only is not None and name not in only:
             continue
         remote_entry = {

@@ -180,7 +180,7 @@ async def test_status_includes_concurrency_per_server():
     manager = HubManager(cfg)
     async with await _client_for(manager) as client:
         resp = await client.get("/api/status")
-        assert resp.json() == {"servers": {"a": {"status": "stopped", "concurrency": "parallel"}}}
+        assert resp.json() == {"servers": {"a": {"status": "stopped", "concurrency": "parallel", "type": "mcp"}}}
 
 
 @pytest.mark.asyncio

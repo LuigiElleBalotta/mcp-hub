@@ -43,19 +43,49 @@ class _StatusWorker(QThread):
     thread's own direct calls (start/stop/upsert/remove, all short-lived
     and user-initiated) is fine.
     """
-    done = Signal(bool, object)  # (ok, statuses dict | None)
+    done = Signal(bool, object, object)  # (ok, statuses dict | None, (name, log lines) | None)
 
-    def __init__(self, client: HubApiClient, parent=None):
+    def __init__(self, client: HubApiClient, log_name: str | None = None, parent=None):
         super().__init__(parent)
         self._client = client
+        self._log_name = log_name
 
     def run(self) -> None:
         try:
             statuses = self._client.status()
         except Exception:
-            self.done.emit(False, None)
+            self.done.emit(False, None, None)
+            return
+        # The selected server's log is refreshed on every tick too (a
+        # service's startup output is the whole point of looking at it),
+        # off the main thread like the status call itself.
+        logs = None
+        if self._log_name is not None and self._log_name in statuses:
+            try:
+                logs = (self._log_name, self._client.logs(self._log_name))
+            except Exception:
+                logs = None
+        self.done.emit(True, statuses, logs)
+
+
+class _ActionWorker(QThread):
+    """Runs one start/stop call off the GUI thread: stopping a service kills
+    its process tree and waits for the port to be released, which can take
+    several seconds and must not freeze the window."""
+    finished_ok = Signal(str, bool, str)  # (name, success, error message)
+
+    def __init__(self, action, name: str, parent=None):
+        super().__init__(parent)
+        self._action = action
+        self._name = name
+
+    def run(self) -> None:
+        try:
+            self._action(self._name)
+        except Exception as exc:
+            self.finished_ok.emit(self._name, False, str(exc))
         else:
-            self.done.emit(True, statuses)
+            self.finished_ok.emit(self._name, True, "")
 
 
 class _InstallUpdateWorker(QThread):
@@ -93,13 +123,22 @@ class MainWindow(QMainWindow):
         self._last_hub_launch_attempt = 0.0
         self._status_worker: _StatusWorker | None = None
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Server", "Status", "Concurrency", "Actions"])
+        self._action_workers: list[_ActionWorker] = []
+        self._busy: set[str] = set()  # servers with a start/stop call in flight
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Server", "Type", "Status", "Details", "Actions"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        # Interactive, width set by `_fit_actions_column`: neither
+        # ResizeToContents (ignores cell widgets) nor Fixed (uses the default
+        # section size) honour the button row, which then overflowed
+        # leftwards and covered the Status/Details text.
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        self._actions_width = 0
 
         self.connection_banner = QLabel("Hub non raggiungibile — nuovo tentativo tra 2s...")
         self.connection_banner.setVisible(False)
@@ -306,11 +345,24 @@ class MainWindow(QMainWindow):
         # hung hub must not pile up overlapping requests).
         if self._status_worker is not None and self._status_worker.isRunning():
             return
-        self._status_worker = _StatusWorker(self.client, self)
+        self._status_worker = _StatusWorker(self.client, self._selected_name(), self)
         self._status_worker.done.connect(self._on_status_result)
         self._status_worker.start()
 
-    def _on_status_result(self, ok: bool, statuses: dict | None) -> None:
+    def _fit_actions_column(self) -> None:
+        if self._actions_width:
+            self.table.setColumnWidth(4, self._actions_width)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_actions_column()
+
+    def _selected_name(self) -> str | None:
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        return item.text() if item is not None else None
+
+    def _on_status_result(self, ok: bool, statuses: dict | None, logs: object = None) -> None:
         if not ok:
             # Hub unreachable -- could be the first-run wizard's freshly
             # spawned hub still starting up, or a transient blip on an
@@ -328,20 +380,33 @@ class MainWindow(QMainWindow):
             return
         self._ever_connected = True
         self.connection_banner.setVisible(False)
+        selected = self._selected_name()
         self.table.setRowCount(len(statuses))
         for row, (name, info) in enumerate(sorted(statuses.items())):
             status = info["status"]
+            is_service = info.get("type", "mcp") == "service"
             self.table.setItem(row, 0, QTableWidgetItem(name))
+            self.table.setItem(row, 1, QTableWidgetItem("Service" if is_service else "MCP"))
             status_item = QTableWidgetItem(status)
             status_item.setForeground(QColor(_STATUS_COLOR.get(status, "#000000")))
-            self.table.setItem(row, 1, status_item)
-            self.table.setItem(row, 2, QTableWidgetItem(info["concurrency"]))
+            self.table.setItem(row, 2, status_item)
+            # A service has no concurrency mode and no SSE endpoint: show its
+            # port instead. MCP servers keep showing their concurrency.
+            if is_service:
+                port = info.get("port")
+                details = f"HTTP :{port}" if port is not None else "process"
+            else:
+                details = info["concurrency"]
+            self.table.setItem(row, 3, QTableWidgetItem(details))
 
             actions = QWidget()
             actions_layout = QHBoxLayout(actions)
             actions_layout.setContentsMargins(0, 0, 0, 0)
             start_btn = QPushButton("Start")
             stop_btn = QPushButton("Stop")
+            busy = name in self._busy
+            start_btn.setEnabled(not busy and status in ("stopped", "crashed"))
+            stop_btn.setEnabled(not busy and status in ("starting", "running"))
             edit_btn = QPushButton("Edit")
             remove_btn = QPushButton("Remove")
             start_btn.clicked.connect(lambda _, n=name: self._start(n))
@@ -352,7 +417,31 @@ class MainWindow(QMainWindow):
             actions_layout.addWidget(stop_btn)
             actions_layout.addWidget(edit_btn)
             actions_layout.addWidget(remove_btn)
-            self.table.setCellWidget(row, 3, actions)
+            self.table.setCellWidget(row, 4, actions)
+            buttons = (start_btn, stop_btn, edit_btn, remove_btn)
+            self._actions_width = max(
+                self._actions_width,
+                sum(b.sizeHint().width() for b in buttons) + actions_layout.spacing() * (len(buttons) - 1) + 8,
+            )
+        self._fit_actions_column()
+        # The header relayouts itself once more after the first populate and
+        # resets this column, so apply the width again shortly after.
+        QTimer.singleShot(100, self._fit_actions_column)
+        # The table was repopulated: restore the selection (setRowCount +
+        # sorted rows can shift it) and refresh the selected server's log.
+        if selected is not None:
+            self.table.blockSignals(True)  # no sync logs fetch from _on_row_selected
+            try:
+                for row in range(self.table.rowCount()):
+                    if self.table.item(row, 0).text() == selected:
+                        self.table.setCurrentCell(row, 0)
+                        break
+            finally:
+                self.table.blockSignals(False)
+        if logs is not None:
+            name, lines = logs
+            if name == self._selected_name():
+                self.log_panel.show_logs(name, lines)
 
     def _maybe_launch_hub(self) -> None:
         """Best-effort attempt to start the hub ourselves when it's never
@@ -375,11 +464,27 @@ class MainWindow(QMainWindow):
         _launch_hub()
 
     def _start(self, name: str) -> None:
-        self.client.start(name)
-        self.refresh()
+        self._run_action(self.client.start, name)
 
     def _stop(self, name: str) -> None:
-        self.client.stop(name)
+        self._run_action(self.client.stop, name)
+
+    def _run_action(self, action, name: str) -> None:
+        if name in self._busy:
+            return
+        self._busy.add(name)
+        worker = _ActionWorker(action, name, self)
+        worker.finished_ok.connect(self._on_action_result)
+        self._action_workers.append(worker)
+        worker.start()
+        self.refresh()
+
+    def _on_action_result(self, name: str, success: bool, error: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        self._busy.discard(name)
+        self._action_workers = [w for w in self._action_workers if w.isRunning()]
+        if not success:
+            QMessageBox.warning(self, name, f"Operazione fallita: {error}")
         self.refresh()
 
     def _add_server(self) -> None:
@@ -475,7 +580,8 @@ class MainWindow(QMainWindow):
         from mcp_hub.config import load_config
         from mcp_hub.claude_config import apply_servers
         config = load_config()
-        enabled_names = [n for n, s in config.servers.items() if s.enabled]
+        # Services are not MCP servers: `apply` never touches them.
+        enabled_names = [n for n, s in config.servers.items() if s.enabled and not s.is_service]
         confirm = QMessageBox.question(
             self, "Apply",
             f"This will back up {path} and rewrite these servers to point at the hub:\n"
