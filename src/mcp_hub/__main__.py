@@ -71,6 +71,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
             f"Refusing to bind {config.hub.host}: set hub.authToken in config.json "
             "before binding anywhere other than 127.0.0.1/localhost."
         )
+    # Servers started from here on die with the hub even if it is killed.
+    from mcp_hub.jobobject import bind_children_to_this_process
+    bind_children_to_this_process()
     manager = HubManager(config)
     shutdown_event = asyncio.Event()
     app = build_app(manager, shutdown_event)

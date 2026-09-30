@@ -67,19 +67,34 @@ def management_routes(
             shutdown_event.set()
         return JSONResponse({"status": "shutting down"})
 
+    def _unknown(name: str) -> JSONResponse:
+        return JSONResponse({"error": f"unknown server: {name}"}, status_code=404)
+
     async def start(request: Request) -> JSONResponse:
         name = request.path_params["name"]
-        await manager.get(name).start()
-        return JSONResponse({"status": manager.get(name).status})
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        await server.start()
+        return JSONResponse({"status": server.status})
 
     async def stop(request: Request) -> JSONResponse:
         name = request.path_params["name"]
-        await manager.get(name).stop()
-        return JSONResponse({"status": manager.get(name).status})
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        await server.stop()
+        return JSONResponse({"status": server.status})
 
     async def logs(request: Request) -> JSONResponse:
         name = request.path_params["name"]
-        return JSONResponse({"lines": list(manager.get(name).logs)})
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        return JSONResponse({"lines": list(server.logs)})
 
     def _rizzo_state() -> dict:
         snapshot = manager.status_snapshot().get(BUILTIN_RIZZO)

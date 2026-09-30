@@ -109,6 +109,12 @@ this repo (the repo only ships `config.example.json` as a template). Copy
 it there and edit it by hand, or populate it from an existing
 `.claude.json` with `mcp_hub import` (see below).
 
+**Automatic backups:** every time the hub or the GUI saves `config.json`, the
+previous file is first copied to `%LOCALAPPDATA%\mcp-hub\backups\config.<YYYYMMDD-HHMMSS>.json`
+(identical copies are skipped, the newest 30 are kept). To restore, close the
+hub and copy a backup over `config.json`. Backups contain the same secrets as
+the config: treat the folder the same way.
+
 ```json
 {
   "hub": {

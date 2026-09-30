@@ -72,6 +72,22 @@ async def test_delete_unknown_server_does_not_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/api/servers/nope/logs"),
+    ("POST", "/api/servers/nope/start"),
+    ("POST", "/api/servers/nope/stop"),
+])
+async def test_unknown_server_routes_answer_404_not_500(method, path):
+    # A GUI talking to a hub that does not know a server (e.g. the reserved
+    # rizzo-flow one on an older hub) used to crash the route with KeyError -> 500.
+    manager = HubManager(Config(hub=HubConfig(), servers={}))
+    async with await _client_for(manager) as client:
+        resp = await client.request(method, path)
+        assert resp.status_code == 404
+        assert "unknown server" in resp.json()["error"]
+
+
+@pytest.mark.asyncio
 async def test_put_settings_updates_live_config_and_is_reflected_by_get(monkeypatch):
     saved = []
     monkeypatch.setattr("mcp_hub.management_api.save_config", lambda config: saved.append(config))
