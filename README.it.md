@@ -55,7 +55,7 @@ Sessione Claude Code N ─┘                 │
 ## Requisiti
 
 - Windows (supporto completo: GUI PySide6, autostart, Rizzo Flow / Jev, aggiornamento automatico)
-  oppure macOS su Apple Silicon (sperimentale, vedi [macOS](#macos-apple-silicon-sperimentale))
+  oppure macOS (sperimentale, vedi [macOS](#macos-sperimentale))
 - Python 3.11+
 
 ## Installare l'exe (utenti finali)
@@ -85,31 +85,48 @@ file standalone:
 Le nuove versioni si installano col pulsante **Installa e riavvia** della
 GUI — niente più download manuali.
 
-## macOS (Apple Silicon, sperimentale)
+## macOS (sperimentale)
 
-Le release includono anche una build per macOS (arm64). **Non è firmata né notarizzata**:
-al primo avvio macOS la blocca. I manutentori non l'hanno ancora provata su un Mac:
-segnalate i problemi.
+Le release includono anche build per macOS: **Apple Silicon** (`arm64`) e **Intel** (`x86_64`;
+best effort, può mancare da una release). **Non sono firmate né notarizzate**: al primo avvio macOS
+le blocca. I manutentori non le hanno ancora provate su un Mac: segnalate i problemi.
 
-1. Dalla [pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases) scarica
-   `mcp-hub-gui-macos-arm64.zip` (GUI) e `mcp-hub-macos-arm64.tar.gz` (CLI `mcp-hub`).
-2. Decomprimi la GUI e sposta `mcp-hub-gui.app` in `/Applications`; estrai la CLI in una cartella
-   del `PATH` (per esempio `tar -xzf mcp-hub-macos-arm64.tar.gz -C ~/.local/bin`).
+### Installazione
+
+1. Dalla [pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases) scarica la GUI,
+   `mcp-hub-gui-macos-<arch>.zip`, dove `<arch>` è `arm64` (M1/M2/M3/M4) oppure `x86_64` (Intel).
+   Non sai che Mac hai? Esegui `uname -m` nel Terminale.
+2. Decomprimi e sposta `mcp-hub-gui.app` in `/Applications`.
 3. Togli il flag di quarantena aggiunto dal browser, altrimenti macOS dice che l'app è danneggiata:
 
    ```
    xattr -dr com.apple.quarantine /Applications/mcp-hub-gui.app
-   xattr -d com.apple.quarantine ~/.local/bin/mcp-hub
    ```
 
    (Oppure tasto destro sull'app, **Apri**, poi conferma.)
-4. Avvia `mcp-hub serve` o apri l'app. I dati stanno in
-   `~/Library/Application Support/mcp-hub/` (`config.json`, `backups/`).
 
-Non ancora disponibili su macOS: la scheda **Rizzo Flow / Jev** (il server locale richiede Windows e
-una GPU NVIDIA; una versione per Apple Silicon è prevista), l'avvio al login e l'aggiornamento
-automatico dentro l'app (scarica a mano la nuova release). Server, API di gestione, CLI
-(`serve`, `import`, `apply`) e GUI funzionano come su Windows; la config di Claude Code è `~/.claude.json`.
+Basta la GUI: contiene anche l'hub. La CLI (`mcp-hub-macos-<arch>.tar.gz`, poi
+`tar -xzf ... -C ~/.local/bin` e `xattr -d com.apple.quarantine ~/.local/bin/mcp-hub`) è facoltativa.
+
+### Avvio
+
+- **Apri `mcp-hub-gui.app`.** La GUI avvia da sola l'hub in background (al primo avvio, dopo la
+  procedura guidata; poi ogni volta che non lo raggiunge), quindi non devi lanciare altro. L'hub
+  resta attivo quando chiudi la finestra; **Esci** dall'icona nella barra dei menu ferma l'hub e
+  tutti i server che gestisce.
+- **Avvio al login:** Impostazioni di Sistema > Generali > Elementi login > **+** > `mcp-hub-gui.app`.
+  La GUI poi avvia l'hub a ogni accesso.
+- **Senza GUI:** `mcp-hub serve` (CLI), oppure `/Applications/mcp-hub-gui.app/Contents/MacOS/mcp-hub-gui serve`.
+- **Verifica:** `curl http://127.0.0.1:37450/api/status`.
+- I dati stanno in `~/Library/Application Support/mcp-hub/` (`config.json`, `backups/`). La config di
+  Claude Code è `~/.claude.json`; importa e applica come descritto più avanti.
+
+### Non ancora disponibili su macOS
+
+La scheda **Rizzo Flow / Jev** (il server locale richiede Windows e una GPU NVIDIA; una versione per
+Apple Silicon è prevista), l'interruttore "avvio al login" nelle Impostazioni (usa gli Elementi login
+come sopra) e l'aggiornamento automatico dentro l'app (scarica a mano la nuova release). Server, API
+di gestione, CLI (`serve`, `import`, `apply`) e GUI funzionano come su Windows.
 
 ## Setup (sviluppo)
 
