@@ -40,3 +40,45 @@ def test_save_is_atomic_leaves_no_temp_file_on_success(tmp_path):
 def test_default_concurrency_is_exclusive():
     sc = ServerConfig(enabled=True, command="npx", args=[], env={})
     assert sc.concurrency == "exclusive"
+
+
+def test_save_config_backs_up_the_previous_file(tmp_path):
+    from mcp_hub.config import list_backups
+
+    path = tmp_path / "config.json"
+    save_config(Config(hub=HubConfig(), servers={"a": ServerConfig(enabled=True, command="x", args=[], env={"K": "v"})}), path)
+    assert list_backups(path) == []  # nothing to back up the first time
+    save_config(Config(hub=HubConfig(), servers={}), path)  # e.g. an accidental empty write
+    backups = list_backups(path)
+    assert len(backups) == 1
+    assert load_config(backups[0]).servers["a"].command == "x"  # the old servers survive
+
+
+def test_backup_skips_identical_copy_and_keeps_only_the_newest(tmp_path, monkeypatch):
+    import mcp_hub.config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "BACKUP_KEEP", 3)
+    path = tmp_path / "config.json"
+    cfg = Config(hub=HubConfig(), servers={})
+    save_config(cfg, path)
+    save_config(cfg, path)
+    save_config(cfg, path)
+    assert cfgmod.list_backups(path) == []  # unchanged content: nothing new to keep
+    for i in range(6):
+        cfg.servers[f"s{i}"] = ServerConfig(enabled=False, command="c", args=[], env={})
+        save_config(cfg, path)
+    assert len(cfgmod.list_backups(path)) == 3
+
+
+def test_failed_backup_does_not_block_saving(tmp_path, monkeypatch):
+    import mcp_hub.config as cfgmod
+
+    path = tmp_path / "config.json"
+    save_config(Config(hub=HubConfig(), servers={}), path)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cfgmod.shutil, "copy2", boom)
+    save_config(Config(hub=HubConfig(), servers={"b": ServerConfig(enabled=False, command="c", args=[], env={})}), path)
+    assert "b" in load_config(path).servers

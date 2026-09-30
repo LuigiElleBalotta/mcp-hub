@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Literal
@@ -179,6 +181,51 @@ def load_config(path: Path | None = None) -> Config:
     return Config(hub=hub, servers=servers, rizzo=rizzo)
 
 
+BACKUP_DIR_NAME = "backups"
+BACKUP_KEEP = 30
+
+
+def list_backups(path: Path | None = None) -> list[Path]:
+    """Config backups next to `path`, newest first."""
+    path = path if path is not None else CONFIG_PATH
+    folder = path.parent / BACKUP_DIR_NAME
+    if not folder.is_dir():
+        return []
+    return sorted(folder.glob(f"{path.stem}.*.json"),
+                  key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+
+
+def _backup_existing(path: Path, new_content: bytes) -> None:
+    """Copies the current file to backups/ before it is overwritten, so a bad
+    write (a bug, a test, a hand edit) never destroys the only copy of the
+    server definitions. Skipped when identical to the newest backup; only the
+    newest BACKUP_KEEP are kept. Never raises: a failed backup must not block
+    saving the config."""
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return
+        current = path.read_bytes()
+        # write_text() stores CRLF on Windows: compare line-ending-insensitively.
+        if current.replace(b"\r\n", b"\n") == new_content:
+            return  # the save changes nothing: no need for a copy
+        existing = list_backups(path)
+        if existing and existing[0].read_bytes() == current:
+            return
+        folder = path.parent / BACKUP_DIR_NAME
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = folder / f"{path.stem}.{stamp}.json"
+        counter = 1
+        while target.exists():
+            target = folder / f"{path.stem}.{stamp}-{counter}.json"
+            counter += 1
+        shutil.copy2(path, target)
+        for old in list_backups(path)[BACKUP_KEEP:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def save_config(config: Config, path: Path | None = None) -> None:
     path = path if path is not None else CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,5 +237,7 @@ def save_config(config: Config, path: Path | None = None) -> None:
     if config.rizzo != RizzoSettings():
         payload["rizzo"] = asdict(config.rizzo)
     tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    text = json.dumps(payload, indent=2)
+    _backup_existing(path, text.encode("utf-8"))
+    tmp_path.write_text(text, encoding="utf-8")
     os.replace(tmp_path, path)
