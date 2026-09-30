@@ -136,6 +136,10 @@ jobs:
     needs: [check-tag, build-windows, build-macos]
     if: needs.check-tag.outputs.kind == 'release' || needs.check-tag.outputs.kind == 'beta'
     runs-on: ubuntu-latest
+    env:
+      # Optional: a token that can dispatch workflows on the Homebrew tap. Without it
+      # the tap's own schedule picks the release up within a few hours.
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -155,3 +159,13 @@ jobs:
             artifacts/mcp-hub-gui-macos-arm64.zip
             artifacts/mcp-hub-macos-x86_64.tar.gz
             artifacts/mcp-hub-gui-macos-x86_64.zip
+
+      - name: Tell the Homebrew tap about the new release
+        if: env.TAP_TOKEN != '' && needs.check-tag.outputs.kind == 'release'
+        continue-on-error: true
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TAP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/LuigiElleBalotta/homebrew-tap/dispatches \
+            -d '{"event_type":"mcp-hub-release"}'

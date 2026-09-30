@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from mcp_hub.config import (
+    default_rizzo_device,
     BUILTIN_RIZZO, Config, HubConfig, RizzoSettings, ServerConfig, load_config,
     rizzo_settings_from_dict, save_config,
 )
@@ -134,7 +135,7 @@ async def test_api_get_and_put_rizzo(monkeypatch):
     async with await _client(manager) as client:
         assert (await client.get("/api/rizzo")).json() == {
             "settings": {"installDir": None, "port": 8017, "quant": "q4_k_m", "ctx": 16384,
-                         "kvType": "q8_0", "autostart": False},
+                         "kvType": "q8_0", "device": default_rizzo_device(), "autostart": False},
             "status": None}
         resp = await client.put("/api/rizzo", json={"installDir": r"C:\x", "port": 9100, "quant": "q4_k_m",
                                                     "ctx": 16384, "kvType": "q8_0", "autostart": False})

@@ -135,6 +135,44 @@ def hub_exe_path() -> Path:
     return gui_exe_path().parent / HUB_EXE_NAME
 
 
+BREW_CASK = "mcp-hub"
+
+
+def brew_cask_installed() -> bool:
+    """macOS only: the app was installed with `brew install --cask mcp-hub`,
+    so Homebrew can upgrade it (the in-app PowerShell updater is Windows-only)."""
+    if sys.platform != "darwin":
+        return False
+    brew = shutil.which("brew")
+    if not brew:
+        return False
+    try:
+        done = subprocess.run([brew, "list", "--cask", BREW_CASK], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def brew_upgrade() -> None:
+    """`brew upgrade --cask mcp-hub` (which refreshes the tap first). Raises
+    RuntimeError with the tail of Homebrew's output when it fails."""
+    brew = shutil.which("brew")
+    if not brew:
+        raise RuntimeError("Homebrew non trovato (brew non e' nel PATH)")
+    try:
+        done = subprocess.run([brew, "upgrade", "--cask", BREW_CASK], capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("brew upgrade: timeout") from exc
+    if done.returncode != 0:
+        tail = (done.stderr or done.stdout or "").strip().splitlines()[-3:]
+        raise RuntimeError("brew upgrade non riuscito: " + " | ".join(tail))
+
+
+def relaunch_app_later() -> None:
+    """Reopens the GUI a moment after this process has exited (macOS)."""
+    launch_detached(["sh", "-c", "sleep 3; open -a mcp-hub-gui"])
+
+
 def hub_command() -> list[str]:
     """The command that starts the hub. Windows exes ship a separate
     `mcp-hub.exe`; the macOS app is one binary that serves when run with

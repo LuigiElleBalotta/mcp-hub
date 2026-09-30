@@ -87,13 +87,25 @@ GUI — niente più download manuali.
 
 ## macOS (sperimentale)
 
-Le release includono anche build per macOS: **Apple Silicon** (`arm64`) e **Intel** (`x86_64`;
-best effort, può mancare da una release). **Non sono firmate né notarizzate**: al primo avvio macOS
-le blocca. I manutentori non le hanno ancora provate su un Mac: segnalate i problemi.
+Le release includono anche build per macOS: **Apple Silicon** (`arm64`) e **Intel** (`x86_64`).
+**Non sono firmate né notarizzate**. I manutentori non le hanno ancora provate su un Mac: segnalate i problemi.
 
-### Installazione
+### Installazione con Homebrew (consigliata)
 
-1. Dalla [pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases) scarica la GUI,
+```
+brew tap LuigiElleBalotta/tap
+brew install --cask mcp-hub
+```
+
+Mette `mcp-hub-gui.app` in `/Applications` (l'architettura giusta è scelta da sola), toglie il flag di
+quarantena (niente avviso "app danneggiata") e aggiunge il comando `mcp-hub`
+(`mcp-hub serve | import | apply`). Per aggiornare: `brew upgrade --cask mcp-hub`, oppure il pulsante
+**Installa e riavvia** dell'app (lancia quel comando e riapre l'app). Per disinstallare:
+`brew uninstall --cask mcp-hub`.
+
+### Installazione a mano
+
+1. Dalla [pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases) scarica
    `mcp-hub-gui-macos-<arch>.zip`, dove `<arch>` è `arm64` (M1/M2/M3/M4) oppure `x86_64` (Intel).
    Non sai che Mac hai? Esegui `uname -m` nel Terminale.
 2. Decomprimi e sposta `mcp-hub-gui.app` in `/Applications`.
@@ -107,6 +119,7 @@ le blocca. I manutentori non le hanno ancora provate su un Mac: segnalate i prob
 
 Basta la GUI: contiene anche l'hub. La CLI (`mcp-hub-macos-<arch>.tar.gz`, poi
 `tar -xzf ... -C ~/.local/bin` e `xattr -d com.apple.quarantine ~/.local/bin/mcp-hub`) è facoltativa.
+Con l'installazione a mano gli aggiornamenti sono manuali.
 
 ### Avvio
 
@@ -120,13 +133,24 @@ Basta la GUI: contiene anche l'hub. La CLI (`mcp-hub-macos-<arch>.tar.gz`, poi
 - **Verifica:** `curl http://127.0.0.1:37450/api/status`.
 - I dati stanno in `~/Library/Application Support/mcp-hub/` (`config.json`, `backups/`). La config di
   Claude Code è `~/.claude.json`; importa e applica come descritto più avanti.
+- Le app avviate da Finder o al login hanno un `PATH` minimo: mcp-hub aggiunge `/opt/homebrew/bin`,
+  `/usr/local/bin`, `~/.local/bin` e `~/.cargo/bin`, così `npx`, `uvx`, `uv`, `node` e `git` vengono trovati.
+
+### Rizzo Flow / Jev su macOS (sperimentale)
+
+La tab **Rizzo Flow / Jev** funziona anche su macOS: Rizzo Flow gira su **Apple Silicon** tramite Metal
+(memoria unificata, circa 4,1 GB per il modello) e sui **Mac Intel** solo su CPU (lento). Installa prima i
+prerequisiti, per esempio `brew install git uv node`, poi apri la tab e segui i passi. La cartella di
+installazione predefinita è `~/rizzo-compaction`; il dispositivo (`metal` o `cpu`) è scelto in base al tuo Mac
+e salvato come `rizzo.device` in `config.json` (`auto`, `cuda`, `metal` o `cpu`). Il progetto Rizzo segnala
+che Metal funziona su un M3 Pro, ma i manutentori non l'hanno riprodotto e non è ancora stato provato
+tramite mcp-hub su un Mac.
 
 ### Non ancora disponibili su macOS
 
-La scheda **Rizzo Flow / Jev** (il server locale richiede Windows e una GPU NVIDIA; una versione per
-Apple Silicon è prevista), l'interruttore "avvio al login" nelle Impostazioni (usa gli Elementi login
-come sopra) e l'aggiornamento automatico dentro l'app (scarica a mano la nuova release). Server, API
-di gestione, CLI (`serve`, `import`, `apply`) e GUI funzionano come su Windows.
+L'interruttore "avvio al login" nelle Impostazioni (usa gli Elementi login come sopra) e
+l'aggiornamento automatico dentro l'app per le installazioni a mano (usa Homebrew, o scarica la nuova
+release). Server, API di gestione, CLI (`serve`, `import`, `apply`) e GUI funzionano come su Windows.
 
 ## Setup (sviluppo)
 
@@ -213,7 +237,7 @@ Claude Code `fast-jev-compaction` — è **integrato nella GUI**: apri la tab
   avanzamento) / Installato, fermo / In avvio / In esecuzione / Errore, con GPU e
   VRAM, porta, modello, `--ctx`, tipo di cache KV e ultimo health check.
 - **Installa** (compare solo se manca qualcosa): controlla i prerequisiti (git, uv,
-  node, npm, GPU NVIDIA), clona i due fork, `uv sync`, scarica pesi + runtime CUDA
+  node, npm e una GPU: NVIDIA su Windows, Apple Silicon su macOS), clona i due fork, `uv sync`, scarica pesi + runtime llama.cpp
   (~3,9 GB, con byte/percentuale/velocità), `npm install` del plugin e attiva Rizzo
   Flow nell'hub. Ogni passo viene saltato se già fatto, si può annullare (viene
   terminato l'intero albero di processi) e riprendere. Prima del download si
@@ -223,15 +247,18 @@ Claude Code `fast-jev-compaction` — è **integrato nella GUI**: apri la tab
   mai il download). Avvia/Ferma usano le stesse chiamate dell'hub di qualunque service.
 - **Impostazioni** (chiuse di default): cartella di installazione, porta (8017),
   quantizzazione dei pesi, `--ctx` (16384), cache KV (`q8_0`) e "avvia con l'hub"
-  (no). Sono salvate sotto la chiave `rizzo` di `config.json`; l'hub costruisce da
+  (no). Il dispositivo di calcolo (`cuda` su Windows/Linux, `metal` su Apple Silicon, `cpu` sui Mac Intel;
+  `auto` lascia scegliere a Rizzo) è `rizzo.device` in `config.json` / `PUT /api/rizzo`. Sono salvate sotto la chiave `rizzo` di `config.json`; l'hub costruisce da
   sole il comando `uv run rizzo serve ...`. Salvare mentre il server gira lo ferma.
 - **Usa con Claude Code (Jev)**: pulsante *Prova la connessione* (invia una piccola
   domanda `noul` a `http://127.0.0.1:<porta>/v1/systemone` e mostra
   OK/latenza/modello/VRAM), i due comandi `/plugin` e la `userConfig` del plugin
-  (`baseUrl`, `model` = `rizzo-latest`, `apiKey` segnaposto, `maxStateTokens` 12000,
+  (`baseUrl`, `model` = `rizzo-latest`, `apiKey` segnaposto, `maxStateTokens` 6000,
   `maxRequestTokens` 14000, `maxQuestionsPerRequest` 64) con pulsanti Copia.
   mcp-hub non scrive mai i `settings.json` di Claude Code: l'installazione del
-  plugin dentro Claude Code resta manuale.
+  plugin dentro Claude Code resta manuale. Il plugin usa gli hook a funzione di Claude Code
+  (funzione sperimentale): avvia Claude Code con `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`, altrimenti il
+  plugin risulta installato ma non parte mai.
 
 Sotto il cofano è un `service` di nome `rizzo-flow`, generato dall'hub dalle
 impostazioni. Il nome è riservato: non sta in `servers`, non compare nella tabella
@@ -511,6 +538,11 @@ true` per essere avvisato anche delle prerelease `x.y.z-n`, non solo delle
 release stabili.
 
 ## Auto-update
+
+**macOS:** l'updater PowerShell descritto sotto è solo per Windows. Una copia installata con Homebrew
+(`brew install --cask mcp-hub`) si aggiorna con `brew upgrade --cask mcp-hub`, e il pulsante
+**Installa e riavvia** del banner lancia esattamente quel comando e poi riapre l'app. Con l'installazione
+a mano il banner mostra solo il link per scaricare.
 
 **Layout di installazione da cui dipende:** `mcp-hub.exe` e
 `mcp-hub-gui.exe` devono stare nella stessa cartella (esattamente come li

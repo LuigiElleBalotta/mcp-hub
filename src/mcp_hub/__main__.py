@@ -115,6 +115,9 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    from mcp_hub.paths import augment_path
+
+    augment_path()
     parser = argparse.ArgumentParser(prog="mcp_hub")
     parser.add_argument("--version", action="version", version=f"mcp-hub {mcp_hub.__version__}")
     sub = parser.add_subparsers(dest="command", required=True)

@@ -97,6 +97,17 @@ class HubConfig:
 BUILTIN_RIZZO = "rizzo-flow"
 RIZZO_QUANTS = ("q4_k_m", "q8_0")
 RIZZO_KV_TYPES = ("f16", "q8_0", "q4_0")
+RIZZO_DEVICES = ("auto", "cuda", "metal", "cpu")
+
+
+def default_rizzo_device() -> str:
+    """CUDA on Windows/Linux (NVIDIA), Metal on Apple Silicon, CPU on Intel Macs."""
+    import platform
+    import sys
+
+    if sys.platform == "darwin":
+        return "metal" if platform.machine() == "arm64" else "cpu"
+    return "cuda"
 
 
 @dataclass
@@ -108,6 +119,7 @@ class RizzoSettings:
     quant: str = "q4_k_m"
     ctx: int = 16384
     kvType: str = "q8_0"
+    device: str = field(default_factory=default_rizzo_device)
     autostart: bool = False
 
     @property
@@ -123,7 +135,7 @@ class RizzoSettings:
             return None
         return ServerConfig(
             enabled=True, command="uv",
-            args=["run", "rizzo", "serve", "--size", "4b", "--quant", self.quant, "--device", "cuda",
+            args=["run", "rizzo", "serve", "--size", "4b", "--quant", self.quant, "--device", self.device,
                   "--ctx", str(self.ctx), "--kv-type", self.kvType, "--port", str(self.port)],
             type="service", cwd=str(self.rizzo_dir),
             healthUrl=f"http://127.0.0.1:{self.port}/health", port=self.port,
@@ -146,6 +158,8 @@ def rizzo_settings_from_dict(data: dict) -> RizzoSettings:
         raise ValueError("ctx must be an integer between 2048 and 262144")
     if settings.quant not in RIZZO_QUANTS:
         raise ValueError(f"quant must be one of {', '.join(RIZZO_QUANTS)}")
+    if settings.device not in RIZZO_DEVICES:
+        raise ValueError(f"device must be one of {', '.join(RIZZO_DEVICES)}")
     if settings.kvType not in RIZZO_KV_TYPES:
         raise ValueError(f"kvType must be one of {', '.join(RIZZO_KV_TYPES)}")
     if not isinstance(settings.autostart, bool):

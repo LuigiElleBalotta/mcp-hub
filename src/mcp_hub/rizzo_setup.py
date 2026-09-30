@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -26,7 +27,10 @@ from typing import Callable
 from mcp_hub.config import BUILTIN_RIZZO, RizzoSettings
 
 SERVICE_NAME = BUILTIN_RIZZO
-DEFAULT_INSTALL_DIR = Path(r"C:\repositories\mindicity\utils\claude-code\rizzo-compaction")
+DEFAULT_INSTALL_DIR = (
+    Path("C:/repositories/mindicity/utils/claude-code/rizzo-compaction")
+    if sys.platform == "win32" else Path.home() / "rizzo-compaction"
+)
 RIZZO_URL = "https://github.com/LuigiElleBalotta/rizzo-flow.git"
 JEV_URL = "https://github.com/LuigiElleBalotta/fast-jev-compaction.git"
 BRANCH = "custom"
@@ -42,6 +46,7 @@ _WEIGHTS_BY_QUANT = {"q4_k_m": WEIGHTS_BYTES, "q8_0": 4_500_000_000}
 MIN_FREE_BYTES = 6 * 1024**3
 MIN_VRAM_MIB = 6000
 REQUIRED_TOOLS = ("git", "uv", "node", "npm")
+FUNCTION_HOOKS_ENV = "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1"
 PLUGIN_MARKETPLACE_CMD = "/plugin marketplace add LuigiElleBalotta/fast-jev-compaction"
 PLUGIN_INSTALL_CMD = "/plugin install fast-jev-compaction@fast-jev-compaction"
 
@@ -80,7 +85,7 @@ STEP_SPECS: tuple[StepSpec, ...] = (
     StepSpec("prereqs", "Prerequisiti (git, uv, node, npm, GPU)"),
     StepSpec("clone_rizzo", "Clona rizzo-flow (server locale)"),
     StepSpec("uv_sync", "Dipendenze Python (uv sync)"),
-    StepSpec("download", "Scarica pesi e runtime CUDA (~3,9 GB)"),
+    StepSpec("download", "Scarica pesi e runtime (~3,9 GB)"),
     StepSpec("clone_jev", "Clona fast-jev-compaction (plugin)"),
     StepSpec("npm_install", "Dipendenze del plugin (npm install)"),
     StepSpec("register_service", "Attiva Rizzo Flow nell'hub"),
@@ -138,7 +143,7 @@ def plugin_user_config(port: int = PORT) -> dict:
         "baseUrl": f"http://127.0.0.1:{port}/v1/systemone",
         "model": "rizzo-latest",
         "apiKey": "rizzo-local",
-        "maxStateTokens": 12000,
+        "maxStateTokens": 6000,
         "maxRequestTokens": 14000,
         "maxQuestionsPerRequest": 64,
     }
@@ -152,6 +157,8 @@ def plugin_config_lines(port: int = PORT) -> str:
 
 def plugin_instructions(port: int = PORT) -> str:
     return (
+        f"Prima avvia Claude Code con la variabile {FUNCTION_HOOKS_ENV} (funzione sperimentale:\n"
+        "senza, il plugin risulta installato ma non parte mai; riavvia le sessioni gia' aperte).\n\n"
         "Installa il plugin da Claude Code:\n"
         f"  {PLUGIN_MARKETPLACE_CMD}\n"
         f"  {PLUGIN_INSTALL_CMD}\n\n"
@@ -244,6 +251,7 @@ class SetupEnv:
     register: Callable[[dict], None] | None = None
     run_command: Callable[..., int] = _default_run_command
     kill_tree: Callable[[int], None] = _default_kill_tree
+    platform: str = sys.platform
 
 
 @dataclass
@@ -350,6 +358,24 @@ def resolve_install_dir(options: SetupOptions, env: SetupEnv) -> Path:
     return Path(configured) if configured else DEFAULT_INSTALL_DIR
 
 
+def _detect_mac_gpu(env: "SetupEnv", prereqs: list, warnings: list) -> tuple[str | None, int | None]:
+    """Apple Silicon runs the model on the GPU through Metal with unified memory;
+    an Intel Mac has no usable GPU for it (CPU only, slow)."""
+    chip = (env.query(["sysctl", "-n", "machdep.cpu.brand_string"]) or "").strip() or "Mac"
+    arch = (env.query(["uname", "-m"]) or "").strip()
+    mem = (env.query(["sysctl", "-n", "hw.memsize"]) or "").strip()
+    gib = int(mem) // 1024**3 if mem.isdigit() else None
+    if arch == "arm64":
+        detail = f"{chip}, {gib} GB di memoria unificata" if gib else chip
+        prereqs.append(Prereq("GPU (Metal)", True, detail, required=False))
+        if gib is not None and gib < 8:
+            warnings.append(f"Memoria {gib} GB: il server usa circa 4,1 GB, potrebbe non starci.")
+        return chip, (gib * 1024 if gib else None)
+    warnings.append("Mac Intel: nessuna GPU utilizzabile, il server gira su CPU e sara' lento.")
+    prereqs.append(Prereq("GPU (Metal)", False, "Mac Intel: solo CPU", required=False))
+    return chip, None
+
+
 def detect(options: SetupOptions | None = None, env: SetupEnv | None = None) -> Detection:
     options = options or SetupOptions()
     env = env or SetupEnv()
@@ -368,20 +394,23 @@ def detect(options: SetupOptions | None = None, env: SetupEnv | None = None) -> 
     gpu_name: str | None = None
     gpu_mib: int | None = None
     warnings: list[str] = []
-    smi = env.which("nvidia-smi")
-    out = env.query([smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]) if smi else None
-    if out and out.strip():
-        parts = [x.strip() for x in out.strip().splitlines()[0].split(",")]
-        if len(parts) >= 2 and parts[1].isdigit():
-            gpu_name, gpu_mib = parts[0], int(parts[1])
-    if gpu_mib is None:
-        warnings.append("GPU NVIDIA non rilevata (nvidia-smi): il server e' pensato per CUDA.")
-        prereqs.append(Prereq("GPU NVIDIA", False, "non rilevata", required=False))
-    elif gpu_mib < MIN_VRAM_MIB:
-        warnings.append(f"VRAM {gpu_mib} MiB < 6 GB: il server usa circa 4,1 GB, potrebbe non starci.")
-        prereqs.append(Prereq("GPU NVIDIA", True, f"{gpu_name}, {gpu_mib} MiB (pochi)", required=False))
+    if env.platform == "darwin":
+        gpu_name, gpu_mib = _detect_mac_gpu(env, prereqs, warnings)
     else:
-        prereqs.append(Prereq("GPU NVIDIA", True, f"{gpu_name}, {gpu_mib} MiB", required=False))
+        smi = env.which("nvidia-smi")
+        out = env.query([smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]) if smi else None
+        if out and out.strip():
+            parts = [x.strip() for x in out.strip().splitlines()[0].split(",")]
+            if len(parts) >= 2 and parts[1].isdigit():
+                gpu_name, gpu_mib = parts[0], int(parts[1])
+        if gpu_mib is None:
+            warnings.append("GPU NVIDIA non rilevata (nvidia-smi): il server e' pensato per CUDA.")
+            prereqs.append(Prereq("GPU NVIDIA", False, "non rilevata", required=False))
+        elif gpu_mib < MIN_VRAM_MIB:
+            warnings.append(f"VRAM {gpu_mib} MiB < 6 GB: il server usa circa 4,1 GB, potrebbe non starci.")
+            prereqs.append(Prereq("GPU NVIDIA", True, f"{gpu_name}, {gpu_mib} MiB (pochi)", required=False))
+        else:
+            prereqs.append(Prereq("GPU NVIDIA", True, f"{gpu_name}, {gpu_mib} MiB", required=False))
 
     registered = bool(settings.installDir) and Path(settings.installDir) == install_dir
     weights = _weights_present(p["gguf"], settings.quant)
