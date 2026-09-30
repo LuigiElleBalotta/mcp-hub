@@ -26,6 +26,18 @@ class _UpdateCheckWorker(QThread):
         self.found.emit(check_for_update(mcp_hub.__version__, include_beta=self._include_beta))
 
 
+class _QuitWorker(QThread):
+    """Stops the hub process tree for the tray's "Esci"."""
+
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        from mcp_hub.gui.hub_control import shutdown_hub
+        shutdown_hub(self._client)
+
+
 class _StatusWorker(QThread):
     """Runs `client.status()` off the Qt main thread.
 
@@ -231,6 +243,20 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _quit_from_tray(self) -> None:
+        # "Esci" must end the background hub too (and every server it
+        # manages), not just this window: stop it off the UI thread -- a
+        # graceful stop can take several seconds -- then quit.
+        if getattr(self, "_quit_thread", None) is not None:
+            return
+        self.tray_icon.showMessage(
+            self.windowTitle(), "Chiusura dell'hub in corso...",
+            QSystemTrayIcon.MessageIcon.Information, 2000,
+        )
+        self._quit_thread = _QuitWorker(self.client, self)
+        self._quit_thread.finished.connect(self._finish_quit)
+        self._quit_thread.start()
+
+    def _finish_quit(self) -> None:
         from PySide6.QtWidgets import QApplication
         self.tray_icon.hide()
         QApplication.quit()
