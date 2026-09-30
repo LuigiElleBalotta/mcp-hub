@@ -1,5 +1,6 @@
 # tests/test_rizzo_setup.py
 """Rizzo setup backend: detection, step ordering/skipping, failure, cancel, progress."""
+import sys
 import threading
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def make_env(tmp_path, *, tools=("git", "uv", "node", "npm", "nvidia-smi"), sett
         register=register,
         run_command=run_command or (lambda args, cwd, on_line, on_start: 0),
         kill_tree=lambda pid: None,
+        platform="win32",
     ), box, registered
 
 
@@ -372,11 +374,12 @@ def test_format_progress():
 def test_plugin_config_text_and_values(tmp_path):
     cfg = plugin_user_config()
     assert cfg["baseUrl"] == "http://127.0.0.1:8017/v1/systemone" and cfg["model"] == "rizzo-latest"
-    assert (cfg["maxStateTokens"], cfg["maxRequestTokens"], cfg["maxQuestionsPerRequest"]) == (12000, 14000, 64)
+    assert (cfg["maxStateTokens"], cfg["maxRequestTokens"], cfg["maxQuestionsPerRequest"]) == (6000, 14000, 64)
     text = plugin_instructions(9100)
     assert "/plugin marketplace add LuigiElleBalotta/fast-jev-compaction" in text
     assert "/plugin install fast-jev-compaction@fast-jev-compaction" in text
     assert "baseUrl" in plugin_config_lines() and ":9100/v1/systemone" in text
+    assert "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1" in text
     assert "settings.json" not in text.replace("non", "")  # never tells to edit settings.json
 
 
@@ -424,3 +427,65 @@ def test_connection_failures_are_reported_not_raised():
     assert "HTTP 422" in check_connection(8017, lambda *a: (422, "bad")).error
     assert "Jev-compatibile" in check_connection(8017, lambda *a: (200, "{}")).error
     assert not check_connection(8017, lambda *a: (200, "not json")).ok
+
+
+def _mac_env(tmp_path, arch, chip="Apple M3 Pro", mem=18 * GB):
+    env, _, _ = make_env(tmp_path)
+    answers = {"uname": f"{arch}\n", "sysctl": None}
+
+    def query(args):
+        if args[0] == "uname":
+            return answers["uname"]
+        if args[-1] == "machdep.cpu.brand_string":
+            return chip + "\n"
+        if args[-1] == "hw.memsize":
+            return f"{mem}\n"
+        return None
+
+    env.query = query
+    env.platform = "darwin"
+    return env
+
+
+def test_detect_apple_silicon_reports_metal_and_unified_memory(tmp_path):
+    d = detect(SetupOptions(install_dir=tmp_path), _mac_env(tmp_path, "arm64"))
+    gpu = next(p for p in d.prereqs if p.name == "GPU (Metal)")
+    assert gpu.found and "Apple M3 Pro" in gpu.detail and "18 GB" in gpu.detail
+    assert d.gpu_name == "Apple M3 Pro" and d.gpu_mib == 18 * 1024
+    assert not any("NVIDIA" in w for w in d.warnings)
+
+
+def test_detect_apple_silicon_with_little_memory_warns(tmp_path):
+    d = detect(SetupOptions(install_dir=tmp_path), _mac_env(tmp_path, "arm64", mem=4 * GB))
+    assert any("Memoria 4 GB" in w for w in d.warnings)
+
+
+def test_detect_intel_mac_warns_about_cpu_only(tmp_path):
+    d = detect(SetupOptions(install_dir=tmp_path), _mac_env(tmp_path, "x86_64", chip="Intel(R) Core(TM) i7"))
+    gpu = next(p for p in d.prereqs if p.name == "GPU (Metal)")
+    assert not gpu.found and d.gpu_mib is None
+    assert any("Mac Intel" in w for w in d.warnings)
+
+
+def test_device_is_part_of_the_service_command_and_validated(tmp_path):
+    from mcp_hub.config import rizzo_settings_from_dict
+
+    sc = installed_settings(tmp_path, device="metal").to_service()
+    assert sc.args[sc.args.index("--device") + 1] == "metal"
+    with pytest.raises(ValueError, match="device"):
+        rizzo_settings_from_dict({"device": "tpu"})
+    assert rizzo_settings_from_dict({"device": "auto"}).device == "auto"
+
+
+def test_default_device_follows_the_platform(monkeypatch):
+    import platform
+
+    from mcp_hub.config import default_rizzo_device
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+    assert default_rizzo_device() == "metal"
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    assert default_rizzo_device() == "cpu"
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert default_rizzo_device() == "cuda"

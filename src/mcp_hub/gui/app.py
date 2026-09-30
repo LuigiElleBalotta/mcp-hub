@@ -47,6 +47,9 @@ def _launch_hub() -> None:
 
 
 def main() -> None:
+    from mcp_hub.paths import augment_path
+
+    augment_path()  # a Finder/login launch on macOS has a minimal PATH
     app = QApplication(sys.argv)
 
     lock = QSharedMemory(_SINGLETON_KEY)

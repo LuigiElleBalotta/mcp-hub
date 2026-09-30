@@ -338,6 +338,13 @@ class RizzoPanel(QWidget):
         test_row.addWidget(self.test_label, 1)
         jbox.addLayout(test_row)
         self.test_btn.clicked.connect(self._test_connection)
+        env_note = QLabel(
+            f"0. Avvia Claude Code con la variabile d'ambiente <b>{rs.FUNCTION_HOOKS_ENV}</b> "
+            "(funzione sperimentale: senza, il plugin risulta installato ma non parte mai; "
+            "riavvia le sessioni gia' aperte)."
+        )
+        env_note.setWordWrap(True)
+        jbox.addWidget(env_note)
         jbox.addWidget(QLabel("1. Installa il plugin in Claude Code (a mano, dentro Claude Code):"))
         self.cmd_edits: list[QLineEdit] = []
         for cmd in (rs.PLUGIN_MARKETPLACE_CMD, rs.PLUGIN_INSTALL_CMD):
@@ -389,7 +396,8 @@ class RizzoPanel(QWidget):
         return RizzoSettings(
             installDir=self._persisted.installDir, port=self.port_spin.value(),
             quant=self.quant_combo.currentText(), ctx=self.ctx_spin.value(),
-            kvType=self.kv_combo.currentText(), autostart=self.autostart_check.isChecked(),
+            kvType=self.kv_combo.currentText(), device=self._persisted.device,
+            autostart=self.autostart_check.isChecked(),
         )
 
     def install_dir(self) -> Path:
@@ -724,32 +732,3 @@ class RizzoPanel(QWidget):
         self.test_label.setText(result.summary())
         self.test_label.setStyleSheet(f"color: {'#2e7d32' if result.ok else '#c62828'};")
         self.test_btn.setEnabled(True)
-
-
-class UnsupportedRizzoPanel(QWidget):
-    """Stands in for `RizzoPanel` where the Rizzo Flow installer cannot run
-    (anything but Windows + NVIDIA for now), with the same small interface the
-    main window uses."""
-    state_changed = Signal(str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        label = QLabel(
-            "<b>Rizzo Flow / Jev non e' ancora disponibile su questo sistema.</b><br><br>"
-            "Il server locale oggi richiede Windows con una GPU NVIDIA (CUDA). "
-            "Il supporto per macOS (Apple Silicon) e' in lavorazione.<br><br>"
-            "Il resto di mcp-hub funziona normalmente."
-        )
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        layout.addStretch(1)
-
-    def tab_title(self) -> str:
-        return "Rizzo Flow / Jev"
-
-    def refresh_detection(self) -> None:
-        pass
-
-    def on_hub_status(self, info: dict | None, reachable: bool = True) -> None:
-        pass

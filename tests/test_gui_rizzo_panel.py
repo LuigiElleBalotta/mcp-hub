@@ -154,7 +154,7 @@ def test_installing_shows_step_and_download_progress(qapp, tmp_path):
     assert panel.current_bar.maximum() == 0                       # busy until a size is known
     panel._on_progress("download", 1_288_490_189, 3_914_315_482, 8_808_038)
     assert panel.phase() == Phase.INSTALLING
-    assert panel.state_label.text() == "Installazione in corso: Scarica pesi e runtime CUDA (~3,9 GB) (3/8)"
+    assert panel.state_label.text() == "Installazione in corso: Scarica pesi e runtime (~3,9 GB) (3/8)"
     assert panel.current_label.text() == "Download pesi e runtime: 1.2 GB / 3.6 GB (33%), 8 MB/s"
     assert panel.current_bar.maximum() == 1000 and 320 < panel.current_bar.value() < 340
     assert panel.overall_bar.value() == 3
@@ -356,7 +356,7 @@ def test_jev_section_has_copyable_config_commands_and_connection_test(qapp, tmp_
     set_state(panel, detection(tmp_path))
     text = panel.config_text.toPlainText()
     for needle in ("baseUrl", "http://127.0.0.1:8017/v1/systemone", "rizzo-latest", "maxStateTokens",
-                   "12000", "14000", "maxQuestionsPerRequest", "64", "apiKey"):
+                   "6000", "14000", "maxQuestionsPerRequest", "64", "apiKey"):
         assert needle in text
     assert [e.text() for e in panel.cmd_edits] == [
         "/plugin marketplace add LuigiElleBalotta/fast-jev-compaction",

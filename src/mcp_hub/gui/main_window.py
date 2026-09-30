@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtCore import QEvent, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -118,6 +120,10 @@ class _InstallUpdateWorker(QThread):
             from mcp_hub.paths import data_dir
 
             staging = data_dir() / self_update.STAGING_DIR_NAME
+            if sys.platform == "darwin":
+                self_update.brew_upgrade()
+                self.finished_ok.emit(True, "")
+                return
             work_dir = self_update.fresh_staging_dir(staging, self._info.version)
             self_update.apply_update(self._info, self._hub_pid, work_dir)
             self.finished_ok.emit(True, "")
@@ -214,10 +220,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(version_label)
 
         self.tabs.addTab(servers_page, "Server")
-        import sys
-
-        from mcp_hub.gui.rizzo_panel import RizzoPanel, UnsupportedRizzoPanel
-        self.rizzo_panel = RizzoPanel(self.client) if sys.platform == "win32" else UnsupportedRizzoPanel()
+        from mcp_hub.gui.rizzo_panel import RizzoPanel
+        self.rizzo_panel = RizzoPanel(self.client)
         self.tabs.addTab(self.rizzo_panel, self.rizzo_panel.tab_title())
         self.rizzo_panel.state_changed.connect(lambda text: self.tabs.setTabText(1, text))
         self.tabs.currentChanged.connect(
@@ -331,7 +335,7 @@ class MainWindow(QMainWindow):
             and self_update.is_frozen()
             and self_update.HUB_EXE_NAME in info.assets
             and self_update.GUI_EXE_NAME in info.assets
-        )
+        ) or self_update.brew_cask_installed()
         self.install_update_btn.setVisible(can_auto_install)
 
     def _install_update(self) -> None:
@@ -377,6 +381,11 @@ class MainWindow(QMainWindow):
         # replace would then either fail (exe still locked) or race a still
         # -running old GUI against the freshly relaunched new one.
         from PySide6.QtWidgets import QApplication
+        if sys.platform == "darwin":
+            # Homebrew already replaced the app; reopen it once we have exited
+            # (it starts the new hub by itself).
+            from mcp_hub import self_update
+            self_update.relaunch_app_later()
         try:
             self.client.shutdown()
         except Exception:

@@ -86,13 +86,25 @@ manual downloads.
 
 ## macOS (experimental)
 
-Releases also ship macOS builds for **Apple Silicon** (`arm64`) and **Intel** (`x86_64`; best effort,
-it may be missing from a release). They are **not signed or notarized**, so macOS blocks them the
-first time. The maintainers have not tested them on a Mac yet: please report problems.
+Releases also ship macOS builds for **Apple Silicon** (`arm64`) and **Intel** (`x86_64`). They are
+**not signed or notarized**. The maintainers have not tested them on a Mac yet: please report problems.
 
-### Install
+### Install with Homebrew (recommended)
 
-1. From the [Releases page](https://github.com/LuigiElleBalotta/mcp-hub/releases) download the GUI,
+```
+brew tap LuigiElleBalotta/tap
+brew install --cask mcp-hub
+```
+
+This puts `mcp-hub-gui.app` in `/Applications` (the right architecture is picked for you), removes the
+download quarantine flag (no "damaged app" warning) and adds the `mcp-hub` command
+(`mcp-hub serve | import | apply`). Update later with `brew upgrade --cask mcp-hub`, or with the
+**Installa e riavvia** button in the app (it runs that command and reopens the app). Uninstall with
+`brew uninstall --cask mcp-hub`.
+
+### Install by hand
+
+1. From the [Releases page](https://github.com/LuigiElleBalotta/mcp-hub/releases) download
    `mcp-hub-gui-macos-<arch>.zip`, where `<arch>` is `arm64` (M1/M2/M3/M4) or `x86_64` (Intel).
    Not sure which Mac you have? Run `uname -m` in Terminal.
 2. Unzip it and move `mcp-hub-gui.app` to `/Applications`.
@@ -106,7 +118,7 @@ first time. The maintainers have not tested them on a Mac yet: please report pro
 
 The GUI is all you need: it contains the hub too. The command-line tool
 (`mcp-hub-macos-<arch>.tar.gz`, then `tar -xzf ... -C ~/.local/bin` and
-`xattr -d com.apple.quarantine ~/.local/bin/mcp-hub`) is optional.
+`xattr -d com.apple.quarantine ~/.local/bin/mcp-hub`) is optional. Updates are then manual.
 
 ### Start it
 
@@ -120,12 +132,23 @@ The GUI is all you need: it contains the hub too. The command-line tool
 - **Check:** `curl http://127.0.0.1:37450/api/status`.
 - Data lives in `~/Library/Application Support/mcp-hub/` (`config.json`, `backups/`). Claude Code's own
   config is `~/.claude.json`; import from and apply to it as described below.
+- Apps started from Finder or at login have a minimal `PATH`; mcp-hub adds `/opt/homebrew/bin`,
+  `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` so `npx`, `uvx`, `uv`, `node` and `git` are found.
+
+### Rizzo Flow / Jev on macOS (experimental)
+
+The **Rizzo Flow / Jev** tab works on macOS too: Rizzo Flow runs on **Apple Silicon** through Metal
+(unified memory, about 4.1 GB for the model) and on **Intel Macs** on the CPU only (slow). Install the
+prerequisites first, for example `brew install git uv node`, then open the tab and follow the steps. The
+default install folder is `~/rizzo-compaction`; the device (`metal` or `cpu`) is chosen for your Mac and
+stored as `rizzo.device` in `config.json` (`auto`, `cuda`, `metal` or `cpu`). Upstream reports Metal
+working on an M3 Pro but the maintainers have not reproduced it, and it has not been run through mcp-hub
+on a Mac yet.
 
 ### Not available on macOS yet
 
-The **Rizzo Flow / Jev** tab (the local server needs Windows and an NVIDIA GPU; an Apple Silicon
-version is planned), the "start at login" switch in Settings (use Login Items as above) and in-app
-self-update (download the new release by hand). Servers, the management API, the CLI
+The "start at login" switch in Settings (use Login Items as above) and the in-app self-update for
+manual installs (use Homebrew, or download the new release). Servers, the management API, the CLI
 (`serve`, `import`, `apply`) and the GUI work as on Windows.
 
 ## Setup (development)
@@ -213,8 +236,8 @@ Rizzo Flow — the local, Jev-compatible model server used by the
   Installed, stopped / Starting / Running / Error, with GPU and VRAM, port,
   model, `--ctx`, KV cache type and the last health check.
 - **Install** (only shown when something is missing): checks the prerequisites
-  (git, uv, node, npm, NVIDIA GPU), clones the two forks, `uv sync`, downloads
-  weights + CUDA runtime (~3.9 GB, with bytes/percent/speed), `npm install`
+  (git, uv, node, npm, and a GPU: NVIDIA on Windows, Apple Silicon on macOS), clones the two forks, `uv sync`, downloads
+  weights + the llama.cpp runtime (~3.9 GB, with bytes/percent/speed), `npm install`
   for the plugin and activates Rizzo Flow in the hub. Every step is skipped
   when already done, can be cancelled (whole process tree is killed) and
   resumed. Free disk space >= 6 GB is checked before the download.
@@ -224,16 +247,19 @@ Rizzo Flow — the local, Jev-compatible model server used by the
   hub calls as any service.
 - **Settings** (collapsed by default): install folder, port (8017), weights
   quantization, `--ctx` (16384), KV cache type (`q8_0`) and "start with the hub"
-  (off). They are stored under the `rizzo` key of `config.json`; the hub builds
+  (off). The compute device (`cuda` on Windows/Linux, `metal` on Apple Silicon, `cpu` on Intel Macs;
+  `auto` lets Rizzo choose) is `rizzo.device` in `config.json` / `PUT /api/rizzo`. They are stored under the `rizzo` key of `config.json`; the hub builds
   the `uv run rizzo serve ...` command from them. Saving while the server runs
   stops it (new command line).
 - **Use with Claude Code (Jev)**: a *Test connection* button (POSTs one tiny
   `noul` question to `http://127.0.0.1:<port>/v1/systemone` and shows
   OK/latency/model/VRAM), the two `/plugin` commands and the plugin `userConfig`
   (`baseUrl`, `model` = `rizzo-latest`, placeholder `apiKey`, `maxStateTokens`
-  12000, `maxRequestTokens` 14000, `maxQuestionsPerRequest` 64) with Copy
+  6000, `maxRequestTokens` 14000, `maxQuestionsPerRequest` 64) with Copy
   buttons. mcp-hub never writes Claude Code's `settings.json`: installing the
-  plugin inside Claude Code stays manual.
+  plugin inside Claude Code stays manual. The plugin uses Claude Code's function hooks
+  (an early-access feature): start Claude Code with `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`, otherwise the
+  plugin shows as installed but never runs.
 
 Under the hood it is a `service` (see below) named `rizzo-flow`, generated by
 the hub from the settings. That name is reserved: the service is not stored in
@@ -525,6 +551,11 @@ Releases list; set `hub.includeBetaUpdates: true` to also be notified about
 `x.y.z-n` prereleases, not just stable tags.
 
 ## Auto-update
+
+**macOS:** the PowerShell updater below is Windows-only. A copy installed with Homebrew
+(`brew install --cask mcp-hub`) updates with `brew upgrade --cask mcp-hub`, and the update banner's
+**Installa e riavvia** button runs exactly that, then reopens the app. A manual install shows the banner
+with the download link only.
 
 **Install layout this depends on:** `mcp-hub.exe` and `mcp-hub-gui.exe`
 must sit in the same folder (exactly how the release workflow builds
