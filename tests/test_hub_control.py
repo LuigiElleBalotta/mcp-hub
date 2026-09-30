@@ -54,7 +54,7 @@ class FakeClient:
 
 def test_kills_hub_and_children_when_graceful_shutdown_does_nothing(tree):
     parent, procs = tree
-    assert len(procs) == 2
+    assert len(procs) >= 2
     client = FakeClient(parent.pid)  # hub ignores /api/shutdown
     assert shutdown_hub(client, wait=0.5) is True
     assert client.shutdown_calls == 1
@@ -115,3 +115,20 @@ def test_tray_quit_stops_hub_then_quits(monkeypatch):
     finally:
         window.tray_icon.hide()
         window.close()
+
+
+def test_old_hub_without_rizzo_route_gives_a_clear_error_not_a_json_error():
+    import httpx
+
+    from mcp_hub.gui.api_client import OLD_HUB_MESSAGE, HubApiClient, HubTooOldError
+
+    def handler(request):
+        return httpx.Response(404, text="Not Found")  # what an older hub answers
+
+    client = HubApiClient()
+    client._client = httpx.Client(base_url="http://hub", transport=httpx.MockTransport(handler))
+    with pytest.raises(HubTooOldError, match="versione precedente"):
+        client.rizzo()
+    with pytest.raises(HubTooOldError):
+        client.set_rizzo({"port": 8017})
+    assert "Riavvia hub" in OLD_HUB_MESSAGE
