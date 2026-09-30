@@ -152,6 +152,32 @@ it there and edit it by hand, or populate it from an existing
 | `env`         | Extra environment variables, merged on top of the hub process's own environment (so `PATH` etc. are preserved). Any key matching `TOKEN\|SECRET\|PASS\|KEY\|AUTH` (case-insensitive) is redacted (`***`) wherever it's logged or returned by the API — never redacted in the config file itself, since the hub needs the real values to launch the process. |
 | `concurrency` | `"exclusive"` (default, serializes every request to this server behind an `asyncio.Lock`) or `"parallel"` (no serialization). Use `"exclusive"` for anything that can't handle overlapping calls (e.g. a stateful browser session); `"parallel"` for stateless/read-only tools. |
 
+### Services (non-MCP processes the hub starts and stops)
+
+A server entry with `"type": "service"` is a plain long-running process —
+for example a local HTTP server such as
+[Rizzo Flow](https://github.com/LuigiElleBalotta/rizzo-flow) — that the hub
+only starts, stops and monitors. It is **not** an MCP server: its stdio is
+not proxied, no `/<name>/sse` route is mounted, and `apply`/`import` never
+touch it in Claude Code's config. Existing entries have no `type` and keep
+working as `"mcp"`.
+
+| Field           | Meaning (services only) |
+|-----------------|-------------------------|
+| `type`          | `"service"` (default `"mcp"`). |
+| `cwd`           | Working directory of the process. |
+| `healthUrl`     | URL polled after start; status stays `starting` until it answers 2xx, then `running`. Without it the service is `running` right after spawn. |
+| `port`          | TCP port the service listens on (taken from `healthUrl` when unset). The hub refuses to start while the port is already in use (so it never kills a foreign process) and checks the port is free again after `stop`. |
+| `healthTimeout` | Seconds to wait for `healthUrl` (default 120); on timeout the process is stopped and marked `crashed`. |
+| `autostart`     | With `enabled`, start it when the hub starts. Default `false`: services are started manually from the GUI (or `POST /api/servers/<name>/start`). |
+
+`stop` terminates the whole process tree (`uv run` spawns child processes).
+Output (stdout and stderr) goes to the same redacted log buffer shown in the
+GUI. `concurrency` is not used for services. The GUI shows them with type
+"Service" and their port instead of a concurrency mode; Start/Stop are
+enabled according to the current status. See the `rizzo-flow` entry in
+`config.example.json`.
+
 ## Running the hub
 
 ```

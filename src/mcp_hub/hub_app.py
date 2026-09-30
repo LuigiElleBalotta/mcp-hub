@@ -245,7 +245,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
 
 
 def _server_mounts(manager: HubManager) -> list[Mount]:
-    return [_mount_for(name, manager) for name, sc in manager.config.servers.items() if sc.enabled]
+    return [_mount_for(name, manager) for name, sc in manager.config.servers.items() if sc.enabled and not sc.is_service]
 
 
 def build_app(manager: HubManager, shutdown_event: asyncio.Event | None = None) -> Starlette:

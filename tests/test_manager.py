@@ -78,8 +78,8 @@ def test_status_snapshot_reflects_all_servers():
     cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config(), "b": _python_sleep_config()})
     manager = HubManager(cfg)
     assert manager.status_snapshot() == {
-        "a": {"status": "stopped", "concurrency": "exclusive"},
-        "b": {"status": "stopped", "concurrency": "exclusive"},
+        "a": {"status": "stopped", "concurrency": "exclusive", "type": "mcp"},
+        "b": {"status": "stopped", "concurrency": "exclusive", "type": "mcp"},
     }
 
 
