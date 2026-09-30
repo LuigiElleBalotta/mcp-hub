@@ -82,14 +82,21 @@ def management_routes(
     async def upsert(request: Request) -> JSONResponse:
         name = request.path_params["name"]
         body = await request.json()
-        server_config = ServerConfig(**body)
+        try:
+            server_config = ServerConfig(**body)
+        except TypeError as exc:
+            return JSONResponse({"error": f"invalid server config: {exc}"}, status_code=400)
+        if server_config.type not in ("mcp", "service"):
+            return JSONResponse({"error": "type must be 'mcp' or 'service'"}, status_code=400)
+        if server_config.is_service and not server_config.command:
+            return JSONResponse({"error": "a service needs a command"}, status_code=400)
         # HubManager.upsert stops any previously-running process for `name`
         # itself before replacing the entry (round-2 review fix), so the
         # freshly-returned `managed` here is a brand-new ManagedServer with
         # no old process to worry about -- just start it if enabled.
         managed = await manager.upsert(name, server_config)
         save_config(manager.config)
-        if server_config.enabled:
+        if server_config.starts_with_hub:
             await managed.start()
         _notify_change()
         return JSONResponse({"status": managed.status})

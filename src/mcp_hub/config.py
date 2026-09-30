@@ -23,6 +23,58 @@ class ServerConfig:
     args: list[str]
     env: dict[str, str] = field(default_factory=dict)
     concurrency: Literal["exclusive", "parallel"] = "exclusive"
+    # `type == "service"`: a plain long-running process (e.g. an HTTP server
+    # such as Rizzo Flow) that the hub only starts/stops/monitors. It is not
+    # an MCP server: stdio is not proxied, no `/<name>/sse` route is mounted
+    # and it is never written into Claude Code's config by `apply`. The
+    # fields below apply to services only.
+    type: Literal["mcp", "service"] = "mcp"
+    cwd: str | None = None
+    # URL polled after start; the service is "starting" until it answers 2xx.
+    healthUrl: str | None = None
+    # TCP port the service listens on (derived from healthUrl when unset);
+    # used to refuse a start while the port is taken and to verify it is
+    # released after stop.
+    port: int | None = None
+    healthTimeout: float = 120.0
+    # With `enabled`, start the service when the hub starts (default: manual).
+    autostart: bool = False
+
+    @property
+    def is_service(self) -> bool:
+        return self.type == "service"
+
+    @property
+    def starts_with_hub(self) -> bool:
+        """Whether the hub starts this server at its own startup / on upsert.
+
+        MCP servers: whenever `enabled`. Services: only `enabled` AND
+        `autostart`, so a heavy local service (GPU model) is never started
+        behind the user's back."""
+        return self.enabled and (self.autostart if self.is_service else True)
+
+    @property
+    def effective_port(self) -> int | None:
+        if self.port is not None:
+            return self.port
+        if self.healthUrl:
+            from urllib.parse import urlparse
+            return urlparse(self.healthUrl).port
+        return None
+
+
+_SERVICE_ONLY_FIELDS = ("cwd", "healthUrl", "port", "healthTimeout", "autostart")
+
+
+def server_to_dict(sc: ServerConfig) -> dict:
+    """`asdict`, but MCP servers omit the service-only fields so existing
+    entries in config.json keep their original shape."""
+    data = asdict(sc)
+    if not sc.is_service:
+        data.pop("type")
+        for key in _SERVICE_ONLY_FIELDS:
+            data.pop(key, None)
+    return data
 
 
 @dataclass
@@ -54,7 +106,7 @@ def save_config(config: Config, path: Path = CONFIG_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "hub": asdict(config.hub),
-        "servers": {name: asdict(sc) for name, sc in config.servers.items()},
+        "servers": {name: server_to_dict(sc) for name, sc in config.servers.items()},
     }
     tmp_path = path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

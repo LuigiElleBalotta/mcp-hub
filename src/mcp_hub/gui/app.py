@@ -59,7 +59,7 @@ def main() -> None:
         _launch_hub()
 
     window = MainWindow()
-    window.resize(700, 400)
+    window.resize(800, 480)
     window.show()
     sys.exit(app.exec())
 

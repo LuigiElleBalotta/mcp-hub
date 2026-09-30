@@ -3,6 +3,9 @@ from __future__ import annotations
 import httpx
 
 
+_SLOW_TIMEOUT = 60.0
+
+
 class HubApiClient:
     def __init__(self, base_url: str = "http://127.0.0.1:37450"):
         self._client = httpx.Client(base_url=base_url, timeout=5.0)
@@ -11,10 +14,12 @@ class HubApiClient:
         return self._client.get("/api/status").json()["servers"]
 
     def start(self, name: str) -> str:
-        return self._client.post(f"/api/servers/{name}/start").json()["status"]
+        return self._client.post(f"/api/servers/{name}/start", timeout=_SLOW_TIMEOUT).json()["status"]
 
     def stop(self, name: str) -> str:
-        return self._client.post(f"/api/servers/{name}/stop").json()["status"]
+        # A service stop kills the process tree and then waits (up to ~10s)
+        # for its port to be released, so the default 5s is not enough.
+        return self._client.post(f"/api/servers/{name}/stop", timeout=_SLOW_TIMEOUT).json()["status"]
 
     def logs(self, name: str) -> list[str]:
         return self._client.get(f"/api/servers/{name}/logs").json()["lines"]

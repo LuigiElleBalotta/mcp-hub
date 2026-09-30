@@ -14,6 +14,18 @@
       "args": ["-y", "some-mcp-server"],
       "env": {},
       "concurrency": "exclusive"
+    },
+    "rizzo-flow": {
+      "enabled": false,
+      "type": "service",
+      "command": "uv",
+      "args": ["run", "rizzo", "serve", "--size", "4b", "--quant", "q4_k_m", "--device", "cuda", "--ctx", "16384", "--kv-type", "q8_0"],
+      "cwd": "C:/path/to/rizzo-flow",
+      "healthUrl": "http://127.0.0.1:8017/health",
+      "port": 8017,
+      "healthTimeout": 120,
+      "autostart": false,
+      "env": {}
     }
   }
 }

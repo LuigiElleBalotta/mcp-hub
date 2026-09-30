@@ -7,6 +7,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
 
@@ -29,6 +31,20 @@ Status = Literal["stopped", "starting", "running", "crashed"]
 # though the small stats payloads used in earlier manual testing never did.
 # 10 MiB is comfortably above any response this hub is expected to proxy.
 _STDOUT_LIMIT = 10 * 1024 * 1024
+
+
+def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _http_ok(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:  # noqa: S310 - operator-configured local URL
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
 
 
 def _redact_line(line: str) -> str:
@@ -64,6 +80,10 @@ class ManagedServer:
     # that is what rules out a NEW id collision being introduced by the
     # rewriting scheme itself.
     _id_counter: itertools.count = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
+    # Set by `stop()` so the watcher tasks can tell a deliberate stop (which
+    # ends the process with a non-zero exit code on Windows) from a crash.
+    _stopping: bool = field(default=False, init=False, repr=False)
+    _health_task: asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
@@ -188,6 +208,10 @@ class ManagedServer:
                 fut.set_exception(exc)
 
     async def start(self) -> None:
+        if self.config.is_service:
+            await self._start_service()
+            return
+        self._stopping = False
         self.status = "starting"
         # Merge with the parent's environment rather than replacing it: several
         # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
@@ -232,8 +256,81 @@ class ManagedServer:
             async for raw in self.process.stderr:
                 self.append_log(raw.decode(errors="replace").rstrip())
         code = await self.process.wait()
-        if self.status != "stopped":
+        if self.status != "stopped" and not self._stopping:
             self.status = "crashed" if code != 0 else "stopped"
+
+    # -- services (non-MCP long-running processes) -------------------------
+
+    async def _start_service(self) -> None:
+        """Spawns a plain service process (no stdio proxying) and watches it.
+
+        Returns as soon as the process is spawned, with status "starting";
+        a background task flips it to "running" once `healthUrl` answers
+        (immediately when there is none). Idempotent while already alive.
+        Refuses to spawn when the configured port is already taken, so a
+        foreign process (or an orphan of a previous run) is never mistaken
+        for this service nor killed by a later `stop()`."""
+        if self.process is not None and self.process.returncode is None:
+            return
+        self._stopping = False
+        port = self.config.effective_port
+        if port is not None and await asyncio.to_thread(_port_in_use, port):
+            self.append_log(f"[hub] port {port} is already in use; not starting {self.name}")
+            self.status = "crashed"
+            return
+        self.status = "starting"
+        env = {**os.environ, **self.config.env}
+        resolved_command = shutil.which(self.config.command) or self.config.command
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                resolved_command, *self.config.args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=self.config.cwd or None,
+                env=env,
+            )
+        except OSError as exc:
+            self.append_log(f"[hub] failed to start {self.name}: {exc}")
+            self.status = "crashed"
+            return
+        self.append_log(f"[hub] started {self.name} (pid {self.process.pid})")
+        asyncio.create_task(self._watch_service(self.process))
+        if self.config.healthUrl:
+            self._health_task = asyncio.create_task(self._wait_healthy(self.process))
+        else:
+            self.status = "running"
+
+    async def _watch_service(self, process: asyncio.subprocess.Process) -> None:
+        # stdout and stderr are merged into one pipe (log-only, not protocol).
+        assert process.stdout is not None
+        try:
+            async for raw in process.stdout:
+                self.append_log(raw.decode(errors="replace").rstrip())
+        except ValueError:
+            pass  # over-long line; keep waiting for exit
+        code = await process.wait()
+        if process is self.process and not self._stopping:
+            self.append_log(f"[hub] {self.name} exited with code {code}")
+            self.status = "crashed" if code != 0 else "stopped"
+
+    async def _wait_healthy(self, process: asyncio.subprocess.Process) -> None:
+        url = self.config.healthUrl
+        assert url is not None
+        deadline = asyncio.get_running_loop().time() + self.config.healthTimeout
+        while process.returncode is None and not self._stopping:
+            if await asyncio.to_thread(_http_ok, url):
+                if process.returncode is None and not self._stopping:
+                    self.status = "running"
+                    self.append_log(f"[hub] {self.name} is healthy ({url})")
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                self.append_log(f"[hub] {self.name} not healthy after {self.config.healthTimeout:g}s; stopping it")
+                self._health_task = None  # stop() must not cancel this very task
+                await self.stop()
+                self.status = "crashed"
+                return
+            await asyncio.sleep(0.5)
 
     async def stop(self) -> None:
         """Stops this server's subprocess AND every descendant it has spawned.
@@ -278,6 +375,10 @@ class ManagedServer:
         `_reject_pending` finally, and every other managed server's own
         stop() in a sequential `stop_all()`).
         """
+        self._stopping = True
+        if self._health_task is not None:
+            self._health_task.cancel()
+            self._health_task = None
         if self.process is not None and self.process.returncode is None:
             children: list[psutil.Process] = []
             try:
@@ -308,6 +409,16 @@ class ManagedServer:
                     except psutil.Error:
                         pass
         self.status = "stopped"
+        port = self.config.effective_port
+        if self.config.is_service and port is not None:
+            # Verify the port is really released (a surviving child would
+            # keep it); report instead of silently claiming "stopped".
+            for _ in range(20):
+                if not await asyncio.to_thread(_port_in_use, port):
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                self.append_log(f"[hub] warning: port {port} still in use after stop")
 
 
 class HubManager:
@@ -320,7 +431,7 @@ class HubManager:
 
     async def start_all(self) -> None:
         for server in self._servers.values():
-            if server.config.enabled:
+            if server.config.starts_with_hub:
                 await server.start()
 
     async def stop_all(self) -> None:
@@ -332,7 +443,13 @@ class HubManager:
         # endpoint) so the GUI's 2s status poll is the one place both are
         # kept current -- a server's concurrency mode can change via
         # `upsert` (Edit dialog) same as its running status can.
-        return {name: {"status": s.status, "concurrency": s.config.concurrency} for name, s in self._servers.items()}
+        snapshot: dict[str, dict] = {}
+        for name, s in self._servers.items():
+            entry: dict = {"status": s.status, "concurrency": s.config.concurrency, "type": s.config.type}
+            if s.config.is_service and s.config.effective_port is not None:
+                entry["port"] = s.config.effective_port
+            snapshot[name] = entry
+        return snapshot
 
     async def upsert(self, name: str, server_config: ServerConfig) -> ManagedServer:
         """Replaces (or creates) the `ManagedServer` entry for `name`.
@@ -394,12 +511,12 @@ class HubManager:
             if existing is None:
                 added.append(name)
                 await self.upsert(name, server_config)
-                if server_config.enabled:
+                if server_config.starts_with_hub:
                     await self.get(name).start()
             elif existing != server_config:
                 updated.append(name)
                 await self.upsert(name, server_config)
-                if server_config.enabled:
+                if server_config.starts_with_hub:
                     await self.get(name).start()
         for name in list(self.config.servers):
             if name not in new_config.servers:
