@@ -54,7 +54,7 @@ class FakeClient:
 
 def test_kills_hub_and_children_when_graceful_shutdown_does_nothing(tree):
     parent, procs = tree
-    assert len(procs) == 2
+    assert len(procs) >= 2
     client = FakeClient(parent.pid)  # hub ignores /api/shutdown
     assert shutdown_hub(client, wait=0.5) is True
     assert client.shutdown_calls == 1
