@@ -2,6 +2,15 @@ from __future__ import annotations
 
 import sys
 
+# The macOS app is a single binary: `mcp-hub-gui serve` (also `import`/`apply`)
+# runs the hub/CLI instead of opening a window, so the GUI can start the hub by
+# launching itself. Done before any Qt import to keep that process light.
+if getattr(sys, "frozen", False) and len(sys.argv) > 1 and sys.argv[1] in ("serve", "import", "apply"):
+    from mcp_hub.__main__ import main as _cli_main
+
+    _cli_main()
+    sys.exit(0)
+
 from PySide6.QtCore import QSharedMemory
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -32,10 +41,7 @@ def _launch_hub() -> None:
     from mcp_hub import self_update
 
     try:
-        if self_update.is_frozen():
-            self_update.launch_detached([str(self_update.hub_exe_path()), "serve"])
-        else:
-            self_update.launch_detached([sys.executable, "-m", "mcp_hub", "serve"])
+        self_update.launch_detached(self_update.hub_command())
     except (OSError, subprocess.SubprocessError):
         pass
 

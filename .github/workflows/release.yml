@@ -73,12 +73,24 @@ jobs:
             dist/mcp-hub.exe
             dist/mcp-hub-gui.exe
 
-  # Apple Silicon (macos-latest is arm64). The app is not signed or notarized:
-  # the README explains how to open it the first time.
+  # The app is not signed or notarized: the README explains how to open it the
+  # first time. Intel is best effort: if its runner is unavailable or fails, the
+  # release is still published with the other files.
   build-macos:
     needs: check-tag
     if: needs.check-tag.outputs.kind != 'none'
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+            optional: false
+          - runner: macos-15-intel
+            arch: x86_64
+            optional: true
     steps:
       - uses: actions/checkout@v4
 
@@ -102,22 +114,23 @@ jobs:
       - name: Build CLI (mcp-hub serve/import/apply)
         run: pyinstaller --onefile --name mcp-hub src/mcp_hub/__main__.py
 
+      # The GUI binary also serves the hub (`mcp-hub-gui serve`), so it bundles __main__.
       - name: Build GUI app (mcp-hub-gui.app)
-        run: pyinstaller --windowed --name mcp-hub-gui src/mcp_hub/gui/app.py
+        run: pyinstaller --windowed --name mcp-hub-gui --hidden-import mcp_hub.__main__ src/mcp_hub/gui/app.py
 
       - name: Package
         shell: bash
         run: |
           chmod +x dist/mcp-hub
-          tar -czf dist/mcp-hub-macos-arm64.tar.gz -C dist mcp-hub
-          ditto -c -k --keepParent dist/mcp-hub-gui.app dist/mcp-hub-gui-macos-arm64.zip
+          tar -czf dist/mcp-hub-macos-${{ matrix.arch }}.tar.gz -C dist mcp-hub
+          ditto -c -k --keepParent dist/mcp-hub-gui.app dist/mcp-hub-gui-macos-${{ matrix.arch }}.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos
+          name: macos-${{ matrix.arch }}
           path: |
-            dist/mcp-hub-macos-arm64.tar.gz
-            dist/mcp-hub-gui-macos-arm64.zip
+            dist/mcp-hub-macos-${{ matrix.arch }}.tar.gz
+            dist/mcp-hub-gui-macos-${{ matrix.arch }}.zip
 
   publish:
     needs: [check-tag, build-windows, build-macos]
@@ -140,3 +153,5 @@ jobs:
             artifacts/mcp-hub-gui.exe
             artifacts/mcp-hub-macos-arm64.tar.gz
             artifacts/mcp-hub-gui-macos-arm64.zip
+            artifacts/mcp-hub-macos-x86_64.tar.gz
+            artifacts/mcp-hub-gui-macos-x86_64.zip

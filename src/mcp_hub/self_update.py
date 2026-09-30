@@ -135,6 +135,17 @@ def hub_exe_path() -> Path:
     return gui_exe_path().parent / HUB_EXE_NAME
 
 
+def hub_command() -> list[str]:
+    """The command that starts the hub. Windows exes ship a separate
+    `mcp-hub.exe`; the macOS app is one binary that serves when run with
+    `serve`; from source it is `python -m mcp_hub serve`."""
+    if is_frozen():
+        if sys.platform == "win32":
+            return [str(hub_exe_path()), "serve"]
+        return [sys.executable, "serve"]
+    return [sys.executable, "-m", "mcp_hub", "serve"]
+
+
 def fresh_staging_dir(root: Path, version: str) -> Path:
     """A new, empty download folder per update attempt, under `root`: a
     leftover file from an earlier attempt (possibly still open, or running)
