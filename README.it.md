@@ -153,6 +153,43 @@ esistente con `mcp_hub import` (vedi sotto).
 | `env`         | Variabili d'ambiente extra, unite sopra l'ambiente del processo hub stesso (così `PATH` ecc. sono preservate). Qualsiasi chiave che corrisponde a `TOKEN\|SECRET\|PASS\|KEY\|AUTH` (case-insensitive) è oscurata (`***`) ovunque venga loggata o restituita dall'API — mai oscurata nel file di config stesso, dato che l'hub ha bisogno dei valori reali per avviare il processo. |
 | `concurrency` | `"exclusive"` (default, serializza ogni richiesta a questo server dietro un `asyncio.Lock`) oppure `"parallel"` (nessuna serializzazione). Usa `"exclusive"` per tutto ciò che non gestisce chiamate sovrapposte (es. una sessione browser stateful); `"parallel"` per strumenti stateless/di sola lettura. |
 
+### Rizzo Flow / Jev (integrato)
+
+Rizzo Flow — il server di modelli locale compatibile con Jev usato dal plugin
+Claude Code `fast-jev-compaction` — è **integrato nella GUI**: apri la tab
+**Rizzo Flow / Jev** (accanto a *Server*). Non c'è niente da aggiungere a mano
+(niente comando, argomenti, cwd o health URL):
+
+- **Stato a colpo d'occhio**: Non installato / Installazione (passo corrente +
+  avanzamento) / Installato, fermo / In avvio / In esecuzione / Errore, con GPU e
+  VRAM, porta, modello, `--ctx`, tipo di cache KV e ultimo health check.
+- **Installa** (compare solo se manca qualcosa): controlla i prerequisiti (git, uv,
+  node, npm, GPU NVIDIA), clona i due fork, `uv sync`, scarica pesi + runtime CUDA
+  (~3,9 GB, con byte/percentuale/velocità), `npm install` del plugin e attiva Rizzo
+  Flow nell'hub. Ogni passo viene saltato se già fatto, si può annullare (viene
+  terminato l'intero albero di processi) e riprendere. Prima del download si
+  controlla che ci siano almeno 6 GB liberi.
+- **Già installato?** La tab lo rileva all'apertura e mostra subito *Avvia* / *Ferma*
+  (più *Ricontrolla* e *Ripara*, che rilancia `uv sync`, `npm install` e l'attivazione,
+  mai il download). Avvia/Ferma usano le stesse chiamate dell'hub di qualunque service.
+- **Impostazioni** (chiuse di default): cartella di installazione, porta (8017),
+  quantizzazione dei pesi, `--ctx` (16384), cache KV (`q8_0`) e "avvia con l'hub"
+  (no). Sono salvate sotto la chiave `rizzo` di `config.json`; l'hub costruisce da
+  sole il comando `uv run rizzo serve ...`. Salvare mentre il server gira lo ferma.
+- **Usa con Claude Code (Jev)**: pulsante *Prova la connessione* (invia una piccola
+  domanda `noul` a `http://127.0.0.1:<porta>/v1/systemone` e mostra
+  OK/latenza/modello/VRAM), i due comandi `/plugin` e la `userConfig` del plugin
+  (`baseUrl`, `model` = `rizzo-latest`, `apiKey` segnaposto, `maxStateTokens` 12000,
+  `maxRequestTokens` 14000, `maxQuestionsPerRequest` 64) con pulsanti Copia.
+  mcp-hub non scrive mai i `settings.json` di Claude Code: l'installazione del
+  plugin dentro Claude Code resta manuale.
+
+Sotto il cofano è un `service` di nome `rizzo-flow`, generato dall'hub dalle
+impostazioni. Il nome è riservato: non sta in `servers`, non compare nella tabella
+*Server* e `POST/DELETE /api/servers/rizzo-flow` rispondono `409`. Un service
+`rizzo-flow` aggiunto a mano con la 1.0.6 viene adottato nelle impostazioni
+(cartella e porta) al caricamento di `config.json`.
+
 ## Avviare l'hub
 
 ```
