@@ -5,6 +5,26 @@ import httpx
 
 _SLOW_TIMEOUT = 60.0
 
+OLD_HUB_MESSAGE = (
+    "L'hub in esecuzione e' una versione precedente e non gestisce Rizzo Flow. "
+    "Riavvialo con la versione aggiornata (pulsante \"Riavvia hub\", oppure \"Esci\" dal tray e riapri mcp-hub-gui)."
+)
+
+
+class HubTooOldError(RuntimeError):
+    """The hub answers, but without the route this GUI needs (older build)."""
+
+
+def _rizzo_json(resp: httpx.Response) -> dict:
+    # An older hub has no /api/rizzo: it answers 404 with a plain-text "Not Found",
+    # which used to surface as the cryptic "Expecting value: line 1 column 1 (char 0)".
+    if resp.status_code == 404 and "json" not in resp.headers.get("content-type", ""):
+        raise HubTooOldError(OLD_HUB_MESSAGE)
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise HubTooOldError(OLD_HUB_MESSAGE) from exc
+
 
 class HubApiClient:
     def __init__(self, base_url: str = "http://127.0.0.1:37450"):
@@ -31,13 +51,14 @@ class HubApiClient:
         self._client.delete(f"/api/servers/{name}")
 
     def rizzo(self) -> dict:
-        return self._client.get("/api/rizzo").json()
+        return _rizzo_json(self._client.get("/api/rizzo"))
 
     def set_rizzo(self, settings: dict) -> dict:
         resp = self._client.put("/api/rizzo", json=settings)
         if resp.status_code != 200:
-            raise RuntimeError(resp.json().get("error", f"HTTP {resp.status_code}"))
-        return resp.json()
+            body = _rizzo_json(resp)
+            raise RuntimeError(body.get("error", f"HTTP {resp.status_code}"))
+        return _rizzo_json(resp)
 
     def reload(self) -> dict:
         return self._client.post("/api/reload").json()

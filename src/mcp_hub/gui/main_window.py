@@ -115,7 +115,8 @@ class _InstallUpdateWorker(QThread):
         from mcp_hub import self_update
 
         try:
-            work_dir = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mcp-hub" / "update-staging"
+            staging = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mcp-hub" / self_update.STAGING_DIR_NAME
+            work_dir = self_update.fresh_staging_dir(staging, self._info.version)
             self_update.apply_update(self._info, self._hub_pid, work_dir)
             self.finished_ok.emit(True, "")
         except Exception as exc:

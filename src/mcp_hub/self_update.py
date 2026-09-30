@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from mcp_hub.updater import UpdateInfo, download_asset
@@ -94,14 +97,58 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+STAGING_DIR_NAME = "update-staging"
+
+
+def default_install_dir() -> Path:
+    """Where the README, the autostart tasks and `install_task.ps1` put the exes."""
+    base = os.environ.get("LOCALAPPDATA")
+    root = Path(base) if base else Path.home() / "AppData" / "Local"
+    return root / "Programs" / "mcp-hub"
+
+
+def _in_staging(path: Path) -> bool:
+    return STAGING_DIR_NAME in (part.lower() for part in path.resolve().parts)
+
+
 def gui_exe_path() -> Path:
-    return Path(sys.executable)
+    """The exe to replace on update. If this GUI is itself running from the
+    update-staging folder (it was launched from a downloaded copy), that is
+    NOT the install location: replacing it would overwrite the running exe
+    ("Accesso negato") and leave the real install outdated -- so use the
+    default install dir instead."""
+    current = Path(sys.executable)
+    if _in_staging(current):
+        return default_install_dir() / GUI_EXE_NAME
+    return current
 
 
 def hub_exe_path() -> Path:
     """Assumes the CLI/hub exe is installed next to the GUI exe -- the
     layout the release workflow and README both document."""
     return gui_exe_path().parent / HUB_EXE_NAME
+
+
+def fresh_staging_dir(root: Path, version: str) -> Path:
+    """A new, empty download folder per update attempt, under `root`: a
+    leftover file from an earlier attempt (possibly still open, or running)
+    can then never block the `.part` -> final rename. Older attempts are
+    removed best-effort."""
+    root.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in ".-_" else "_" for c in version) or "update"
+    work = root / f"{safe}-{os.getpid()}-{int(time.time())}"
+    work.mkdir(parents=True, exist_ok=True)
+    for entry in root.iterdir():
+        if entry == work:
+            continue
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink()
+        except OSError:
+            pass  # in use (e.g. a running exe): leave it, it no longer matters
+    return work
 
 
 def launch_detached(args: list[str]) -> subprocess.Popen:
@@ -152,5 +199,4 @@ def apply_update(
 
 
 def _current_pid() -> int:
-    import os
     return os.getpid()

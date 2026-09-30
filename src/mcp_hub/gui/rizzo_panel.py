@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcp_hub import rizzo_setup as rs
+from mcp_hub.gui.api_client import OLD_HUB_MESSAGE, HubTooOldError
 from mcp_hub.config import (
     BUILTIN_RIZZO, RIZZO_KV_TYPES, RIZZO_QUANTS, RizzoSettings, load_config, save_config,
 )
@@ -70,12 +71,20 @@ class _SetupWorker(QThread):
 class _DetectWorker(QThread):
     """Detection (subprocess + disk + health) and server log, off the GUI thread."""
     done = Signal(object, object, object)  # Detection, persisted RizzoSettings, server log lines | None
+    hub_old = Signal(bool)  # the running hub has no Rizzo support (older build)
 
     def __init__(self, client, form: RizzoSettings, install_dir: Path, want_log: bool, parent=None):
         super().__init__(parent)
         self._client, self._form, self._dir, self._want_log = client, form, install_dir, want_log
 
     def run(self) -> None:
+        try:
+            self._client.rizzo()
+            self.hub_old.emit(False)
+        except HubTooOldError:
+            self.hub_old.emit(True)
+        except Exception:
+            pass  # unreachable hub: reported by the usual hub-status path
         persisted = _read_persisted(self._client)
         effective = replace(self._form, installDir=persisted.installDir)
         env = rs.SetupEnv(load_settings=lambda: effective)
@@ -87,6 +96,24 @@ class _DetectWorker(QThread):
             except Exception:
                 lines = None
         self.done.emit(detection, persisted, lines)
+
+
+class _RestartHubWorker(QThread):
+    """Stops the running hub (and its servers) and starts a fresh one."""
+    done = Signal()
+
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        from mcp_hub.gui.app import _launch_hub
+        from mcp_hub.gui.hub_control import shutdown_hub
+        try:
+            shutdown_hub(self._client)
+            _launch_hub()
+        finally:
+            self.done.emit()
 
 
 class _ConnWorker(QThread):
@@ -134,6 +161,8 @@ class RizzoPanel(QWidget):
         self._persisted = initial if initial is not None else self._load_initial()
         self._hub_info: dict | None = None
         self._hub_reachable = True
+        self._hub_old = False
+        self._restart_worker = None
         self._installing = False
         self._setup_worker: _SetupWorker | None = None
         self._detect_worker: _DetectWorker | None = None
@@ -204,8 +233,10 @@ class RizzoPanel(QWidget):
         self.repair_btn = QPushButton("Ripara")
         self.log_btn = QPushButton("Apri log del server")
         self.cancel_btn = QPushButton("Annulla")
+        self.restart_hub_btn = QPushButton("Riavvia hub")
+        self.restart_hub_btn.setVisible(False)
         for b in (self.install_btn, self.start_btn, self.stop_btn, self.recheck_btn,
-                  self.repair_btn, self.log_btn, self.cancel_btn):
+                  self.repair_btn, self.log_btn, self.cancel_btn, self.restart_hub_btn):
             row.addWidget(b)
         row.addStretch(1)
         root.addLayout(row)
@@ -216,6 +247,7 @@ class RizzoPanel(QWidget):
         self.repair_btn.clicked.connect(self._repair)
         self.log_btn.clicked.connect(self._toggle_log)
         self.cancel_btn.clicked.connect(self._cancel)
+        self.restart_hub_btn.clicked.connect(self._restart_hub)
 
         # 3. install steps
         self.install_box = QGroupBox("Installazione")
@@ -422,7 +454,27 @@ class RizzoPanel(QWidget):
         self._detect_worker = _DetectWorker(
             self.client, self.form_settings(), self.install_dir(), self._log_mode == "server", self)
         self._detect_worker.done.connect(self.apply_detection)
+        self._detect_worker.hub_old.connect(self._set_hub_old)
         self._detect_worker.start()
+
+    def _set_hub_old(self, old: bool) -> None:
+        if old != self._hub_old:
+            self._hub_old = old
+            self._render()
+
+    def _restart_hub(self) -> None:
+        if self._restart_worker is not None and self._restart_worker.isRunning():
+            return
+        self.restart_hub_btn.setEnabled(False)
+        self.restart_hub_btn.setText("Riavvio in corso...")
+        self._restart_worker = _RestartHubWorker(self.client, self)
+        self._restart_worker.done.connect(self._on_hub_restarted)
+        self._restart_worker.start()
+
+    def _on_hub_restarted(self) -> None:
+        self.restart_hub_btn.setText("Riavvia hub")
+        self.restart_hub_btn.setEnabled(True)
+        self.refresh_detection()
 
     def apply_detection(self, detection: rs.Detection, persisted: RizzoSettings, server_log=None) -> None:
         self._detection = detection
@@ -467,6 +519,9 @@ class RizzoPanel(QWidget):
             parts.append(f"ultimo health check {when}: {'OK' if self._last_health[1] else 'nessuna risposta'}")
         self.details_label.setText("  ·  ".join(parts))
         warnings = list(d.warnings) if d else []
+        if self._hub_old:
+            warnings.insert(0, OLD_HUB_MESSAGE)
+        self.restart_hub_btn.setVisible(self._hub_old)
         self.warning_label.setText("\n".join(warnings))
         self.warning_label.setVisible(bool(warnings))
 
