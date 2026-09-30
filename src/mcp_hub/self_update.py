@@ -100,11 +100,17 @@ def is_frozen() -> bool:
 STAGING_DIR_NAME = "update-staging"
 
 
+def is_supported() -> bool:
+    """In-place self-update swaps the exes with a PowerShell helper: Windows only.
+    Elsewhere the GUI points to the Releases page instead."""
+    return sys.platform == "win32"
+
+
 def default_install_dir() -> Path:
     """Where the README, the autostart tasks and `install_task.ps1` put the exes."""
-    base = os.environ.get("LOCALAPPDATA")
-    root = Path(base) if base else Path.home() / "AppData" / "Local"
-    return root / "Programs" / "mcp-hub"
+    from mcp_hub.paths import data_root
+
+    return data_root() / "Programs" / "mcp-hub"
 
 
 def _in_staging(path: Path) -> bool:
@@ -157,7 +163,10 @@ def launch_detached(args: list[str]) -> subprocess.Popen:
     exits. Shared by `apply_update`'s helper launch and the GUI's first-run
     wizard, which needs to start the hub the same detached way after
     writing a fresh config.json."""
-    return subprocess.Popen(args, creationflags=_DETACHED_FLAGS, close_fds=True)
+    if sys.platform == "win32":
+        return subprocess.Popen(args, creationflags=_DETACHED_FLAGS, close_fds=True)
+    return subprocess.Popen(args, start_new_session=True, close_fds=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def apply_update(
@@ -171,6 +180,8 @@ def apply_update(
     helper that waits for this process and the hub process to exit, does
     the (locked-while-running) file replace, and relaunches both -- so the
     actual swap happens after nothing holds the old files open."""
+    if not is_supported():
+        raise RuntimeError("l'aggiornamento automatico e' disponibile solo su Windows: scarica la nuova versione dalla pagina Releases")
     hub_exe = hub_exe or hub_exe_path()
     gui_exe = gui_exe or gui_exe_path()
 

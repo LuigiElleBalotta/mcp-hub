@@ -54,8 +54,8 @@ Sessione Claude Code N ─┘                 │
 
 ## Requisiti
 
-- Windows (GUI PySide6, autostart via Task Scheduler, gestione processi
-  Windows-specifica in `cleanup.py`/`manager.py`)
+- Windows (supporto completo: GUI PySide6, autostart, Rizzo Flow / Jev, aggiornamento automatico)
+  oppure macOS su Apple Silicon (sperimentale, vedi [macOS](#macos-apple-silicon-sperimentale))
 - Python 3.11+
 
 ## Installare l'exe (utenti finali)
@@ -84,6 +84,32 @@ file standalone:
 
 Le nuove versioni si installano col pulsante **Installa e riavvia** della
 GUI — niente più download manuali.
+
+## macOS (Apple Silicon, sperimentale)
+
+Le release includono anche una build per macOS (arm64). **Non è firmata né notarizzata**:
+al primo avvio macOS la blocca. I manutentori non l'hanno ancora provata su un Mac:
+segnalate i problemi.
+
+1. Dalla [pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases) scarica
+   `mcp-hub-gui-macos-arm64.zip` (GUI) e `mcp-hub-macos-arm64.tar.gz` (CLI `mcp-hub`).
+2. Decomprimi la GUI e sposta `mcp-hub-gui.app` in `/Applications`; estrai la CLI in una cartella
+   del `PATH` (per esempio `tar -xzf mcp-hub-macos-arm64.tar.gz -C ~/.local/bin`).
+3. Togli il flag di quarantena aggiunto dal browser, altrimenti macOS dice che l'app è danneggiata:
+
+   ```
+   xattr -dr com.apple.quarantine /Applications/mcp-hub-gui.app
+   xattr -d com.apple.quarantine ~/.local/bin/mcp-hub
+   ```
+
+   (Oppure tasto destro sull'app, **Apri**, poi conferma.)
+4. Avvia `mcp-hub serve` o apri l'app. I dati stanno in
+   `~/Library/Application Support/mcp-hub/` (`config.json`, `backups/`).
+
+Non ancora disponibili su macOS: la scheda **Rizzo Flow / Jev** (il server locale richiede Windows e
+una GPU NVIDIA; una versione per Apple Silicon è prevista), l'avvio al login e l'aggiornamento
+automatico dentro l'app (scarica a mano la nuova release). Server, API di gestione, CLI
+(`serve`, `import`, `apply`) e GUI funzionano come su Windows; la config di Claude Code è `~/.claude.json`.
 
 ## Setup (sviluppo)
 

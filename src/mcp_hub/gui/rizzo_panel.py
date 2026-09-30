@@ -724,3 +724,32 @@ class RizzoPanel(QWidget):
         self.test_label.setText(result.summary())
         self.test_label.setStyleSheet(f"color: {'#2e7d32' if result.ok else '#c62828'};")
         self.test_btn.setEnabled(True)
+
+
+class UnsupportedRizzoPanel(QWidget):
+    """Stands in for `RizzoPanel` where the Rizzo Flow installer cannot run
+    (anything but Windows + NVIDIA for now), with the same small interface the
+    main window uses."""
+    state_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        label = QLabel(
+            "<b>Rizzo Flow / Jev non e' ancora disponibile su questo sistema.</b><br><br>"
+            "Il server locale oggi richiede Windows con una GPU NVIDIA (CUDA). "
+            "Il supporto per macOS (Apple Silicon) e' in lavorazione.<br><br>"
+            "Il resto di mcp-hub funziona normalmente."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addStretch(1)
+
+    def tab_title(self) -> str:
+        return "Rizzo Flow / Jev"
+
+    def refresh_detection(self) -> None:
+        pass
+
+    def on_hub_status(self, info: dict | None, reachable: bool = True) -> None:
+        pass
