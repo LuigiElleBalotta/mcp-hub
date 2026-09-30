@@ -30,6 +30,15 @@ class HubApiClient:
     def remove(self, name: str) -> None:
         self._client.delete(f"/api/servers/{name}")
 
+    def rizzo(self) -> dict:
+        return self._client.get("/api/rizzo").json()
+
+    def set_rizzo(self, settings: dict) -> dict:
+        resp = self._client.put("/api/rizzo", json=settings)
+        if resp.status_code != 200:
+            raise RuntimeError(resp.json().get("error", f"HTTP {resp.status_code}"))
+        return resp.json()
+
     def reload(self) -> dict:
         return self._client.post("/api/reload").json()
 

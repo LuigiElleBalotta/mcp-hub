@@ -8,7 +8,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from mcp_hub.config import CONFIG_PATH, ServerConfig, save_config
+from dataclasses import asdict
+
+from mcp_hub.config import BUILTIN_RIZZO, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
 from mcp_hub.manager import HubManager
 
 
@@ -79,8 +81,30 @@ def management_routes(
         name = request.path_params["name"]
         return JSONResponse({"lines": list(manager.get(name).logs)})
 
+    def _rizzo_state() -> dict:
+        snapshot = manager.status_snapshot().get(BUILTIN_RIZZO)
+        return {"settings": asdict(manager.config.rizzo), "status": snapshot["status"] if snapshot else None}
+
+    async def get_rizzo(request: Request) -> JSONResponse:
+        return JSONResponse(_rizzo_state())
+
+    async def put_rizzo(request: Request) -> JSONResponse:
+        # The Rizzo Flow tab's settings: the hub rebuilds the built-in
+        # service from them. A running server is stopped (new command line).
+        try:
+            settings = rizzo_settings_from_dict(await request.json())
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": f"invalid rizzo settings: {exc}"}, status_code=400)
+        managed = await manager.apply_rizzo(settings)
+        save_config(manager.config)
+        if managed is not None and managed.config.starts_with_hub:
+            await managed.start()
+        return JSONResponse(_rizzo_state())
+
     async def upsert(request: Request) -> JSONResponse:
         name = request.path_params["name"]
+        if name == BUILTIN_RIZZO:
+            return JSONResponse({"error": f"'{name}' is managed by the Rizzo Flow panel"}, status_code=409)
         body = await request.json()
         try:
             server_config = ServerConfig(**body)
@@ -103,6 +127,8 @@ def management_routes(
 
     async def remove(request: Request) -> JSONResponse:
         name = request.path_params["name"]
+        if name == BUILTIN_RIZZO:
+            return JSONResponse({"error": f"'{name}' is managed by the Rizzo Flow panel"}, status_code=409)
         await manager.remove(name)
         save_config(manager.config)
         _notify_change()
@@ -122,6 +148,8 @@ def management_routes(
         Route("/api/status", status, methods=["GET"]),
         Route("/api/settings", settings, methods=["GET"]),
         Route("/api/settings", update_settings, methods=["PUT"]),
+        Route("/api/rizzo", get_rizzo, methods=["GET"]),
+        Route("/api/rizzo", put_rizzo, methods=["PUT"]),
         Route("/api/pid", pid, methods=["GET"]),
         Route("/api/shutdown", shutdown, methods=["POST"]),
         Route("/api/reload", reload, methods=["POST"]),

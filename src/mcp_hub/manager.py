@@ -16,7 +16,7 @@ import psutil
 
 from pathlib import Path
 
-from mcp_hub.config import Config, ServerConfig, load_config
+from mcp_hub.config import BUILTIN_RIZZO, Config, RizzoSettings, ServerConfig, load_config
 from mcp_hub.concurrency import ConcurrencyGuard
 
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
@@ -424,7 +424,32 @@ class ManagedServer:
 class HubManager:
     def __init__(self, config: Config):
         self.config = config
-        self._servers = {name: ManagedServer(name, sc) for name, sc in config.servers.items()}
+        self._servers = {
+            name: ManagedServer(name, sc) for name, sc in config.servers.items() if name != BUILTIN_RIZZO
+        }
+        self._sync_builtin()
+
+    def _sync_builtin(self) -> None:
+        """(Re)creates the built-in Rizzo Flow service from `config.rizzo`;
+        it lives next to the user's servers at runtime but never in
+        `config.servers`, so it is never persisted there, exported by `apply`
+        or editable through the generic upsert/remove routes."""
+        service = self.config.rizzo.to_service()
+        if service is None:
+            self._servers.pop(BUILTIN_RIZZO, None)
+        else:
+            self._servers[BUILTIN_RIZZO] = ManagedServer(BUILTIN_RIZZO, service)
+
+    async def apply_rizzo(self, settings: RizzoSettings) -> ManagedServer | None:
+        """Applies new built-in Rizzo settings: a running server is stopped
+        first (its command line may have changed) and the entry is rebuilt.
+        Does not start it; the caller does when `starts_with_hub`."""
+        existing = self._servers.get(BUILTIN_RIZZO)
+        if existing is not None:
+            await existing.stop()
+        self.config.rizzo = settings
+        self._sync_builtin()
+        return self._servers.get(BUILTIN_RIZZO)
 
     def get(self, name: str) -> ManagedServer:
         return self._servers[name]
@@ -446,6 +471,8 @@ class HubManager:
         snapshot: dict[str, dict] = {}
         for name, s in self._servers.items():
             entry: dict = {"status": s.status, "concurrency": s.config.concurrency, "type": s.config.type}
+            if name == BUILTIN_RIZZO:
+                entry["builtin"] = True  # owned by the GUI's Rizzo Flow tab
             if s.config.is_service and s.config.effective_port is not None:
                 entry["port"] = s.config.effective_port
             snapshot[name] = entry
@@ -463,6 +490,8 @@ class HubManager:
         is a no-op when there's nothing running, so this is safe to call
         unconditionally for any pre-existing entry.
         """
+        if name == BUILTIN_RIZZO:
+            raise ValueError(f"'{name}' is managed by the Rizzo Flow panel")
         existing = self._servers.get(name)
         if existing is not None:
             await existing.stop()
@@ -475,6 +504,8 @@ class HubManager:
         from both the live manager and `self.config.servers`. A no-op if
         `name` is unknown -- safe to call idempotently, mirroring `upsert`'s
         existing stop-before-drop safety for a pre-existing entry."""
+        if name == BUILTIN_RIZZO:
+            raise ValueError(f"'{name}' is managed by the Rizzo Flow panel")
         existing = self._servers.pop(name, None)
         if existing is not None:
             await existing.stop()
@@ -522,4 +553,9 @@ class HubManager:
             if name not in new_config.servers:
                 removed.append(name)
                 await self.remove(name)
+        if new_config.rizzo != self.config.rizzo:
+            updated.append(BUILTIN_RIZZO)
+            managed = await self.apply_rizzo(new_config.rizzo)
+            if managed is not None and managed.config.starts_with_hub:
+                await managed.start()
         return added, updated, removed

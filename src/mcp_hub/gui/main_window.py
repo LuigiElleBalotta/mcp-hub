@@ -5,7 +5,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QHBoxLayout, QLabel, QHeaderView, QMenu, QStyle,
-    QSystemTrayIcon,
+    QSystemTrayIcon, QTabWidget,
 )
 
 from mcp_hub.gui.api_client import HubApiClient
@@ -24,6 +24,18 @@ class _UpdateCheckWorker(QThread):
     def run(self) -> None:
         import mcp_hub
         self.found.emit(check_for_update(mcp_hub.__version__, include_beta=self._include_beta))
+
+
+class _QuitWorker(QThread):
+    """Stops the hub process tree for the tray's "Esci"."""
+
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        from mcp_hub.gui.hub_control import shutdown_hub
+        shutdown_hub(self._client)
 
 
 class _StatusWorker(QThread):
@@ -158,9 +170,16 @@ class MainWindow(QMainWindow):
         update_row.addWidget(self.install_update_btn)
 
         central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.addLayout(update_row)
-        layout.addWidget(self.connection_banner)
+        outer = QVBoxLayout(central)
+        outer.addLayout(update_row)
+        outer.addWidget(self.connection_banner)
+        # Two first-class tabs: the generic MCP/service table, and the built-in
+        # Rizzo Flow / Jev panel (which owns the `rizzo-flow` service: it is
+        # not a row of the generic table).
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, 1)
+        servers_page = QWidget()
+        layout = QVBoxLayout(servers_page)
         layout.addWidget(self.table, 2)
 
         add_btn = QPushButton("Add server")
@@ -190,6 +209,14 @@ class MainWindow(QMainWindow):
         version_label = QLabel(f"mcp-hub v{mcp_hub.__version__}")
         version_label.setStyleSheet("color: #888; padding: 2px 4px;")
         layout.addWidget(version_label)
+
+        self.tabs.addTab(servers_page, "Server")
+        from mcp_hub.gui.rizzo_panel import RizzoPanel
+        self.rizzo_panel = RizzoPanel(self.client)
+        self.tabs.addTab(self.rizzo_panel, self.rizzo_panel.tab_title())
+        self.rizzo_panel.state_changed.connect(lambda text: self.tabs.setTabText(1, text))
+        self.tabs.currentChanged.connect(
+            lambda i: self.rizzo_panel.refresh_detection() if i == 1 else None)
 
         self._init_tray()
 
@@ -231,6 +258,20 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _quit_from_tray(self) -> None:
+        # "Esci" must end the background hub too (and every server it
+        # manages), not just this window: stop it off the UI thread -- a
+        # graceful stop can take several seconds -- then quit.
+        if getattr(self, "_quit_thread", None) is not None:
+            return
+        self.tray_icon.showMessage(
+            self.windowTitle(), "Chiusura dell'hub in corso...",
+            QSystemTrayIcon.MessageIcon.Information, 2000,
+        )
+        self._quit_thread = _QuitWorker(self.client, self)
+        self._quit_thread.finished.connect(self._finish_quit)
+        self._quit_thread.start()
+
+    def _finish_quit(self) -> None:
         from PySide6.QtWidgets import QApplication
         self.tray_icon.hide()
         QApplication.quit()
@@ -374,12 +415,17 @@ class MainWindow(QMainWindow):
                 "Hub non raggiungibile — nuovo tentativo automatico in corso..."
             )
             self.connection_banner.setVisible(True)
+            self.rizzo_panel.on_hub_status(None, reachable=False)
             if not self._ever_connected:
                 self.table.setRowCount(0)
                 self._maybe_launch_hub()
             return
         self._ever_connected = True
         self.connection_banner.setVisible(False)
+        # The built-in Rizzo Flow service belongs to its own tab, not to this table.
+        builtin = {n: i for n, i in statuses.items() if i.get("builtin")}
+        self.rizzo_panel.on_hub_status(next(iter(builtin.values()), None), reachable=True)
+        statuses = {n: i for n, i in statuses.items() if n not in builtin}
         selected = self._selected_name()
         self.table.setRowCount(len(statuses))
         for row, (name, info) in enumerate(sorted(statuses.items())):
