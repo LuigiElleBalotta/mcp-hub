@@ -320,7 +320,7 @@ def _paths(install_dir: Path, quant: str = "q4_k_m") -> dict[str, Path]:
     return {
         "rizzo": rizzo,
         "jev": jev,
-        "venv_python": rizzo / ".venv" / "Scripts" / "python.exe",
+        "venv_python": rizzo.joinpath(".venv", *(("Scripts", "python.exe") if os.name == "nt" else ("bin", "python"))),
         "gguf": rizzo / "models" / "rizzo-flow" / gguf_name(quant),
         "runtimes": rizzo / "runtimes",
         "node_modules": jev / "node_modules",

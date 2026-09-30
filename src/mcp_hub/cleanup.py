@@ -76,7 +76,7 @@ def find_legacy_processes(
     session_root = None
     for candidate_pid in (self_pid, *self_ancestors):
         proc = by_pid.get(candidate_pid)
-        if proc is not None and proc.name == "claude.exe":
+        if proc is not None and proc.name in ("claude.exe", "claude"):
             session_root = candidate_pid
             break
 

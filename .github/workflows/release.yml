@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - '*'
+  # Manual run from the Actions tab: builds every platform and keeps the files as
+  # workflow artifacts, without publishing a release.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,7 +23,10 @@ jobs:
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            kind=dev
+            TAG="0.0.0-dev"
+          elif [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
             kind=beta
           elif [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             kind=release
@@ -30,7 +36,7 @@ jobs:
           echo "kind=$kind" >> "$GITHUB_OUTPUT"
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
-  build:
+  build-windows:
     needs: check-tag
     if: needs.check-tag.outputs.kind != 'none'
     runs-on: windows-latest
@@ -50,7 +56,8 @@ jobs:
       - name: Stamp package version from the tag
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.check-tag.outputs.version }}"
+          VERSION="${VERSION#v}"
           echo "__version__ = \"$VERSION\"" > src/mcp_hub/__init__.py
 
       - name: Build CLI exe (mcp-hub serve/import/apply)
@@ -59,6 +66,69 @@ jobs:
       - name: Build GUI exe (mcp-hub-gui)
         run: pyinstaller --onefile --windowed --name mcp-hub-gui src/mcp_hub/gui/app.py
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/mcp-hub.exe
+            dist/mcp-hub-gui.exe
+
+  # Apple Silicon (macos-latest is arm64). The app is not signed or notarized:
+  # the README explains how to open it the first time.
+  build-macos:
+    needs: check-tag
+    if: needs.check-tag.outputs.kind != 'none'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install package and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pyinstaller
+
+      - name: Stamp package version from the tag
+        shell: bash
+        run: |
+          VERSION="${{ needs.check-tag.outputs.version }}"
+          VERSION="${VERSION#v}"
+          echo "__version__ = \"$VERSION\"" > src/mcp_hub/__init__.py
+
+      - name: Build CLI (mcp-hub serve/import/apply)
+        run: pyinstaller --onefile --name mcp-hub src/mcp_hub/__main__.py
+
+      - name: Build GUI app (mcp-hub-gui.app)
+        run: pyinstaller --windowed --name mcp-hub-gui src/mcp_hub/gui/app.py
+
+      - name: Package
+        shell: bash
+        run: |
+          chmod +x dist/mcp-hub
+          tar -czf dist/mcp-hub-macos-arm64.tar.gz -C dist mcp-hub
+          ditto -c -k --keepParent dist/mcp-hub-gui.app dist/mcp-hub-gui-macos-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/mcp-hub-macos-arm64.tar.gz
+            dist/mcp-hub-gui-macos-arm64.zip
+
+  publish:
+    needs: [check-tag, build-windows, build-macos]
+    if: needs.check-tag.outputs.kind == 'release' || needs.check-tag.outputs.kind == 'beta'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -66,5 +136,7 @@ jobs:
           name: ${{ needs.check-tag.outputs.version }}
           prerelease: ${{ needs.check-tag.outputs.kind == 'beta' }}
           files: |
-            dist/mcp-hub.exe
-            dist/mcp-hub-gui.exe
+            artifacts/mcp-hub.exe
+            artifacts/mcp-hub-gui.exe
+            artifacts/mcp-hub-macos-arm64.tar.gz
+            artifacts/mcp-hub-gui-macos-arm64.zip

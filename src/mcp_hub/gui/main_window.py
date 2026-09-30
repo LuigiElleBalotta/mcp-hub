@@ -115,7 +115,9 @@ class _InstallUpdateWorker(QThread):
         from mcp_hub import self_update
 
         try:
-            staging = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mcp-hub" / self_update.STAGING_DIR_NAME
+            from mcp_hub.paths import data_dir
+
+            staging = data_dir() / self_update.STAGING_DIR_NAME
             work_dir = self_update.fresh_staging_dir(staging, self._info.version)
             self_update.apply_update(self._info, self._hub_pid, work_dir)
             self.finished_ok.emit(True, "")
@@ -212,8 +214,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(version_label)
 
         self.tabs.addTab(servers_page, "Server")
-        from mcp_hub.gui.rizzo_panel import RizzoPanel
-        self.rizzo_panel = RizzoPanel(self.client)
+        import sys
+
+        from mcp_hub.gui.rizzo_panel import RizzoPanel, UnsupportedRizzoPanel
+        self.rizzo_panel = RizzoPanel(self.client) if sys.platform == "win32" else UnsupportedRizzoPanel()
         self.tabs.addTab(self.rizzo_panel, self.rizzo_panel.tab_title())
         self.rizzo_panel.state_changed.connect(lambda text: self.tabs.setTabText(1, text))
         self.tabs.currentChanged.connect(
@@ -323,7 +327,8 @@ class MainWindow(QMainWindow):
 
         from mcp_hub import self_update
         can_auto_install = (
-            self_update.is_frozen()
+            self_update.is_supported()
+            and self_update.is_frozen()
             and self_update.HUB_EXE_NAME in info.assets
             and self_update.GUI_EXE_NAME in info.assets
         )

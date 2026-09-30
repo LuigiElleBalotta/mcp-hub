@@ -9,7 +9,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Literal
 
-CONFIG_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mcp-hub" / "config.json"
+from mcp_hub.paths import data_dir
+
+CONFIG_PATH = data_dir() / "config.json"
 
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
 

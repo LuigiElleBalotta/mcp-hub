@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout,
     QCheckBox, QLabel, QWidget, QMessageBox,
@@ -55,6 +57,11 @@ class SettingsDialog(QDialog):
 
         self.autostart_checkbox = QCheckBox("Avvia con Windows")
         self.autostart_checkbox.setChecked(hub.autostart)
+        if sys.platform != "win32":
+            # The autostart entry is a Windows Task Scheduler task (install_task.ps1).
+            self.autostart_checkbox.setText("Avvia all'accesso")
+            self.autostart_checkbox.setEnabled(False)
+            self.autostart_checkbox.setToolTip("Non ancora disponibile su questo sistema: avvia mcp-hub a mano o aggiungilo agli elementi di login.")
         self.check_updates_checkbox = QCheckBox("Controlla aggiornamenti")
         self.check_updates_checkbox.setChecked(hub.checkForUpdates)
         self.beta_checkbox = QCheckBox("Includi versioni beta")
@@ -109,7 +116,7 @@ class SettingsDialog(QDialog):
         except Exception:
             pass  # hub unreachable right now -- config.json is still saved, picked up on next hub start
 
-        if new_autostart != self._initial_autostart:
+        if new_autostart != self._initial_autostart and sys.platform == "win32":
             import subprocess
             from pathlib import Path
             script = Path(__file__).resolve().parents[3] / "scripts" / "install_task.ps1"

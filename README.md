@@ -53,8 +53,8 @@ Claude Code session N ─┘                 │
 
 ## Requirements
 
-- Windows (PySide6 GUI, Task Scheduler autostart, Windows-specific process
-  handling in `cleanup.py`/`manager.py`)
+- Windows (full support: PySide6 GUI, Task Scheduler autostart, Rizzo Flow / Jev, self-update)
+  or macOS on Apple Silicon (experimental, see [macOS](#macos-apple-silicon-experimental))
 - Python 3.11+
 
 ## Installing the exe (end users)
@@ -83,6 +83,33 @@ No installer, no admin rights needed — it's two standalone files:
 
 New versions install with the GUI's **Installa e riavvia** button — no more
 manual downloads.
+
+## macOS (Apple Silicon, experimental)
+
+Releases also ship a macOS build (arm64). It is **not signed or notarized**, so macOS
+blocks it the first time. It has not been tested by the maintainers on a Mac yet:
+please report problems.
+
+1. From the [Releases page](https://github.com/LuigiElleBalotta/mcp-hub/releases) download
+   `mcp-hub-gui-macos-arm64.zip` (GUI) and `mcp-hub-macos-arm64.tar.gz` (CLI `mcp-hub`).
+2. Unzip the GUI and move `mcp-hub-gui.app` to `/Applications`; extract the CLI somewhere on
+   your `PATH` (for example `tar -xzf mcp-hub-macos-arm64.tar.gz -C ~/.local/bin`).
+3. Remove the quarantine flag the browser added, otherwise macOS says the app is damaged:
+
+   ```
+   xattr -dr com.apple.quarantine /Applications/mcp-hub-gui.app
+   xattr -d com.apple.quarantine ~/.local/bin/mcp-hub
+   ```
+
+   (Or right-click the app, choose **Open**, then confirm.)
+4. Run `mcp-hub serve` or open the app. Data lives in
+   `~/Library/Application Support/mcp-hub/` (`config.json`, `backups/`).
+
+Not available on macOS yet: the **Rizzo Flow / Jev** tab (the local server needs Windows and
+an NVIDIA GPU; an Apple Silicon version is planned), "start at login", and in-app
+self-update (download the new release by hand). Servers, the management API, the CLI
+(`serve`, `import`, `apply`) and the GUI work as on Windows, except that Claude Code's own
+config is `~/.claude.json`.
 
 ## Setup (development)
 
