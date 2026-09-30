@@ -156,7 +156,9 @@ class Config:
     rizzo: RizzoSettings = field(default_factory=RizzoSettings)
 
 
-def load_config(path: Path = CONFIG_PATH) -> Config:
+def load_config(path: Path | None = None) -> Config:
+    # Resolved per call, not bound at import, so a patched CONFIG_PATH is honoured.
+    path = path if path is not None else CONFIG_PATH
     if not path.exists():
         return Config(hub=HubConfig(), servers={})
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -177,7 +179,8 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
     return Config(hub=hub, servers=servers, rizzo=rizzo)
 
 
-def save_config(config: Config, path: Path = CONFIG_PATH) -> None:
+def save_config(config: Config, path: Path | None = None) -> None:
+    path = path if path is not None else CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "hub": asdict(config.hub),
