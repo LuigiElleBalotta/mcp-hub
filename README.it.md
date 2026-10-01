@@ -94,8 +94,12 @@ Le release includono anche build per macOS: **Apple Silicon** (`arm64`) e **Inte
 
 ```
 brew tap LuigiElleBalotta/tap
+brew trust LuigiElleBalotta/tap
 brew install --cask mcp-hub
 ```
+
+Da Homebrew 6.0 una tap di terzi va dichiarata affidabile prima che il suo codice giri: `brew trust` è
+quel consenso, da dare una sola volta (senza, `brew install` rifiuta). Si controlla con `brew tap-info LuigiElleBalotta/tap`.
 
 Mette `mcp-hub-gui.app` in `/Applications` (l'architettura giusta è scelta da sola), toglie il flag di
 quarantena (niente avviso "app danneggiata") e aggiunge il comando `mcp-hub`

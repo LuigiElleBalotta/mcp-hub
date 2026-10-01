@@ -93,8 +93,12 @@ Releases also ship macOS builds for **Apple Silicon** (`arm64`) and **Intel** (`
 
 ```
 brew tap LuigiElleBalotta/tap
+brew trust LuigiElleBalotta/tap
 brew install --cask mcp-hub
 ```
+
+Since Homebrew 6.0 a third-party tap must be trusted before its code runs: `brew trust` is that
+one-time consent (without it `brew install` refuses). You can check it with `brew tap-info LuigiElleBalotta/tap`.
 
 This puts `mcp-hub-gui.app` in `/Applications` (the right architecture is picked for you), removes the
 download quarantine flag (no "damaged app" warning) and adds the `mcp-hub` command
