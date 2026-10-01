@@ -88,7 +88,9 @@ GUI — niente più download manuali.
 ## macOS (sperimentale)
 
 Le release includono anche build per macOS: **Apple Silicon** (`arm64`) e **Intel** (`x86_64`).
-**Non sono firmate né notarizzate**. I manutentori non le hanno ancora provate su un Mac: segnalate i problemi.
+**Non sono firmate né notarizzate**.
+
+**Stato:** su un Mac **Intel** l'installazione con Homebrew e l'avvio dell'app sono verificati (nessun errore). **Apple Silicon non è ancora verificato**, e neppure Rizzo Flow / Jev su un Mac. Segnalate i problemi.
 
 ### Installazione con Homebrew (consigliata)
 
@@ -147,8 +149,8 @@ La tab **Rizzo Flow / Jev** funziona anche su macOS: Rizzo Flow gira su **Apple 
 prerequisiti, per esempio `brew install git uv node`, poi apri la tab e segui i passi. La cartella di
 installazione predefinita è `~/rizzo-compaction`; il dispositivo (`metal` o `cpu`) è scelto in base al tuo Mac
 e salvato come `rizzo.device` in `config.json` (`auto`, `cuda`, `metal` o `cpu`). Il progetto Rizzo segnala
-che Metal funziona su un M3 Pro, ma i manutentori non l'hanno riprodotto e non è ancora stato provato
-tramite mcp-hub su un Mac.
+che Metal funziona su un M3 Pro, ma i manutentori non l'hanno riprodotto. Non è ancora verificato tramite mcp-hub su nessun Mac
+(il caso da provare è Apple Silicon; su Intel girerebbe solo su CPU).
 
 ### Non ancora disponibili su macOS
 
