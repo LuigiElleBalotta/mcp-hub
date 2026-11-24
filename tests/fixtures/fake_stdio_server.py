@@ -28,6 +28,11 @@ Supported methods:
   - "test/last_cancel" -> {"cancel": <params of the last notifications/cancelled
     received, or None>}.
   - "test/last_srv_reply" -> {"reply": <last answer to a server request>}.
+  - "initialize": counted; answers a plausible MCP initialize result, or a
+    JSON-RPC error when the env var FAKE_FAIL_INIT is set. A client's
+    `notifications/initialized` is counted too.
+  - "test/handshake_stats" -> {"initializes": n, "initializeds": m,
+    "protocolVersion": <version the initialize asked for>}.
 """
 import json
 import os
@@ -36,7 +41,8 @@ import threading
 import time
 
 _out_lock = threading.Lock()
-_state = {"last_cancel": None, "last_srv_reply": None}
+_state = {"last_cancel": None, "last_srv_reply": None, "initializes": 0, "initializeds": 0,
+          "protocolVersion": None}
 
 
 def _write(obj: dict) -> None:
@@ -80,6 +86,26 @@ def _dispatch(req: dict) -> None:
         return
     if method == "notifications/cancelled":
         _state["last_cancel"] = params
+        return
+    if method == "notifications/initialized":
+        _state["initializeds"] += 1
+        return
+    if method == "initialize":
+        _state["initializes"] += 1
+        _state["protocolVersion"] = params.get("protocolVersion")
+        if os.environ.get("FAKE_FAIL_INIT"):
+            _write({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": "init refused"}})
+            return
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {
+            "protocolVersion": params.get("protocolVersion"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake", "version": "9.9"},
+        }})
+        return
+    if method == "test/handshake_stats":
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {
+            "initializes": _state["initializes"], "initializeds": _state["initializeds"],
+            "protocolVersion": _state["protocolVersion"]}})
         return
 
     if method == "test/echo":

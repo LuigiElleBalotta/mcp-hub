@@ -279,6 +279,18 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                         fut.exception()
 
         try:
+            method = obj.get("method")
+            if method == "notifications/initialized":
+                return  # the hub sent its own when it initialised the upstream
+            if method is not None:
+                await managed.ensure_ready()
+                if method == "initialize" and is_request:
+                    # hub-proxy-hardening R4: never forwarded. Every client of
+                    # this shared upstream gets the hub's cached handshake, so
+                    # a respawned upstream is initialised exactly once, by the
+                    # hub, whatever the clients believe.
+                    await deliver({"jsonrpc": "2.0", "id": client_id, "result": managed.initialize_result})
+                    return
             if is_request:
                 await managed.guard.run(write_and_maybe_wait)
             else:

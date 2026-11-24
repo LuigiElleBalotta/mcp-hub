@@ -33,6 +33,10 @@ Status = Literal["stopped", "starting", "running", "crashed"]
 # 10 MiB is comfortably above any response this hub is expected to proxy.
 _STDOUT_LIMIT = 10 * 1024 * 1024
 
+# How long the hub waits for an upstream's answer to its own `initialize`.
+# Generous on purpose: `npx`/`uvx` servers may download packages on first run.
+HANDSHAKE_TIMEOUT = 120.0
+
 
 def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -90,6 +94,15 @@ class ManagedServer:
     # session.py): routes progress and server-initiated requests to the right
     # client instead of broadcasting them to every connection.
     table: RequestTable = field(init=False, repr=False)
+    # Hub-owned MCP handshake (hub-proxy-hardening R4): the upstream is
+    # initialised once per spawn by the hub itself and the result is cached;
+    # clients' own `initialize` is answered from it, never forwarded.
+    # `_ready_process` is the subprocess object the handshake completed for, so
+    # a respawn (a new object) is detected without any reset bookkeeping.
+    initialize_result: dict | None = field(default=None, init=False, repr=False)
+    _ready_process: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
+    _handshake_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _handshake_for: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
@@ -206,6 +219,86 @@ class ManagedServer:
         finally:
             self._reject_pending()
 
+    async def hub_request(self, method: str, params: dict, timeout: float) -> dict:
+        """A request the HUB makes of the upstream (handshake, health ping),
+        not on behalf of any client: own hub id, no session, no guard.
+        Returns the JSON-RPC response object (`result` or `error`); raises
+        ConnectionError if the process is gone and TimeoutError on no answer."""
+        if self.process is None or self.process.stdin is None or self.process.returncode is not None:
+            raise ConnectionError(f"managed server {self.name!r} subprocess is not running")
+        self.ensure_stdout_reader()
+        hub_id = self.next_request_id()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.pending[hub_id] = fut
+        try:
+            try:
+                self.process.stdin.write(
+                    (json.dumps({"jsonrpc": "2.0", "id": hub_id, "method": method, "params": params}) + "\n").encode("utf-8")
+                )
+                await self.process.stdin.drain()
+            except (ConnectionError, OSError) as exc:
+                raise ConnectionError(
+                    f"managed server {self.name!r} subprocess is not accepting requests ({exc})"
+                ) from exc
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self.pending.pop(hub_id, None)
+            if fut.done() and not fut.cancelled():
+                fut.exception()  # mark retrieved (see hub_app's same note)
+
+    async def ensure_ready(self) -> None:
+        """Makes sure the CURRENT subprocess has been initialised by the hub.
+
+        The handshake runs once per spawn, shared by every caller (and
+        shielded, so a client that disconnects mid-handshake cannot abort it
+        for the others). Raises ConnectionError if the process is not running
+        or refuses to initialise; the next call tries again."""
+        process = self.process
+        if process is None or process.returncode is not None:
+            raise ConnectionError(f"managed server {self.name!r} subprocess is not running")
+        if self._ready_process is process:
+            return
+        task = self._handshake_task
+        if task is None or task.done() or self._handshake_for is not process:
+            self._handshake_for = process
+            task = self._handshake_task = asyncio.create_task(self._do_handshake(process))
+            # Nobody may be left awaiting it (all callers cancelled): retrieve
+            # the exception so asyncio does not log it as never retrieved.
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        await asyncio.shield(task)
+
+    async def _do_handshake(self, process: asyncio.subprocess.Process) -> None:
+        from mcp_types.version import LATEST_HANDSHAKE_VERSION
+
+        import mcp_hub
+
+        try:
+            response = await self.hub_request(
+                "initialize",
+                {
+                    "protocolVersion": LATEST_HANDSHAKE_VERSION,
+                    # The hub declares no client capabilities: roots/sampling/
+                    # elicitation belong to individual sessions, not to the
+                    # one shared connection.
+                    "capabilities": {},
+                    "clientInfo": {"name": "mcp-hub", "version": mcp_hub.__version__},
+                },
+                timeout=HANDSHAKE_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ConnectionError(
+                f"managed server {self.name!r} did not answer initialize within {HANDSHAKE_TIMEOUT:g}s"
+            ) from exc
+        if "result" not in response:
+            message = (response.get("error") or {}).get("message", "unknown error")
+            raise ConnectionError(f"managed server {self.name!r} refused initialize: {message}")
+        if process is not self.process:
+            return  # respawned meanwhile: this handshake belongs to a dead process
+        await self._write_to_upstream({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.initialize_result = response["result"]
+        self._ready_process = process
+        self.append_log(f"[hub] initialized {self.name} (protocol {response['result'].get('protocolVersion')})")
+
     async def _write_to_upstream(self, obj: dict) -> None:
         """Best-effort single-line write to the subprocess's stdin."""
         if self.process is None or self.process.stdin is None or self.process.returncode is not None:
@@ -274,6 +367,8 @@ class ManagedServer:
             await self._start_service()
             return
         self._stopping = False
+        self.initialize_result = None
+        self._ready_process = None
         self.status = "starting"
         # Merge with the parent's environment rather than replacing it: several
         # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
