@@ -12,6 +12,7 @@ from starlette.middleware import Middleware
 from starlette.responses import Response
 from starlette.routing import Mount, Route
 
+from mcp_hub.cache import CACHEABLE_LISTS, has_cursor
 from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
 from mcp_hub.security import HubSecurityMiddleware
@@ -127,6 +128,10 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
 
         # The client's own progress token (if any), swapped for a hub token at
         # dispatch time so two sessions that both picked "tok" cannot collide.
+        # A list request the cache may answer or fill (R1): page requests never.
+        cache_method = obj.get("method") if (is_request and obj.get("method") in CACHEABLE_LISTS
+                                             and not has_cursor(obj.get("params"))) else None
+
         client_progress_token = None
         req_params = obj.get("params")
         if is_request and isinstance(req_params, dict) and isinstance(req_params.get("_meta"), dict):
@@ -197,6 +202,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             # either resolved normally or rejected -- never orphaned.
             managed.ensure_stdout_reader()
             fut: asyncio.Future | None = None
+            cache_generation = managed.cache.generation(cache_method) if cache_method else 0
             out_text = payload_text
             if hub_id is not None:
                 fut = asyncio.get_running_loop().create_future()
@@ -258,6 +264,8 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                         f"t={time.monotonic():.6f}"
                     )
                     dispatch_done_logged = True
+                    if cache_method and isinstance(response_obj.get("result"), dict):
+                        managed.cache.put(cache_method, response_obj["result"], cache_generation)
                     response_obj = {**response_obj, "id": client_id}
                     await deliver(response_obj)
             except Exception:
@@ -288,6 +296,13 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             method = obj.get("method")
             if method == "notifications/initialized":
                 return  # the hub sent its own when it initialised the upstream
+            if cache_method is not None:
+                cached = managed.cache.get(cache_method)
+                if cached is not None:
+                    # Answered without touching the upstream (and even while it
+                    # is restarting): the same list every client would get.
+                    await deliver({"jsonrpc": "2.0", "id": client_id, "result": cached})
+                    return
             if method is not None:
                 await managed.ensure_ready()
                 if method == "initialize" and is_request:

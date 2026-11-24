@@ -19,6 +19,7 @@ import psutil
 from pathlib import Path
 
 from mcp_hub.config import BUILTIN_RIZZO, Config, RizzoSettings, ServerConfig, load_config
+from mcp_hub.cache import ListCache
 from mcp_hub.concurrency import ConcurrencyGuard
 from mcp_hub.session import RequestTable
 
@@ -105,6 +106,10 @@ class ManagedServer:
     # session.py): routes progress and server-initiated requests to the right
     # client instead of broadcasting them to every connection.
     table: RequestTable = field(init=False, repr=False)
+    # Answers to tools/list & co, served to every client without asking the
+    # upstream again (hub-proxy-efficiency R1). Dropped on `*/list_changed`
+    # and whenever the process is respawned.
+    cache: ListCache = field(default_factory=ListCache, init=False, repr=False)
     # Hub-owned MCP handshake (hub-proxy-hardening R4): the upstream is
     # initialised once per spawn by the hub itself and the result is cached;
     # clients' own `initialize` is answered from it, never forwarded.
@@ -220,6 +225,8 @@ class ManagedServer:
                     # else's abandoned response to it.
                     continue
                 method = obj.get("method")
+                if method is not None and msg_id is None:
+                    self.cache.invalidate_for_notification(method)  # then still broadcast below
                 if method == "notifications/progress":
                     await self._route_progress(obj)
                     continue
@@ -400,6 +407,7 @@ class ManagedServer:
         """Spawns the MCP subprocess: a manual start or an automatic restart."""
         self.initialize_result = None
         self._ready_process = None
+        self.cache.clear()
         self._cancel_ping_loop()
         self.status = "starting"
         # Merge with the parent's environment rather than replacing it: several
