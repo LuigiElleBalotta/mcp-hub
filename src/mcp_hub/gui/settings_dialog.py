@@ -5,7 +5,7 @@ import sys
 
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout,
-    QCheckBox, QLabel, QWidget, QMessageBox,
+    QCheckBox, QLabel, QWidget, QMessageBox, QComboBox, QSpinBox,
 )
 
 from mcp_hub.gui.api_client import HubApiClient
@@ -74,6 +74,20 @@ class SettingsDialog(QDialog):
         form.addRow("Host consentiti", self.allowed_hosts_edit)
         form.addRow("Origin consentiti", self.allowed_origins_edit)
 
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItem("SSE (come sempre)", "sse")
+        self.transport_combo.addItem("Streamable HTTP", "http")
+        self.transport_combo.setCurrentIndex(1 if hub.preferredTransport == "http" else 0)
+        self.transport_combo.setToolTip("Quale endpoint 'apply' scrive nella config dei client: /<server>/sse o /<server>/mcp.")
+        self.drain_spin = QSpinBox()
+        self.drain_spin.setRange(0, 3600)
+        self.drain_spin.setSuffix(" s")
+        self.drain_spin.setSpecialValueText("subito")
+        self.drain_spin.setValue(int(hub.drainTimeout))
+        self.drain_spin.setToolTip("Alla chiusura (o all'aggiornamento) l'hub aspetta tanto le richieste in corso prima di uscire.")
+        form.addRow("Trasporto per 'apply'", self.transport_combo)
+        form.addRow("Attesa alla chiusura", self.drain_spin)
+
         warning = QLabel(
             "Host / porta / token / host e origin consentiti: serve riavviare l'hub per applicare le modifiche. "
             "Cambiato il token, riesegui 'apply' perche' i client lo ricevano."
@@ -130,6 +144,8 @@ class SettingsDialog(QDialog):
         hub.authToken = self.token_edit.text() or None
         hub.allowedHosts = _split_list(self.allowed_hosts_edit.text())
         hub.allowedOrigins = _split_list(self.allowed_origins_edit.text())
+        hub.preferredTransport = self.transport_combo.currentData()
+        hub.drainTimeout = float(self.drain_spin.value())
         new_autostart = self.autostart_checkbox.isChecked()
         hub.autostart = new_autostart
         hub.checkForUpdates = self.check_updates_checkbox.isChecked()

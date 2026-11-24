@@ -15,7 +15,7 @@ from mcp_hub.updater import UpdateInfo, check_for_update
 
 _STATUS_COLOR = {
     "running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828",
-    "starting": "#f9a825", "restarting": "#ef6c00",
+    "starting": "#f9a825", "restarting": "#ef6c00", "idle": "#546e7a",
 }
 
 
@@ -463,6 +463,8 @@ class MainWindow(QMainWindow):
                 details = f"HTTP :{port}" if port is not None else "process"
             else:
                 details = info["concurrency"]
+                if info.get("sessions") is not None:  # an isolated server: one process per session
+                    details = f"{details} ({info['sessions']})"
             self.table.setItem(row, 3, QTableWidgetItem(details))
 
             actions = QWidget()
@@ -471,7 +473,10 @@ class MainWindow(QMainWindow):
             start_btn = QPushButton("Start")
             stop_btn = QPushButton("Stop")
             busy = name in self._busy
-            start_btn.setEnabled(not busy and status in ("stopped", "crashed"))
+            # "idle" (lazy / idle-stopped) starts by itself when asked, but Start brings it
+            # up now. An isolated server has no shared process to start.
+            isolated = info.get("concurrency") == "isolated" and not is_service
+            start_btn.setEnabled(not busy and not isolated and status in ("stopped", "crashed", "idle"))
             # "restarting": Stop cancels the pending automatic restart.
             stop_btn.setEnabled(not busy and status in ("starting", "running", "restarting"))
             edit_btn = QPushButton("Edit")
