@@ -40,6 +40,8 @@ Supported methods:
     carries nextCursor "p2" and a cursor request returns page 2.
   - "test/list_calls" -> {"calls": {method: n}}; "test/emit_list_changed" ->
     emits notifications/tools/list_changed (bumping the version), then answers {}.
+  - "test/pid" -> {"pid": <this process id>}; "test/echo_meta" -> {"meta": <the
+    request's params._meta>}.
   - "test/handshake_stats" -> {"initializes": n, "initializeds": m,
     "protocolVersion": <version the initialize asked for>}.
 """
@@ -136,6 +138,12 @@ def _dispatch(req: dict) -> None:
         if os.environ.get("FAKE_PAGINATE") and not params.get("cursor"):
             result["nextCursor"] = "p2"
         _write({"jsonrpc": "2.0", "id": req_id, "result": result})
+        return
+    if method == "test/pid":
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"pid": os.getpid()}})
+        return
+    if method == "test/echo_meta":
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"meta": params.get("_meta")}})
         return
     if method == "test/list_calls":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {"calls": _state["list_calls"]}})

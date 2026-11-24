@@ -13,7 +13,8 @@
 - [x] 4. Lazy start, `ensure_running`, idle watcher, `persistent`, `idle` status
   - `startMode`/`idleTimeout`/`persistent` (MCP only, omitted while default). Status `idle` = not running but starts by itself when asked; a deliberate Stop or a crash is NOT undone by a request. A lazy server answers `initialize` and cached lists from `<data dir>/cache/<name>.json` without spawning (key = command line + env NAMES). Idle shutdown never cuts a request in flight; status flips to `idle` before the process is gone on purpose (a request arriving then waits on the spawn lock, then respawns).
   - Fixed on the way: `handle_sse`/`handle_message` asserted a process exists; `_spawn` now stops the previous process's stdout reader and rejects its pending requests first, so a late EOF cannot reject the new process's requests.
-- [ ] 5. Session modes: `isolated` pool and `session-aware` `_meta` injection
+- [x] 5. Session modes: `isolated` pool and `session-aware` `_meta` injection
+  - `concurrency` accepts exclusive | parallel | session-aware | isolated (validated on load via API and in the GUI later). session-aware injects `params._meta["io.github.mcp-hub/sessionId"]` into every forwarded request, merged with the client's own `_meta` and the remapped progress token. isolated: the server entry has no process; `ManagedServer.session_upstream()` creates a private lazy child per SSE connection and `release_session_upstream()` stops it on disconnect; children share no cache, handshake or request ids, their logs show on the parent, status shows `running`/`idle` with a `sessions` count. `ManagedServer` is now `eq=False` (identity hash). Proven end to end with two real SDK clients.
 - [ ] 6. Streamable HTTP endpoint and `preferredTransport` in `apply`
 - [ ] 7. Graceful drain, shutdown/self-update integration
 - [ ] 8. Tool filters and prefix

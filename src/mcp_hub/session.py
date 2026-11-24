@@ -14,8 +14,15 @@ which hub-generated progress token stands in for the client's own one.
 from __future__ import annotations
 
 import itertools
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+
+
+# `params._meta` key under which a `session-aware` server is told which client
+# session a request comes from. Namespaced to this project: it is not part of
+# MCP, so a server has to be written (or configured) to read it.
+SESSION_META_KEY = "io.github.mcp-hub/sessionId"
 
 
 def _is_key(value: Any) -> bool:
@@ -35,6 +42,8 @@ class HubSession:
     deliver: Callable[..., Awaitable[None]]
     # client-chosen request id -> hub id, for requests currently in flight.
     inflight: dict[Any, str] = field(default_factory=dict)
+    # Stable for the life of the connection; sent to `session-aware` servers.
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
 @dataclass

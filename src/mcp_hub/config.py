@@ -13,6 +13,8 @@ from mcp_hub.paths import data_dir
 
 CONFIG_PATH = data_dir() / "config.json"
 
+CONCURRENCY_MODES = ("exclusive", "parallel", "session-aware", "isolated")
+
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
 
 
@@ -26,7 +28,11 @@ class ServerConfig:
     command: str
     args: list[str]
     env: dict[str, str] = field(default_factory=dict)
-    concurrency: Literal["exclusive", "parallel"] = "exclusive"
+    # exclusive: one request at a time. parallel: shared upstream, no serialisation.
+    # session-aware: parallel, plus the hub tells the server which client session each
+    # request comes from (`_meta`, see session.SESSION_META_KEY). isolated: one upstream
+    # process per client session, started on connect and stopped on disconnect.
+    concurrency: Literal["exclusive", "parallel", "session-aware", "isolated"] = "exclusive"
     # `type == "service"`: a plain long-running process (e.g. an HTTP server
     # such as Rizzo Flow) that the hub only starts/stops/monitors. It is not
     # an MCP server: stdio is not proxied, no `/<name>/sse` route is mounted
@@ -74,7 +80,8 @@ class ServerConfig:
         behind the user's back."""
         if self.is_service:
             return self.enabled and self.autostart
-        return self.enabled and self.startMode == "eager"
+        # An isolated server has no shared process: its upstreams belong to sessions.
+        return self.enabled and self.startMode == "eager" and self.concurrency != "isolated"
 
     @property
     def effective_port(self) -> int | None:

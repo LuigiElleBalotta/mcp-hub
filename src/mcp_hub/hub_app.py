@@ -16,7 +16,7 @@ from mcp_hub.cache import CACHEABLE_LISTS, has_cursor
 from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
 from mcp_hub.security import HubSecurityMiddleware
-from mcp_hub.session import HubSession
+from mcp_hub.session import SESSION_META_KEY, HubSession
 
 
 # JSON-RPC "server error" range (-32000..-32099): the managed server is down.
@@ -43,8 +43,13 @@ def _mount_for(name: str, manager: HubManager) -> Mount:
         # client run). The guard is applied per-request inside `_proxy`
         # instead, so two SSE clients can both connect to an `exclusive`
         # server at once; what serializes is each individual request.
-        async with transport.connect_sse(request.scope, request.receive, request._send) as (read, write):
-            await _proxy(read, write, managed)
+        # An `isolated` server gives each session its own process.
+        upstream = managed.session_upstream()
+        try:
+            async with transport.connect_sse(request.scope, request.receive, request._send) as (read, write):
+                await _proxy(read, write, upstream)
+        finally:
+            await managed.release_session_upstream(upstream)
         return Response()  # avoids a TypeError on client disconnect (Task 2 spike finding)
 
     return Mount(f"/{name}", routes=[
@@ -208,8 +213,14 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                 fut = asyncio.get_running_loop().create_future()
                 managed.pending[hub_id] = fut
                 hub_progress = managed.table.register(session, client_id, hub_id, client_progress_token)
+                meta_updates: dict = {}
                 if hub_progress is not None:
-                    out_params = {**obj["params"], "_meta": {**obj["params"]["_meta"], "progressToken": hub_progress}}
+                    meta_updates["progressToken"] = hub_progress
+                if managed.config.concurrency == "session-aware":
+                    meta_updates[SESSION_META_KEY] = session.id  # R3: who is asking
+                if meta_updates and isinstance(obj.get("params", {}), dict):
+                    out_params = dict(obj.get("params") or {})
+                    out_params["_meta"] = {**(out_params.get("_meta") or {}), **meta_updates}
                     out_text = json.dumps({**obj, "params": out_params})
                 # Permanent hub-side dispatch timing (Task 13 review finding:
                 # scripts/concurrency_check.py's client-observed completion

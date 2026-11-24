@@ -7,7 +7,8 @@ T = TypeVar("T")
 
 
 class ConcurrencyGuard:
-    def __init__(self, mode: Literal["exclusive", "parallel"]):
+    def __init__(self, mode: Literal["exclusive", "parallel", "session-aware", "isolated"]):
+        # Only "exclusive" serialises; every other mode runs requests concurrently.
         self.mode = mode
         self._lock = asyncio.Lock() if mode == "exclusive" else None
 

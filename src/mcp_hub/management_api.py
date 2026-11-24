@@ -10,7 +10,7 @@ from starlette.routing import Route
 
 from dataclasses import asdict
 
-from mcp_hub.config import BUILTIN_RIZZO, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
+from mcp_hub.config import BUILTIN_RIZZO, CONCURRENCY_MODES, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
 from mcp_hub.manager import HubManager
 
 
@@ -129,6 +129,8 @@ def management_routes(
             return JSONResponse({"error": "type must be 'mcp' or 'service'"}, status_code=400)
         if server_config.is_service and not server_config.command:
             return JSONResponse({"error": "a service needs a command"}, status_code=400)
+        if server_config.concurrency not in CONCURRENCY_MODES:
+            return JSONResponse({"error": f"concurrency must be one of {', '.join(CONCURRENCY_MODES)}"}, status_code=400)
         if server_config.restart not in ("never", "on-failure"):
             return JSONResponse({"error": "restart must be 'never' or 'on-failure'"}, status_code=400)
         attempts = server_config.restartMaxAttempts

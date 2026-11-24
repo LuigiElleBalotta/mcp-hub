@@ -11,7 +11,7 @@ import shutil
 import socket
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Literal
 
 import psutil
@@ -72,7 +72,7 @@ def _redact_line(line: str) -> str:
     return _KV_SECRET_RE.sub(_sub, line)
 
 
-@dataclass
+@dataclass(eq=False)  # identity equality: instances live in sets (isolated children)
 class ManagedServer:
     name: str
     config: ServerConfig
@@ -82,6 +82,11 @@ class ManagedServer:
     logs: collections.deque = field(default_factory=lambda: collections.deque(maxlen=500))
     # Where a lazy server keeps its on-disk cache (default: <data dir>/cache).
     cache_dir: Path | None = None
+    # False for a per-session child of an `isolated` server: it must not read or
+    # write the shared on-disk cache.
+    use_disk_cache: bool = True
+    # The `isolated` server this process serves a session for (None otherwise).
+    parent: "ManagedServer | None" = None
     # `pending`/`subscribers`/`_reader_task` back the single shared stdout
     # reader below (see `ensure_stdout_reader`/`_read_stdout`): exactly one
     # task consumes `process.stdout` per subprocess, no matter how many SSE
@@ -134,12 +139,17 @@ class ManagedServer:
     _spawn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _last_activity: float = field(default_factory=time.monotonic, init=False, repr=False)
     _idle_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    # `isolated` mode: the live per-session upstreams of this server.
+    children: set = field(default_factory=set, init=False, repr=False)
+    _child_ids: itertools.count = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
         self.table = RequestTable(self.name)
-        if not self.config.is_service and self.config.startMode == "lazy":
-            self._load_disk_cache()
+        lazy = self.config.startMode == "lazy"
+        if not self.config.is_service and (lazy or self.config.concurrency == "isolated"):
+            if lazy and self.use_disk_cache and self.config.concurrency != "isolated":
+                self._load_disk_cache()
             if self.status == "stopped":
                 self.status = "idle"  # not "stopped": it starts by itself when asked
 
@@ -216,6 +226,36 @@ class ManagedServer:
 
     def append_log(self, line: str) -> None:
         self.logs.append(_redact_line(line))
+        if self.parent is not None:  # a session's upstream logs where the GUI shows the server's logs
+            self.parent.append_log(f"[{self.name}] {line}")
+
+    @property
+    def is_isolated(self) -> bool:
+        return self.config.concurrency == "isolated" and not self.config.is_service
+
+    def session_upstream(self) -> "ManagedServer":
+        """The upstream a newly connected client session talks to: this server
+        itself, or for an `isolated` server a private process (spawned on the
+        session's first request) that nobody else shares - not its cache, its
+        request ids, nor its state. Pair with `release_session_upstream`."""
+        if not self.is_isolated:
+            return self
+        child = ManagedServer(
+            f"{self.name}#{next(self._child_ids)}",
+            replace(self.config, concurrency="parallel", startMode="lazy"),
+            use_disk_cache=False,
+            parent=self,
+        )
+        self.children.add(child)
+        return child
+
+    async def release_session_upstream(self, upstream: "ManagedServer") -> None:
+        """Ends a session's use of `upstream`: an isolated session's private
+        process is stopped (it dies with its session), a shared one is left."""
+        if upstream is self:
+            return
+        self.children.discard(upstream)
+        await upstream.stop()
 
     def next_request_id(self) -> str:
         """Returns a hub-generated JSON-RPC request id, unique for the
@@ -484,6 +524,8 @@ class ManagedServer:
         if self.config.is_service:
             await self._start_service()
             return
+        if self.is_isolated:
+            return  # no shared process: each client session spawns its own
         # A manual start overrides any pending automatic restart and re-arms
         # the circuit breaker (the operator is deliberately trying again).
         self._cancel_restart()
@@ -802,6 +844,10 @@ class ManagedServer:
         `_reject_pending` finally, and every other managed server's own
         stop() in a sequential `stop_all()`).
         """
+        if self.is_isolated:
+            for child in list(self.children):  # their sessions get an error and may reconnect
+                await self.release_session_upstream(child)
+            return
         self._stopping = True
         self._cancel_restart()
         self._cancel_ping_loop()
@@ -873,6 +919,10 @@ class HubManager:
         snapshot: dict[str, dict] = {}
         for name, s in self._servers.items():
             entry: dict = {"status": s.status, "concurrency": s.config.concurrency, "type": s.config.type}
+            if s.is_isolated:
+                # no process of its own: "running" while any session has one
+                entry["status"] = "running" if s.children else "idle"
+                entry["sessions"] = len(s.children)
             if name == BUILTIN_RIZZO:
                 entry["builtin"] = True  # owned by the GUI's Rizzo Flow tab
             if s.config.is_service and s.config.effective_port is not None:

@@ -45,8 +45,8 @@ async def running_hub(hub: HubConfig | None = None, **server_kw):
     port = _free_port()
     hub = hub or HubConfig()
     hub.port = port
-    cfg = ServerConfig(enabled=True, command=sys.executable, args=[REAL_SERVER], env={},
-                       concurrency="parallel", **server_kw)
+    server_kw.setdefault("concurrency", "parallel")
+    cfg = ServerConfig(enabled=True, command=sys.executable, args=[REAL_SERVER], env={}, **server_kw)
     manager = HubManager(Config(hub=hub, servers={"real": cfg}))
     await manager.start_all()
     http = uvicorn.Server(uvicorn.Config(build_app(manager), host="127.0.0.1", port=port, log_level="warning",
@@ -151,3 +151,23 @@ async def test_real_upstream_crash_is_answered_then_the_hub_restarts_it(monkeypa
             after = _text(await session.call_tool("whoami", {}))
             assert after != before
             assert _text(await session.call_tool("add", {"a": 4, "b": 4})) == "8"
+
+
+@pytest.mark.asyncio
+async def test_isolated_mode_gives_each_real_client_its_own_upstream_and_cleans_up():
+    async with running_hub(concurrency="isolated") as (manager, base):
+        server = manager.get("real")
+        async with client(base) as a, client(base) as b:
+            pid_a = _text(await a.call_tool("whoami", {}))
+            pid_b = _text(await b.call_tool("whoami", {}))
+            assert pid_a != pid_b, "two sessions, two upstream processes"
+            assert _text(await a.call_tool("whoami", {})) == pid_a
+            assert len(server.children) == 2
+            procs = [c.process for c in server.children]
+        # both clients left: their private processes are stopped, nothing leaks
+        for _ in range(100):
+            if not server.children and all(p.returncode is not None for p in procs):
+                break
+            await asyncio.sleep(0.05)
+        assert server.children == set()
+        assert all(p.returncode is not None for p in procs)
