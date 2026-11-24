@@ -15,5 +15,8 @@
 - [x] 6. Auto-restart supervisor with backoff, circuit breaker, `restarting` status
 - [x] 7. Health ping loop wired to the restart policy
 - [x] 8. GUI: settings dialog (allow-lists, generate token), server dialog (restart/health fields), `restarting` status
-- [ ] 9. Docs: README (EN+IT) security section and restart/health settings, `config.example.json`
-- [ ] 10. Manual verification with real servers (gitlab, mariadb, chrome-real), then review/merge (`git flow feature finish`); patch release for R1 first if wanted
+- [x] 9. Docs: README (EN+IT) security section and restart/health settings, `config.example.json`
+- [x] 10. Verification and merge
+  - Done on `develop` directly (user's call), no feature branch. `tests/test_e2e_sdk.py`: the REAL SDK client -> hub on real uvicorn/SSE -> a REAL SDK MCP server (`tests/fixtures/real_mcp_server.py`): handshake, tools, two clients sharing one upstream with separate progress, token/Origin/Host/Content-Type over HTTP, upstream crash answered then restarted on the same connection.
+  - NOT done: the user's own servers (gitlab, mariadb, chrome-real, windows-mcp) were not exercised (side effects, secrets); the hub-owned handshake and the missing client capabilities should be tried with them before release. No release/version bump was made.
+  - Found on the way: the venv has mcp 2.2.0 (`mcp_types` only exists in 2.x) while pyproject said `mcp>=1.0.0`: now `mcp>=2.2.0`. sse-starlette keeps a process-global exit flag that breaks tests running several uvicorn hubs in one process (handled in the e2e helper; production runs one hub per process).

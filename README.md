@@ -216,7 +216,9 @@ the config: treat the folder the same way.
 |----------------------|---------------|---------|
 | `host`               | `127.0.0.1`   | Bind address. Anything other than `127.0.0.1`/`localhost` is refused at startup unless `authToken` is set. |
 | `port`               | `37450`       | Bind port. |
-| `authToken`          | `null`        | Required if `host` is not localhost. Not yet enforced on individual requests — binding restriction only. |
+| `authToken`          | `null`        | Bearer token. Required if `host` is not localhost. When set, **every** route (MCP and management API) answers `401` without `Authorization: Bearer <token>`. `apply` writes it into the client config; the GUI sends it too (and re-reads it after the hub restarts with a new one). The Settings dialog has a "Genera" button for a random one. |
+| `allowedHosts`       | `[]`          | Extra `Host` header values accepted besides `127.0.0.1`, `localhost`, `[::1]` and `host` (each with the port). A request with another `Host` gets `403` (DNS-rebinding protection). A hub bound to `0.0.0.0`/`::`, or `["*"]`, skips this check. Omitted from `config.json` while empty. |
+| `allowedOrigins`     | `[]`          | Extra `Origin` values accepted. A request carrying an `Origin` that is not the hub's own gets `403`, so a web page cannot drive the hub; clients without an `Origin` (Claude Code, the GUI, `curl`) are unaffected. |
 | `autostart`          | `false`       | Informational flag mirrored by the GUI's "Avvia con Windows" checkbox, which registers/removes a Windows Task Scheduler entry (see below). |
 | `checkForUpdates`    | `true`        | GUI checks GitHub Releases for a newer version on startup and shows a banner if one exists. Never downloads or installs anything without an explicit click on "Installa e riavvia" (see [Auto-update](#auto-update)). |
 | `includeBetaUpdates` | `false`       | If `true`, the update check also considers beta (prerelease) tags, not just stable releases. |
@@ -230,6 +232,43 @@ the config: treat the folder the same way.
 | `args`        | Argument list passed to `command`. |
 | `env`         | Extra environment variables, merged on top of the hub process's own environment (so `PATH` etc. are preserved). Any key matching `TOKEN\|SECRET\|PASS\|KEY\|AUTH` (case-insensitive) is redacted (`***`) wherever it's logged or returned by the API — never redacted in the config file itself, since the hub needs the real values to launch the process. |
 | `concurrency` | `"exclusive"` (default, serializes every request to this server behind an `asyncio.Lock`) or `"parallel"` (no serialization). Use `"exclusive"` for anything that can't handle overlapping calls (e.g. a stateful browser session); `"parallel"` for stateless/read-only tools. |
+| `restart`     | `"on-failure"` (default) or `"never"`. What to do when the process exits without the hub asking it to (see [Reliability](#reliability)). |
+| `restartMaxAttempts` | Default `5`. Restarts allowed inside `restartWindow` before the server stays `crashed` until started by hand. |
+| `restartWindow` | Default `300` (seconds). Restarts older than this are forgotten, so a server that then ran stably gets a fresh budget. |
+| `healthInterval` | Default `30` (seconds, `0` = off). How often the hub pings the server. |
+| `healthFailures` | Default `3`. Unanswered pings in a row before the server is considered unresponsive and terminated. |
+
+The `restart*`/`health*` fields are omitted from `config.json` while they have
+their default value, so an untouched entry keeps its original shape.
+
+### Reliability
+
+- **The hub initialises each server itself.** On the first client request after
+  a spawn the hub performs the MCP `initialize` handshake once, caches the
+  result, and answers every client's `initialize` from the cache (a client's
+  `notifications/initialized` is not forwarded). This is what lets a crashed
+  server be respawned without any client noticing it was never initialised.
+  Consequence: the upstream sees no per-client capabilities (roots, sampling,
+  elicitation); the 2026-07-28 spec deprecates roots and sampling anyway.
+- **Failures are answered, not dropped.** If a server dies while a request is
+  in flight, that request gets a JSON-RPC error (`-32000`) with the client's own
+  id and the connection stays open; a request that arrives while the server is
+  down fails fast the same way. Requests are never replayed automatically:
+  a tool call may have had side effects.
+- **Automatic restart.** An unexpected exit is followed by a restart after
+  1 s, 2 s, 4 s … (cap 60 s, ±20 % jitter). The status shows `restarting`.
+  After `restartMaxAttempts` restarts inside `restartWindow` the server stays
+  `crashed` (circuit open) until you press Start. Start and Stop override a
+  pending restart; a deliberate stop is never restarted.
+- **Health ping.** Every `healthInterval` seconds the hub sends a `ping`. After
+  `healthFailures` unanswered pings in a row the server is terminated and the
+  restart policy applies. Pings are skipped while client requests are in
+  flight, since a busy single-threaded server answers late without being hung.
+- **Per-session routing.** `progressToken` and `notifications/cancelled` are
+  remapped, progress goes only to the session that asked for it, and a
+  server-initiated request (roots/sampling) goes to the session owning the
+  oldest in-flight request, or is refused with an error when none could answer.
+  A server `ping` is answered by the hub itself.
 
 ### Rizzo Flow / Jev (built-in)
 
@@ -601,6 +640,14 @@ requires a click and a warning instead of running unattended.
 - The hub refuses to bind anywhere other than `127.0.0.1`/`localhost`
   unless `hub.authToken` is set — enforced at startup, not just suggested
   in the GUI.
+- Up to 1.1.2 `hub.authToken` was **not checked on requests**, and the
+  management API (which can add and start any command) had no `Origin`/`Host`
+  check, so a web page could in principle have driven a hub reachable on
+  localhost. Since this version every request is checked: `Host` and `Origin`
+  allow-lists always, the bearer token when one is set, and management
+  routes that carry a body must be `application/json`. If you ran an older
+  version on a machine where you browse untrusted pages, review the servers in
+  `config.json`.
 - Every log line (hub log, per-server ring buffers, the management API's
   `/api/servers/{name}/logs`) redacts the value of any env/config key
   matching `TOKEN|SECRET|PASS|KEY|AUTH` (case-insensitive) before it's

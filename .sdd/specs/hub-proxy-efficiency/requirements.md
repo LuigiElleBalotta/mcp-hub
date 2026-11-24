@@ -11,7 +11,7 @@ supergateway and mcp-proxy (Streamable HTTP, tool filtering/prefix) and the
 MCP spec 2025-11-25 (SSE deprecated in favour of Streamable HTTP). Today the
 hub spawns every enabled server at startup and keeps it forever, offers only
 `exclusive`/`parallel`, speaks only SSE, and its self-update drops every
-connection. Installed `mcp` SDK is 1.28.1, which ships
+connection. Project venv `mcp` is 2.2.0 (not the system 1.28.1; its latest protocol version 2026-07-28 has no `initialize`, the hub handshakes with `LATEST_HANDSHAKE_VERSION`), which ships
 `mcp.server.streamable_http`.
 
 ## Requirements

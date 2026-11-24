@@ -4,7 +4,7 @@ version = "1.1.2"
 description = "Shared local hub for MCP servers, one process instead of one per Claude Code session"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=2.2.0",
     "starlette>=0.37",
     "uvicorn>=0.29",
     "httpx>=0.27",

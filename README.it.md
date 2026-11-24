@@ -217,7 +217,9 @@ contengono gli stessi segreti della config: trattali allo stesso modo.
 |-----------------------|---------------|---------|
 | `host`               | `127.0.0.1`   | Indirizzo di bind. Qualsiasi cosa diversa da `127.0.0.1`/`localhost` viene rifiutata all'avvio a meno che `authToken` non sia impostato. |
 | `port`               | `37450`       | Porta di bind. |
-| `authToken`          | `null`        | Obbligatorio se `host` non è localhost. Non ancora applicato sulle singole richieste — solo restrizione di binding. |
+| `authToken`          | `null`        | Token bearer. Obbligatorio se `host` non è localhost. Se impostato, **ogni** route (MCP e API di gestione) risponde `401` senza `Authorization: Bearer <token>`. `apply` lo scrive nella config dei client; anche la GUI lo invia (e lo rilegge dopo che l'hub riparte con un token nuovo). Il dialog Settings ha il pulsante "Genera" per un token casuale. |
+| `allowedHosts`       | `[]`          | Valori di `Host` extra accettati oltre a `127.0.0.1`, `localhost`, `[::1]` e `host` (ognuno con la porta). Una richiesta con un altro `Host` riceve `403` (protezione DNS-rebinding). Un hub in bind su `0.0.0.0`/`::`, oppure `["*"]`, salta questo controllo. Omesso da `config.json` finché è vuoto. |
+| `allowedOrigins`     | `[]`          | `Origin` extra accettati. Una richiesta con un `Origin` che non è quello dell'hub riceve `403`, così una pagina web non può pilotare l'hub; i client senza `Origin` (Claude Code, la GUI, `curl`) non sono toccati. |
 | `autostart`          | `false`       | Flag informativo rispecchiato dalla checkbox "Avvia con Windows" della GUI, che registra/rimuove una voce di Windows Task Scheduler (vedi sotto). |
 | `checkForUpdates`    | `true`        | La GUI controlla GitHub Releases per una versione più recente all'avvio e mostra un banner se esiste. Non scarica o installa mai nulla senza un click esplicito su "Installa e riavvia" (vedi [Auto-update](#auto-update)). |
 | `includeBetaUpdates` | `false`       | Se `true`, il controllo aggiornamenti considera anche i tag beta (prerelease), non solo le release stabili. |
@@ -231,6 +233,45 @@ contengono gli stessi segreti della config: trattali allo stesso modo.
 | `args`        | Lista di argomenti passata a `command`. |
 | `env`         | Variabili d'ambiente extra, unite sopra l'ambiente del processo hub stesso (così `PATH` ecc. sono preservate). Qualsiasi chiave che corrisponde a `TOKEN\|SECRET\|PASS\|KEY\|AUTH` (case-insensitive) è oscurata (`***`) ovunque venga loggata o restituita dall'API — mai oscurata nel file di config stesso, dato che l'hub ha bisogno dei valori reali per avviare il processo. |
 | `concurrency` | `"exclusive"` (default, serializza ogni richiesta a questo server dietro un `asyncio.Lock`) oppure `"parallel"` (nessuna serializzazione). Usa `"exclusive"` per tutto ciò che non gestisce chiamate sovrapposte (es. una sessione browser stateful); `"parallel"` per strumenti stateless/di sola lettura. |
+| `restart`     | `"on-failure"` (default) oppure `"never"`. Cosa fare quando il processo termina senza che l'hub lo abbia chiesto (vedi [Affidabilità](#affidabilità)). |
+| `restartMaxAttempts` | Default `5`. Riavvii consentiti dentro `restartWindow` prima che il server resti `crashed` finché non lo avvii a mano. |
+| `restartWindow` | Default `300` (secondi). I riavvii più vecchi vengono dimenticati, così un server che poi ha girato stabile riparte con un budget nuovo. |
+| `healthInterval` | Default `30` (secondi, `0` = spento). Ogni quanto l'hub fa il ping al server. |
+| `healthFailures` | Default `3`. Ping senza risposta di fila prima che il server sia considerato bloccato e terminato. |
+
+I campi `restart*`/`health*` non compaiono in `config.json` finché hanno il
+valore di default, così una voce non toccata mantiene la forma originale.
+
+### Affidabilità
+
+- **L'hub inizializza i server da solo.** Alla prima richiesta di un client dopo
+  uno spawn l'hub esegue una volta l'handshake MCP `initialize`, ne tiene il
+  risultato e risponde all'`initialize` di ogni client dalla cache (la
+  `notifications/initialized` di un client non viene inoltrata). Così un
+  server caduto si riavvia senza che nessun client si accorga che non era mai
+  stato inizializzato. Conseguenza: l'upstream non vede le capability dei
+  singoli client (roots, sampling, elicitation); la spec 2026-07-28 depreca
+  comunque roots e sampling.
+- **I guasti ricevono una risposta.** Se un server muore con una richiesta in
+  corso, quella richiesta riceve un errore JSON-RPC (`-32000`) con l'id del
+  client e la connessione resta aperta; una richiesta che arriva mentre il
+  server è giù fallisce subito allo stesso modo. Le richieste non vengono mai
+  rieseguite in automatico: una chiamata a un tool può aver avuto effetti.
+- **Riavvio automatico.** A un'uscita inattesa segue un riavvio dopo 1 s, 2 s,
+  4 s … (tetto 60 s, ±20 % di jitter). Lo stato mostra `restarting`. Dopo
+  `restartMaxAttempts` riavvii dentro `restartWindow` il server resta
+  `crashed` (circuito aperto) finché non premi Start. Start e Stop prevalgono
+  su un riavvio in attesa; uno stop voluto non viene mai riavviato.
+- **Ping di salute.** Ogni `healthInterval` secondi l'hub invia un `ping`. Dopo
+  `healthFailures` ping senza risposta di fila il server viene terminato e si
+  applica la politica di riavvio. I ping vengono saltati mentre ci sono
+  richieste client in corso: un server single-thread occupato risponde in
+  ritardo senza essere bloccato.
+- **Routing per sessione.** `progressToken` e `notifications/cancelled` sono
+  rimappati, il progress va solo alla sessione che l'ha chiesto, e una
+  richiesta iniziata dal server (roots/sampling) va alla sessione che possiede
+  la richiesta in corso più vecchia, oppure viene rifiutata con un errore se
+  nessuna potrebbe rispondere. Un `ping` del server lo risponde l'hub stesso.
 
 ### Rizzo Flow / Jev (integrato)
 
@@ -591,6 +632,14 @@ richiede un click e un avviso invece di girare senza supervisione.
 - L'hub rifiuta di fare bind su qualsiasi cosa diversa da
   `127.0.0.1`/`localhost` a meno che `hub.authToken` non sia impostato —
   applicato all'avvio, non solo suggerito nella GUI.
+- Fino alla 1.1.2 `hub.authToken` **non veniva controllato sulle richieste**, e
+  l'API di gestione (che può aggiungere e avviare qualsiasi comando) non
+  controllava `Origin`/`Host`, quindi una pagina web avrebbe in teoria potuto
+  pilotare un hub raggiungibile su localhost. Da questa versione ogni richiesta
+  è controllata: sempre le liste di `Host` e `Origin` consentiti, il token
+  bearer se impostato, e le route di gestione con un body devono essere
+  `application/json`. Se hai usato una versione precedente su una macchina dove
+  navighi su pagine non fidate, rivedi i server in `config.json`.
 - Ogni riga di log (log dell'hub, buffer circolari per server, l'endpoint
   `/api/servers/{name}/logs` dell'API di gestione) oscura il valore di
   qualsiasi chiave env/config che corrisponde a
