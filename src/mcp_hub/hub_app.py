@@ -17,6 +17,10 @@ from mcp_hub.manager import HubManager, ManagedServer
 from mcp_hub.security import HubSecurityMiddleware
 
 
+# JSON-RPC "server error" range (-32000..-32099): the managed server is down.
+SERVER_UNAVAILABLE_CODE = -32000
+
+
 def _mount_for(name: str, manager: HubManager) -> Mount:
     managed = manager.get(name)
     # Endpoint is relative to THIS mount's root_path (Starlette sets it from
@@ -200,8 +204,15 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             # delivery leg (see comment above `deliver` below).
             dispatch_done_logged = False
             try:
-                managed.process.stdin.write((payload_text + "\n").encode("utf-8"))
-                await managed.process.stdin.drain()
+                try:
+                    managed.process.stdin.write((payload_text + "\n").encode("utf-8"))
+                    await managed.process.stdin.drain()
+                except (ConnectionError, OSError) as exc:
+                    # asyncio's own text here ("Connection lost") names no
+                    # server; the client gets this answer, so make it useful.
+                    raise ConnectionError(
+                        f"managed server {managed.name!r} subprocess is not accepting requests ({exc})"
+                    ) from exc
                 if fut is not None:
                     response_obj = await fut
                     # Logged BEFORE `deliver(...)`: `deliver` hands the
@@ -231,8 +242,33 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             finally:
                 if fut is not None:
                     managed.pending.pop(hub_id, None)
+                    # `_reject_pending` may have failed this future while the
+                    # stdin write above was already raising, so nothing ever
+                    # awaits it: mark its exception as retrieved, otherwise
+                    # asyncio logs "Future exception was never retrieved".
+                    if fut.done() and not fut.cancelled():
+                        fut.exception()
 
-        await managed.guard.run(write_and_maybe_wait)
+        try:
+            await managed.guard.run(write_and_maybe_wait)
+        except ConnectionError as exc:
+            # hub-proxy-hardening R2: the upstream is gone (exited with this
+            # request in flight, a stdin write hit a dead pipe, or it was
+            # already down on arrival). Answer THIS request with a JSON-RPC
+            # error carrying the client's own id instead of letting the
+            # exception escape into the connection's task group, which would
+            # tear down the whole SSE session and every other request on it.
+            # Never replayed: a tool call may have had side effects.
+            managed.append_log(f"[hub] request {client_id!r} failed: {exc}")
+            if is_request:
+                try:
+                    await deliver({
+                        "jsonrpc": "2.0",
+                        "id": client_id,
+                        "error": {"code": SERVER_UNAVAILABLE_CODE, "message": str(exc)},
+                    })
+                except Exception:
+                    pass  # the client is gone too; nobody left to tell
 
     managed.subscribers.add(deliver)
     managed.ensure_stdout_reader()

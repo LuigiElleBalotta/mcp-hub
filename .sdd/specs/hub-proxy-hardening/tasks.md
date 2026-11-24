@@ -7,7 +7,7 @@
   - Failure-answer and progress-crossing hypotheses are reproduced as failing tests at the start of tasks 3 and 4 (test first), not as scripts.
 - [x] 2. Security: `security.py` middleware, config fields, token/Origin/Host/Content-Type tests, GUI api_client / apply / self-update send the token
   - Done: `security.py`, `HubConfig.allowedHosts/allowedOrigins` (omitted from config.json when empty, unknown hub keys ignored on load), `HubApiClient` sends the bearer token and re-reads it from config.json on a 401. `apply` already wrote the Authorization header. A hub bound to 0.0.0.0/:: skips the Host check (token mandatory there); `allowedHosts: ["*"]` also skips it.
-- [ ] 3. Failure answers: JSON-RPC error with the original id, fast-fail while down, connection stays open
+- [x] 3. Failure answers: JSON-RPC error with the original id, fast-fail while down, connection stays open
 - [ ] 4. Session routing: `RequestTable`, progressToken remap, cancelled translation, server-initiated request routing
 - [ ] 5. Hub-owned handshake and initialize cache
 - [ ] 6. Auto-restart supervisor with backoff, circuit breaker, `restarting` status
