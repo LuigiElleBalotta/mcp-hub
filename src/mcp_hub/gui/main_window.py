@@ -32,6 +32,29 @@ def dashboard_cells(info: dict, is_service: bool) -> tuple[str, str, str]:
     )
 
 
+UPDATE_RECHECK_MS = 6 * 60 * 60 * 1000
+_SKIPPED_UPDATE_FILE = "skipped-update.txt"
+
+
+def skipped_update_version() -> str | None:
+    """The version the user chose to skip ("Salta questa versione"), if any."""
+    from mcp_hub.paths import data_dir
+    try:
+        return (data_dir() / _SKIPPED_UPDATE_FILE).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def skip_update_version(version: str) -> None:
+    from mcp_hub.paths import data_dir
+    try:
+        target = data_dir() / _SKIPPED_UPDATE_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(version, encoding="utf-8")
+    except OSError:
+        pass  # worst case the dialog is shown again
+
+
 _STATUS_COLOR = {
     "running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828",
     "starting": "#f9a825", "restarting": "#ef6c00", "idle": "#546e7a",
@@ -299,7 +322,12 @@ class MainWindow(QMainWindow):
         self._update_thread: _UpdateCheckWorker | None = None
         self._install_thread: _InstallUpdateWorker | None = None
         self._pending_update: UpdateInfo | None = None
+        self._offered_version: str | None = None  # asked about in THIS run: never twice
         self._check_for_updates()
+        # The GUI lives in the tray for days: look again every few hours, not only at start.
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._check_for_updates)
+        self._update_timer.start(UPDATE_RECHECK_MS)
 
     def _init_tray(self) -> None:
         icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
@@ -400,6 +428,36 @@ class MainWindow(QMainWindow):
         ) or self_update.brew_cask_installed()
         self.install_update_btn.setVisible(can_auto_install)
 
+        # Ask, once per version: the user answers "now", "later" or "skip this version".
+        # Never installs by itself. A hidden (tray) window still shows the dialog.
+        if can_auto_install and info.version != self._offered_version and info.version != skipped_update_version():
+            self._offered_version = info.version
+            QTimer.singleShot(0, self._offer_update)
+
+    def _offer_update(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        info = self._pending_update
+        if info is None:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Aggiornamento disponibile")
+        box.setText(f"E' disponibile mcp-hub {info.version}. Vuoi installarlo adesso?")
+        box.setInformativeText(
+            "L'hub viene riavviato: le sessioni dei client collegati perdono la "
+            "connessione per qualche secondo, poi tornano operative.")
+        install = box.addButton("Installa e riavvia", QMessageBox.ButtonRole.AcceptRole)
+        later = box.addButton("Più tardi", QMessageBox.ButtonRole.RejectRole)
+        skip = box.addButton("Salta questa versione", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(later)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is install:
+            self._start_install_update()
+        elif clicked is skip:
+            skip_update_version(info.version)
+        # "later" (or closing the box): the banner stays; the next GUI start asks again
+
     def _install_update(self) -> None:
         from PySide6.QtWidgets import QMessageBox
         if self._pending_update is None:
@@ -412,6 +470,12 @@ class MainWindow(QMainWindow):
             "operative con la nuova versione.\n\nContinuare?",
         )
         if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._start_install_update()
+
+    def _start_install_update(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        if self._pending_update is None:
             return
         try:
             hub_pid = self.client.pid()
