@@ -218,6 +218,8 @@ the config: treat the folder the same way.
 | `port`               | `37450`       | Bind port. |
 | `authToken`          | `null`        | Bearer token. Required if `host` is not localhost. When set, **every** route (MCP and management API) answers `401` without `Authorization: Bearer <token>`. `apply` writes it into the client config; the GUI sends it too (and re-reads it after the hub restarts with a new one). The Settings dialog has a "Genera" button for a random one. |
 | `allowedHosts`       | `[]`          | Extra `Host` header values accepted besides `127.0.0.1`, `localhost`, `[::1]` and `host` (each with the port). A request with another `Host` gets `403` (DNS-rebinding protection). A hub bound to `0.0.0.0`/`::`, or `["*"]`, skips this check. Omitted from `config.json` while empty. |
+| `preferredTransport` | `"sse"`       | Which endpoint `apply` writes into client configs: `"sse"` → `/<server>/sse` (exactly what it always wrote) or `"http"` → `/<server>/mcp` (Streamable HTTP, the transport that replaces SSE in the MCP spec). Omitted from `config.json` while default. |
+| `drainTimeout`       | `20`          | Seconds `/api/shutdown` (so the GUI's quit and self-update) waits for requests already in flight before the hub exits. `0` = don't wait. |
 | `allowedOrigins`     | `[]`          | Extra `Origin` values accepted. A request carrying an `Origin` that is not the hub's own gets `403`, so a web page cannot drive the hub; clients without an `Origin` (Claude Code, the GUI, `curl`) are unaffected. |
 | `autostart`          | `false`       | Informational flag mirrored by the GUI's "Avvia con Windows" checkbox, which registers/removes a Windows Task Scheduler entry (see below). |
 | `checkForUpdates`    | `true`        | GUI checks GitHub Releases for a newer version on startup and shows a banner if one exists. Never downloads or installs anything without an explicit click on "Installa e riavvia" (see [Auto-update](#auto-update)). |
@@ -237,6 +239,11 @@ the config: treat the folder the same way.
 | `restartWindow` | Default `300` (seconds). Restarts older than this are forgotten, so a server that then ran stably gets a fresh budget. |
 | `healthInterval` | Default `30` (seconds, `0` = off). How often the hub pings the server. |
 | `healthFailures` | Default `3`. Unanswered pings in a row before the server is considered unresponsive and terminated. |
+| `startMode`   | `"eager"` (default, started with the hub) or `"lazy"` (started by the first request the cache cannot answer). A lazy or idle-stopped server shows status `idle`. |
+| `idleTimeout` | Default `0` (never). Seconds without a client request after which the server is stopped; it restarts by itself on the next request. Never cuts a request in flight. |
+| `persistent`  | Default `false`. `true` = never stop it for idleness (it keeps state in memory). |
+| `toolsAllow` / `toolsDeny` | Glob patterns on the server's own tool names (`read_*`, `*delete*`). Empty allow = all; deny wins. See [Efficiency](#efficiency). |
+| `toolPrefix`  | Prefix put in front of every tool name the client sees (≤ 64 chars of letters, digits, `_`, `-`, `.`), stripped again on `tools/call`. |
 
 The `restart*`/`health*` fields are omitted from `config.json` while they have
 their default value, so an untouched entry keeps its original shape.
@@ -269,6 +276,44 @@ their default value, so an untouched entry keeps its original shape.
   server-initiated request (roots/sampling) goes to the session owning the
   oldest in-flight request, or is refused with an error when none could answer.
   A server `ping` is answered by the hub itself.
+
+### Efficiency
+
+- **`concurrency` has four modes.** `exclusive` (default) serialises requests;
+  `parallel` shares one process with no serialisation; `session-aware` is
+  `parallel` plus `params._meta["io.github.mcp-hub/sessionId"]` on every request, so a
+  server written to read it can keep per-client state (the key is this project's, not
+  part of MCP, so other servers just ignore it); `isolated` gives every client session
+  its own process, started on its first request and stopped when the session ends
+  (nothing is shared: not the cache, not the handshake; the table shows `isolated (n)`).
+  There is no automatic classification: you choose the mode.
+- **List cache.** `tools/list`, `prompts/list`, `resources/list` and
+  `resources/templates/list` are answered from memory once the server has answered
+  once, for every client, even while it restarts. Dropped on `*/list_changed` and when
+  the process is respawned; paginated requests (`cursor`) are never cached.
+- **Lazy start.** A `lazy` server answers `initialize` and its lists from
+  `%LOCALAPPDATA%\mcp-hub\cache\<name>.json` (keyed by command line and env *names*)
+  without being spawned; it starts when a request really needs it. A deliberate Stop,
+  or a crash with `restart: "never"`, is not undone by a request.
+- **Two transports.** Every server is served at `/<name>/sse` (legacy) and
+  `/<name>/mcp` (Streamable HTTP). The token and Origin/Host checks apply to both.
+  Streamable sessions live in memory: after a hub restart an old session id gets `404`
+  and the client initialises a new one. Claude Code 2.1.331 was verified against
+  `/mcp` with a bearer header, against `/sse` as `type: "http"` (what `apply` has always
+  written) and as `type: "sse"`.
+- **Tool filters.** `toolsAllow`/`toolsDeny`/`toolPrefix` shape what a client sees and
+  may call. Hidden tools vanish from `tools/list` (every page) and calling one is
+  refused with `-32602` without reaching the server. The cache keeps the raw list, so
+  changing a filter needs no refetch. Only tools are filtered, not prompts or resources.
+- **Draining.** `POST /api/drain {"timeout": s}` refuses new MCP traffic (`503` +
+  `Retry-After`), waits for requests in flight and reports `{drained, inFlight}`;
+  `DELETE /api/drain` resumes. `POST /api/shutdown` replies at once and does the same
+  for `drainTimeout` seconds before the hub exits. A client's follow-up request on an
+  existing session during a drain also gets `503`, so some clients wait until the hub
+  exits and they reconnect.
+- **Connected clients survive configuration changes.** Adding, editing or removing
+  *another* server used to leave every connected SSE client without a session (it hung);
+  transports are now kept per server across route rebuilds.
 
 ### Rizzo Flow / Jev (built-in)
 

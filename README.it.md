@@ -219,6 +219,8 @@ contengono gli stessi segreti della config: trattali allo stesso modo.
 | `port`               | `37450`       | Porta di bind. |
 | `authToken`          | `null`        | Token bearer. Obbligatorio se `host` non è localhost. Se impostato, **ogni** route (MCP e API di gestione) risponde `401` senza `Authorization: Bearer <token>`. `apply` lo scrive nella config dei client; anche la GUI lo invia (e lo rilegge dopo che l'hub riparte con un token nuovo). Il dialog Settings ha il pulsante "Genera" per un token casuale. |
 | `allowedHosts`       | `[]`          | Valori di `Host` extra accettati oltre a `127.0.0.1`, `localhost`, `[::1]` e `host` (ognuno con la porta). Una richiesta con un altro `Host` riceve `403` (protezione DNS-rebinding). Un hub in bind su `0.0.0.0`/`::`, oppure `["*"]`, salta questo controllo. Omesso da `config.json` finché è vuoto. |
+| `preferredTransport` | `"sse"`       | Quale endpoint scrive `apply` nella config dei client: `"sse"` → `/<server>/sse` (esattamente quello che ha sempre scritto) oppure `"http"` → `/<server>/mcp` (Streamable HTTP, il trasporto che nella spec MCP sostituisce SSE). Omesso da `config.json` finché è il default. |
+| `drainTimeout`       | `20`          | Secondi che `/api/shutdown` (quindi la chiusura dalla GUI e l'auto-update) aspetta le richieste già in corso prima che l'hub esca. `0` = non aspettare. |
 | `allowedOrigins`     | `[]`          | `Origin` extra accettati. Una richiesta con un `Origin` che non è quello dell'hub riceve `403`, così una pagina web non può pilotare l'hub; i client senza `Origin` (Claude Code, la GUI, `curl`) non sono toccati. |
 | `autostart`          | `false`       | Flag informativo rispecchiato dalla checkbox "Avvia con Windows" della GUI, che registra/rimuove una voce di Windows Task Scheduler (vedi sotto). |
 | `checkForUpdates`    | `true`        | La GUI controlla GitHub Releases per una versione più recente all'avvio e mostra un banner se esiste. Non scarica o installa mai nulla senza un click esplicito su "Installa e riavvia" (vedi [Auto-update](#auto-update)). |
@@ -238,6 +240,11 @@ contengono gli stessi segreti della config: trattali allo stesso modo.
 | `restartWindow` | Default `300` (secondi). I riavvii più vecchi vengono dimenticati, così un server che poi ha girato stabile riparte con un budget nuovo. |
 | `healthInterval` | Default `30` (secondi, `0` = spento). Ogni quanto l'hub fa il ping al server. |
 | `healthFailures` | Default `3`. Ping senza risposta di fila prima che il server sia considerato bloccato e terminato. |
+| `startMode`   | `"eager"` (default, avviato con l'hub) oppure `"lazy"` (avviato dalla prima richiesta che la cache non sa soddisfare). Un server lazy o fermato per inattività ha stato `idle`. |
+| `idleTimeout` | Default `0` (mai). Secondi senza richieste dei client dopo i quali il server viene fermato; riparte da solo alla richiesta successiva. Non interrompe mai una richiesta in corso. |
+| `persistent`  | Default `false`. `true` = non fermarlo mai per inattività (tiene stato in memoria). |
+| `toolsAllow` / `toolsDeny` | Pattern glob sui nomi dei tool del server (`read_*`, `*delete*`). Allow vuoto = tutti; deny vince. Vedi [Efficienza](#efficienza). |
+| `toolPrefix`  | Prefisso davanti a ogni nome di tool visto dal client (≤ 64 caratteri tra lettere, cifre, `_`, `-`, `.`), tolto di nuovo su `tools/call`. |
 
 I campi `restart*`/`health*` non compaiono in `config.json` finché hanno il
 valore di default, così una voce non toccata mantiene la forma originale.
@@ -272,6 +279,48 @@ valore di default, così una voce non toccata mantiene la forma originale.
   richiesta iniziata dal server (roots/sampling) va alla sessione che possiede
   la richiesta in corso più vecchia, oppure viene rifiutata con un errore se
   nessuna potrebbe rispondere. Un `ping` del server lo risponde l'hub stesso.
+
+### Efficienza
+
+- **`concurrency` ha quattro modalità.** `exclusive` (default) serializza le
+  richieste; `parallel` condivide un processo senza serializzare; `session-aware` è
+  `parallel` più `params._meta["io.github.mcp-hub/sessionId"]` su ogni richiesta, così
+  un server scritto per leggerlo può tenere stato per client (la chiave è di questo
+  progetto, non fa parte di MCP: gli altri server la ignorano); `isolated` dà a ogni
+  sessione client un processo suo, avviato alla prima richiesta e fermato quando la
+  sessione finisce (non si condivide nulla: né cache né handshake; la tabella mostra
+  `isolated (n)`). Non c'è classificazione automatica: la modalità la scegli tu.
+- **Cache delle liste.** `tools/list`, `prompts/list`, `resources/list` e
+  `resources/templates/list` sono servite dalla memoria dopo la prima risposta del
+  server, per tutti i client, anche mentre si riavvia. Si svuotano su `*/list_changed`
+  e quando il processo viene rilanciato; le richieste paginate (`cursor`) non si
+  cachano mai.
+- **Avvio lazy.** Un server `lazy` risponde a `initialize` e alle liste da
+  `%LOCALAPPDATA%\mcp-hub\cache\<nome>.json` (chiave: riga di comando e *nomi* delle
+  variabili env) senza essere avviato; parte quando una richiesta ne ha davvero
+  bisogno. Uno Stop voluto, o un crash con `restart: "never"`, non viene annullato da
+  una richiesta.
+- **Due trasporti.** Ogni server è servito su `/<nome>/sse` (legacy) e `/<nome>/mcp`
+  (Streamable HTTP). Token e controlli Origin/Host valgono per entrambi. Le sessioni
+  Streamable vivono in memoria: dopo il riavvio dell'hub un vecchio id di sessione
+  riceve `404` e il client ne inizializza una nuova. Claude Code 2.1.331 è stato
+  verificato su `/mcp` con header bearer, su `/sse` come `type: "http"` (quello che
+  `apply` ha sempre scritto) e come `type: "sse"`.
+- **Filtri sui tool.** `toolsAllow`/`toolsDeny`/`toolPrefix` decidono cosa un client
+  vede e può chiamare. I tool nascosti spariscono da `tools/list` (ogni pagina) e
+  chiamarne uno viene rifiutato con `-32602` senza arrivare al server. La cache tiene
+  l'elenco grezzo, quindi cambiare un filtro non richiede un nuovo recupero. Si
+  filtrano solo i tool, non prompt e risorse.
+- **Drain.** `POST /api/drain {"timeout": s}` rifiuta nuovo traffico MCP (`503` +
+  `Retry-After`), aspetta le richieste in corso e risponde `{drained, inFlight}`;
+  `DELETE /api/drain` riprende. `POST /api/shutdown` risponde subito e fa lo stesso per
+  `drainTimeout` secondi prima che l'hub esca. Anche una richiesta successiva di un
+  client su una sessione esistente riceve `503` durante il drain, quindi alcuni client
+  aspettano finché l'hub esce e si riconnettono.
+- **I client connessi sopravvivono ai cambi di configurazione.** Aggiungere,
+  modificare o rimuovere *un altro* server lasciava ogni client SSE connesso senza
+  sessione (restava appeso); i trasporti ora restano per server tra un rebuild delle
+  route e l'altro.
 
 ### Rizzo Flow / Jev (integrato)
 
