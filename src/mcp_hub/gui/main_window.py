@@ -13,7 +13,10 @@ from PySide6.QtWidgets import (
 from mcp_hub.gui.api_client import HubApiClient
 from mcp_hub.updater import UpdateInfo, check_for_update
 
-_STATUS_COLOR = {"running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828", "starting": "#f9a825"}
+_STATUS_COLOR = {
+    "running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828",
+    "starting": "#f9a825", "restarting": "#ef6c00", "idle": "#546e7a",
+}
 
 
 class _UpdateCheckWorker(QThread):
@@ -136,7 +139,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         import mcp_hub
         self.setWindowTitle(f"mcp-hub v{mcp_hub.__version__}")
-        self.client = client or HubApiClient()
+        self.client = client or HubApiClient.from_config()
 
         self.setMinimumSize(480, 320)
 
@@ -450,6 +453,8 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 1, QTableWidgetItem("Service" if is_service else "MCP"))
             status_item = QTableWidgetItem(status)
             status_item.setForeground(QColor(_STATUS_COLOR.get(status, "#000000")))
+            if info.get("restarts"):
+                status_item.setToolTip(f"Riavviato automaticamente {info['restarts']} volte dall'avvio dell'hub")
             self.table.setItem(row, 2, status_item)
             # A service has no concurrency mode and no SSE endpoint: show its
             # port instead. MCP servers keep showing their concurrency.
@@ -458,6 +463,8 @@ class MainWindow(QMainWindow):
                 details = f"HTTP :{port}" if port is not None else "process"
             else:
                 details = info["concurrency"]
+                if info.get("sessions") is not None:  # an isolated server: one process per session
+                    details = f"{details} ({info['sessions']})"
             self.table.setItem(row, 3, QTableWidgetItem(details))
 
             actions = QWidget()
@@ -466,8 +473,12 @@ class MainWindow(QMainWindow):
             start_btn = QPushButton("Start")
             stop_btn = QPushButton("Stop")
             busy = name in self._busy
-            start_btn.setEnabled(not busy and status in ("stopped", "crashed"))
-            stop_btn.setEnabled(not busy and status in ("starting", "running"))
+            # "idle" (lazy / idle-stopped) starts by itself when asked, but Start brings it
+            # up now. An isolated server has no shared process to start.
+            isolated = info.get("concurrency") == "isolated" and not is_service
+            start_btn.setEnabled(not busy and not isolated and status in ("stopped", "crashed", "idle"))
+            # "restarting": Stop cancels the pending automatic restart.
+            stop_btn.setEnabled(not busy and status in ("starting", "running", "restarting"))
             edit_btn = QPushButton("Edit")
             remove_btn = QPushButton("Remove")
             start_btn.clicked.connect(lambda _, n=name: self._start(n))

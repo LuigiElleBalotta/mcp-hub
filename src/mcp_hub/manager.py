@@ -5,11 +5,13 @@ import collections
 import itertools
 import json
 import os
+import random
 import re
 import shutil
 import socket
+import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Literal
 
 import psutil
@@ -17,12 +19,15 @@ import psutil
 from pathlib import Path
 
 from mcp_hub.config import BUILTIN_RIZZO, Config, RizzoSettings, ServerConfig, load_config
+from mcp_hub.cache import DiskCache, ListCache, cache_key
 from mcp_hub.concurrency import ConcurrencyGuard
+from mcp_hub.paths import data_dir
+from mcp_hub.session import RequestTable
 
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
 
-Status = Literal["stopped", "starting", "running", "crashed"]
+Status = Literal["stopped", "starting", "running", "restarting", "idle", "crashed"]
 
 # Default asyncio.StreamReader line-length limit is 64 KiB (65536), which
 # raises ValueError out of readline()/`async for` iteration on any single
@@ -31,6 +36,19 @@ Status = Literal["stopped", "starting", "running", "crashed"]
 # though the small stats payloads used in earlier manual testing never did.
 # 10 MiB is comfortably above any response this hub is expected to proxy.
 _STDOUT_LIMIT = 10 * 1024 * 1024
+
+# How long the hub waits for an upstream's answer to its own `initialize`.
+# Generous on purpose: `npx`/`uvx` servers may download packages on first run.
+HANDSHAKE_TIMEOUT = 120.0
+
+# Automatic restart backoff (hub-proxy-hardening R5): the n-th consecutive
+# attempt waits BASE * 2**n seconds, capped, with +/-20% jitter so several
+# servers that died together do not all respawn in the same instant.
+RESTART_BASE_DELAY = 1.0
+
+# How long a hub ping may stay unanswered before it counts as a failure.
+HEALTH_PING_TIMEOUT = 10.0
+RESTART_MAX_DELAY = 60.0
 
 
 def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -54,7 +72,7 @@ def _redact_line(line: str) -> str:
     return _KV_SECRET_RE.sub(_sub, line)
 
 
-@dataclass
+@dataclass(eq=False)  # identity equality: instances live in sets (isolated children)
 class ManagedServer:
     name: str
     config: ServerConfig
@@ -62,6 +80,13 @@ class ManagedServer:
     process: asyncio.subprocess.Process | None = None
     guard: ConcurrencyGuard = field(init=False)
     logs: collections.deque = field(default_factory=lambda: collections.deque(maxlen=500))
+    # Where a lazy server keeps its on-disk cache (default: <data dir>/cache).
+    cache_dir: Path | None = None
+    # False for a per-session child of an `isolated` server: it must not read or
+    # write the shared on-disk cache.
+    use_disk_cache: bool = True
+    # The `isolated` server this process serves a session for (None otherwise).
+    parent: "ManagedServer | None" = None
     # `pending`/`subscribers`/`_reader_task` back the single shared stdout
     # reader below (see `ensure_stdout_reader`/`_read_stdout`): exactly one
     # task consumes `process.stdout` per subprocess, no matter how many SSE
@@ -85,11 +110,152 @@ class ManagedServer:
     _stopping: bool = field(default=False, init=False, repr=False)
     _health_task: asyncio.Task | None = field(default=None, init=False, repr=False)
 
+    # Which session owns which in-flight request / progress token (see
+    # session.py): routes progress and server-initiated requests to the right
+    # client instead of broadcasting them to every connection.
+    table: RequestTable = field(init=False, repr=False)
+    # Answers to tools/list & co, served to every client without asking the
+    # upstream again (hub-proxy-efficiency R1). Dropped on `*/list_changed`
+    # and whenever the process is respawned.
+    cache: ListCache = field(default_factory=ListCache, init=False, repr=False)
+    # Hub-owned MCP handshake (hub-proxy-hardening R4): the upstream is
+    # initialised once per spawn by the hub itself and the result is cached;
+    # clients' own `initialize` is answered from it, never forwarded.
+    # `_ready_process` is the subprocess object the handshake completed for, so
+    # a respawn (a new object) is detected without any reset bookkeeping.
+    initialize_result: dict | None = field(default=None, init=False, repr=False)
+    _ready_process: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
+    _handshake_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _handshake_for: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
+    # Auto-restart supervision (see `_schedule_restart`): monotonic times of
+    # the restarts inside the current window, the pending backoff task, and
+    # the running total shown by the status snapshot.
+    _restart_times: collections.deque = field(default_factory=collections.deque, init=False, repr=False)
+    _restart_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    restart_count: int = field(default=0, init=False)
+    _ping_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    # Lazy start / idle shutdown (hub-proxy-efficiency R2).
+    disk_cache: DiskCache | None = field(default=None, init=False, repr=False)
+    _spawn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _last_activity: float = field(default_factory=time.monotonic, init=False, repr=False)
+    _idle_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    # `isolated` mode: the live per-session upstreams of this server.
+    children: set = field(default_factory=set, init=False, repr=False)
+    _child_ids: itertools.count = field(default_factory=lambda: itertools.count(1), init=False, repr=False)
+
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
+        self.table = RequestTable(self.name)
+        lazy = self.config.startMode == "lazy"
+        if not self.config.is_service and (lazy or self.config.concurrency == "isolated"):
+            if lazy and self.use_disk_cache and self.config.concurrency != "isolated":
+                self._load_disk_cache()
+            if self.status == "stopped":
+                self.status = "idle"  # not "stopped": it starts by itself when asked
+
+    def _load_disk_cache(self) -> None:
+        """A lazy server can answer initialize and its lists from the previous
+        run's files before it is ever spawned."""
+        directory = self.cache_dir or (data_dir() / "cache")
+        cfg = self.config
+        self.disk_cache = DiskCache(directory, self.name, cache_key(cfg.command, cfg.args, list(cfg.env)))
+        loaded = self.disk_cache.load()
+        if loaded is not None:
+            self.initialize_result = loaded["initialize"]
+            self.cache.load(loaded["lists"])
+
+    def persist_cache(self) -> None:
+        if self.disk_cache is not None:
+            self.disk_cache.save(self.initialize_result, self.cache.snapshot())
+
+    def touch(self) -> None:
+        """Records client activity for the idle watcher."""
+        self._last_activity = time.monotonic()
+
+    async def ensure_running(self) -> None:
+        """Spawns an `idle` server (lazy, or stopped by the idle watcher) on
+        demand. One spawn however many requests arrive at once; any other
+        status is left as it is (a deliberate stop or a crash is not undone).
+        Raises ConnectionError if the process cannot be started."""
+        if self.status != "idle" and not self._spawn_lock.locked():
+            return
+        # A spawn in progress shows as "starting": wait for it (the lock) instead
+        # of racing ahead to a process that does not exist yet.
+        async with self._spawn_lock:
+            if self.status != "idle":
+                return  # someone else spawned it while we waited
+            self._stopping = False
+            try:
+                await self._spawn()
+            except OSError as exc:
+                raise ConnectionError(f"managed server {self.name!r} failed to start: {exc}") from exc
+            self.touch()
+
+    def _start_idle_watch(self, process: asyncio.subprocess.Process) -> None:
+        self._cancel_idle_watch()
+        if self.config.idleTimeout > 0 and not self.config.persistent:
+            self._idle_task = asyncio.create_task(self._idle_loop(process))
+            self._idle_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+    def _cancel_idle_watch(self) -> None:
+        task, self._idle_task = self._idle_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _idle_loop(self, process: asyncio.subprocess.Process) -> None:
+        """Stops the upstream after `idleTimeout` seconds without a client
+        request, but never with one in flight (that is the drain: nothing is
+        cut off). The next request respawns it through `ensure_running`."""
+        timeout = self.config.idleTimeout
+        while process is self.process and process.returncode is None and not self._stopping:
+            await asyncio.sleep(max(0.02, min(timeout / 2, 5.0)))
+            if process is not self.process or self._stopping:
+                return
+            if len(self.table) > 0 or time.monotonic() - self._last_activity < timeout:
+                continue
+            async with self._spawn_lock:  # a racing request waits for the stop, then respawns
+                if process is not self.process or self._stopping or len(self.table) > 0:
+                    continue
+                self.append_log(f"[hub] {self.name} idle for {timeout:g}s: stopping it (it restarts on demand)")
+                self._stopping = True  # so `_watch` does not call this exit a crash
+                self.status = "idle"
+                self._ready_process = None
+                self._cancel_ping_loop()
+                await self._terminate_process_tree(process)
+            return
 
     def append_log(self, line: str) -> None:
         self.logs.append(_redact_line(line))
+        if self.parent is not None:  # a session's upstream logs where the GUI shows the server's logs
+            self.parent.append_log(f"[{self.name}] {line}")
+
+    @property
+    def is_isolated(self) -> bool:
+        return self.config.concurrency == "isolated" and not self.config.is_service
+
+    def session_upstream(self) -> "ManagedServer":
+        """The upstream a newly connected client session talks to: this server
+        itself, or for an `isolated` server a private process (spawned on the
+        session's first request) that nobody else shares - not its cache, its
+        request ids, nor its state. Pair with `release_session_upstream`."""
+        if not self.is_isolated:
+            return self
+        child = ManagedServer(
+            f"{self.name}#{next(self._child_ids)}",
+            replace(self.config, concurrency="parallel", startMode="lazy"),
+            use_disk_cache=False,
+            parent=self,
+        )
+        self.children.add(child)
+        return child
+
+    async def release_session_upstream(self, upstream: "ManagedServer") -> None:
+        """Ends a session's use of `upstream`: an isolated session's private
+        process is stopped (it dies with its session), a shared one is left."""
+        if upstream is self:
+            return
+        self.children.discard(upstream)
+        await upstream.stop()
 
     def next_request_id(self) -> str:
         """Returns a hub-generated JSON-RPC request id, unique for the
@@ -122,6 +288,8 @@ class ManagedServer:
         once per proxied connection (hub_app._proxy does), since only the
         first call actually starts anything.
         """
+        if self.process is None or self.process.stdout is None:
+            return  # nothing to read yet (lazy / idle server)
         if self._reader_task is None or self._reader_task.done():
             self._reader_task = asyncio.create_task(self._read_stdout())
 
@@ -181,6 +349,16 @@ class ManagedServer:
                     # unrelated client's connection and misattribute someone
                     # else's abandoned response to it.
                     continue
+                method = obj.get("method")
+                if method is not None and msg_id is None:
+                    if self.cache.invalidate_for_notification(method):  # then still broadcast below
+                        self.persist_cache()
+                if method == "notifications/progress":
+                    await self._route_progress(obj)
+                    continue
+                if method is not None and msg_id is not None:
+                    await self._route_server_request(obj)
+                    continue
                 for sub in list(self.subscribers):
                     try:
                         await sub(obj)
@@ -191,6 +369,141 @@ class ManagedServer:
                         pass
         finally:
             self._reject_pending()
+
+    async def hub_request(self, method: str, params: dict, timeout: float) -> dict:
+        """A request the HUB makes of the upstream (handshake, health ping),
+        not on behalf of any client: own hub id, no session, no guard.
+        Returns the JSON-RPC response object (`result` or `error`); raises
+        ConnectionError if the process is gone and TimeoutError on no answer."""
+        if self.process is None or self.process.stdin is None or self.process.returncode is not None:
+            raise ConnectionError(f"managed server {self.name!r} subprocess is not running")
+        self.ensure_stdout_reader()
+        hub_id = self.next_request_id()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.pending[hub_id] = fut
+        try:
+            try:
+                self.process.stdin.write(
+                    (json.dumps({"jsonrpc": "2.0", "id": hub_id, "method": method, "params": params}) + "\n").encode("utf-8")
+                )
+                await self.process.stdin.drain()
+            except (ConnectionError, OSError) as exc:
+                raise ConnectionError(
+                    f"managed server {self.name!r} subprocess is not accepting requests ({exc})"
+                ) from exc
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self.pending.pop(hub_id, None)
+            if fut.done() and not fut.cancelled():
+                fut.exception()  # mark retrieved (see hub_app's same note)
+
+    async def ensure_ready(self) -> None:
+        """Makes sure the CURRENT subprocess has been initialised by the hub.
+
+        The handshake runs once per spawn, shared by every caller (and
+        shielded, so a client that disconnects mid-handshake cannot abort it
+        for the others). Raises ConnectionError if the process is not running
+        or refuses to initialise; the next call tries again."""
+        process = self.process
+        if process is None or process.returncode is not None:
+            raise ConnectionError(f"managed server {self.name!r} subprocess is not running")
+        if self._ready_process is process:
+            return
+        task = self._handshake_task
+        if task is None or task.done() or self._handshake_for is not process:
+            self._handshake_for = process
+            task = self._handshake_task = asyncio.create_task(self._do_handshake(process))
+            # Nobody may be left awaiting it (all callers cancelled): retrieve
+            # the exception so asyncio does not log it as never retrieved.
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        await asyncio.shield(task)
+
+    async def _do_handshake(self, process: asyncio.subprocess.Process) -> None:
+        from mcp_types.version import LATEST_HANDSHAKE_VERSION
+
+        import mcp_hub
+
+        try:
+            response = await self.hub_request(
+                "initialize",
+                {
+                    "protocolVersion": LATEST_HANDSHAKE_VERSION,
+                    # The hub declares no client capabilities: roots/sampling/
+                    # elicitation belong to individual sessions, not to the
+                    # one shared connection.
+                    "capabilities": {},
+                    "clientInfo": {"name": "mcp-hub", "version": mcp_hub.__version__},
+                },
+                timeout=HANDSHAKE_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ConnectionError(
+                f"managed server {self.name!r} did not answer initialize within {HANDSHAKE_TIMEOUT:g}s"
+            ) from exc
+        if "result" not in response:
+            message = (response.get("error") or {}).get("message", "unknown error")
+            raise ConnectionError(f"managed server {self.name!r} refused initialize: {message}")
+        if process is not self.process:
+            return  # respawned meanwhile: this handshake belongs to a dead process
+        await self._write_to_upstream({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.initialize_result = response["result"]
+        self._ready_process = process
+        self._start_ping_loop(process)
+        self._start_idle_watch(process)
+        self.persist_cache()
+        self.append_log(f"[hub] initialized {self.name} (protocol {response['result'].get('protocolVersion')})")
+
+    async def _write_to_upstream(self, obj: dict) -> None:
+        """Best-effort single-line write to the subprocess's stdin."""
+        if self.process is None or self.process.stdin is None or self.process.returncode is not None:
+            return
+        try:
+            self.process.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+            await self.process.stdin.drain()
+        except (ConnectionError, OSError):
+            pass  # the process is going away; its reader handles the rest
+
+    async def _route_progress(self, obj: dict) -> None:
+        """`notifications/progress` goes only to the session that asked for it,
+        with that client's own token restored. A token with no owner belongs to
+        a request that already finished: dropped, never broadcast."""
+        params = obj.get("params") or {}
+        owner = self.table.progress_owner(params.get("progressToken"))
+        if owner is None:
+            return
+        session, original_token, client_request_id = owner
+        try:
+            await session.deliver(
+                {**obj, "params": {**params, "progressToken": original_token}},
+                related_request_id=client_request_id,
+            )
+        except Exception:
+            pass  # that session is mid-teardown; nobody else may see its progress
+
+    async def _route_server_request(self, obj: dict) -> None:
+        """A request the upstream makes of its client (roots/list, sampling,
+        elicitation, ping). Several sessions share this upstream, so it must
+        not be broadcast: the first answer would win and the rest would be
+        stray responses. `ping` is answered by the hub itself; anything else
+        goes to the session owning the oldest in-flight request, or is refused
+        with a JSON-RPC error when no session could plausibly answer."""
+        req_id = obj["id"]
+        if obj.get("method") == "ping":
+            await self._write_to_upstream({"jsonrpc": "2.0", "id": req_id, "result": {}})
+            return
+        oldest = self.table.oldest_request()
+        if oldest is not None:
+            session, client_request_id = oldest
+            try:
+                await session.deliver(obj, related_request_id=client_request_id)
+                return
+            except Exception:
+                pass  # fall through: refuse it rather than leave the server waiting
+        await self._write_to_upstream({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": "no client session available to handle this server request"},
+        })
 
     def _reject_pending(self) -> None:
         """Rejects every future still waiting in `self.pending` (subprocess
@@ -211,7 +524,27 @@ class ManagedServer:
         if self.config.is_service:
             await self._start_service()
             return
+        if self.is_isolated:
+            return  # no shared process: each client session spawns its own
+        # A manual start overrides any pending automatic restart and re-arms
+        # the circuit breaker (the operator is deliberately trying again).
+        self._cancel_restart()
+        self._restart_times.clear()
         self._stopping = False
+        await self._spawn()
+
+    async def _spawn(self) -> None:
+        """Spawns the MCP subprocess: a manual start or an automatic restart."""
+        # Whatever the previous process left behind is settled BEFORE the new one
+        # exists: its reader is stopped (a late EOF must not reject requests of
+        # the new process) and its in-flight requests are answered with errors.
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+        self._reject_pending()
+        self.initialize_result = None
+        self._ready_process = None
+        self.cache.clear()
+        self._cancel_ping_loop()
         self.status = "starting"
         # Merge with the parent's environment rather than replacing it: several
         # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
@@ -239,25 +572,78 @@ class ManagedServer:
         # back to the original string if not found, so a genuinely bad
         # command still fails the same way it did before.
         resolved_command = shutil.which(self.config.command) or self.config.command
-        self.process = await asyncio.create_subprocess_exec(
-            resolved_command, *self.config.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            limit=_STDOUT_LIMIT,
-        )
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                resolved_command, *self.config.args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                limit=_STDOUT_LIMIT,
+            )
+        except OSError as exc:
+            self.status = "crashed"
+            self.append_log(f"[hub] failed to start {self.name}: {exc}")
+            raise
         self.status = "running"
-        asyncio.create_task(self._watch())
+        asyncio.create_task(self._watch(self.process))
 
-    async def _watch(self) -> None:
-        assert self.process is not None
-        if self.process.stderr is not None:
-            async for raw in self.process.stderr:
+    async def _watch(self, process: asyncio.subprocess.Process) -> None:
+        if process.stderr is not None:
+            async for raw in process.stderr:
                 self.append_log(raw.decode(errors="replace").rstrip())
-        code = await self.process.wait()
-        if self.status != "stopped" and not self._stopping:
+        code = await process.wait()
+        if process is not self.process or self._stopping:
+            return  # superseded by a newer spawn, or a deliberate stop
+        self.append_log(f"[hub] {self.name} exited with code {code}")
+        if self.config.restart == "on-failure":
+            self._schedule_restart()
+        elif self.status != "stopped":
             self.status = "crashed" if code != 0 else "stopped"
+
+    def _restart_delay(self, attempt: int) -> float:
+        """Backoff before the `attempt`-th (0-based) restart in the window."""
+        return min(RESTART_MAX_DELAY, RESTART_BASE_DELAY * (2 ** attempt)) * random.uniform(0.8, 1.2)
+
+    def _schedule_restart(self) -> None:
+        """An upstream exited without being asked to: respawn it after a
+        backoff, unless it has already been restarted `restartMaxAttempts`
+        times inside `restartWindow` (circuit open: stays `crashed` until a
+        manual start). Attempts older than the window are forgotten, so a
+        server that then ran stably gets a fresh budget."""
+        now = time.monotonic()
+        while self._restart_times and now - self._restart_times[0] > self.config.restartWindow:
+            self._restart_times.popleft()
+        max_attempts = self.config.restartMaxAttempts
+        if len(self._restart_times) >= max_attempts:
+            self.status = "crashed"
+            self.append_log(
+                f"[hub] {self.name} keeps failing ({max_attempts} restarts in "
+                f"{self.config.restartWindow:g}s): giving up until started manually"
+            )
+            return
+        attempt = len(self._restart_times)
+        delay = self._restart_delay(attempt)
+        self._restart_times.append(now)
+        self.restart_count += 1
+        self.status = "restarting"
+        self.append_log(f"[hub] restarting {self.name} in {delay:.1f}s (attempt {attempt + 1}/{max_attempts})")
+        self._restart_task = asyncio.create_task(self._restart_after(delay))
+
+    async def _restart_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self._stopping:
+            return
+        try:
+            await self._spawn()
+        except Exception as exc:  # noqa: BLE001 - a failed respawn counts as one more failed attempt
+            self.append_log(f"[hub] restart of {self.name} failed: {exc}")
+            self._schedule_restart()
+
+    def _cancel_restart(self) -> None:
+        task, self._restart_task = self._restart_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     # -- services (non-MCP long-running processes) -------------------------
 
@@ -332,6 +718,89 @@ class ManagedServer:
                 return
             await asyncio.sleep(0.5)
 
+    async def _terminate_process_tree(self, process: asyncio.subprocess.Process | None = None) -> None:
+        """Terminates `self.process` and every descendant (see `stop()` for why
+        the whole tree), killing survivors. No status or restart bookkeeping:
+        callers decide what the exit means (a deliberate stop, or an upstream
+        the hub gave up on because it stopped answering)."""
+        process = process or self.process
+        if process is None or process.returncode is not None:
+            return
+        children: list[psutil.Process] = []
+        try:
+            children = psutil.Process(process.pid).children(recursive=True)
+        except psutil.Error:
+            children = []
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.Error:
+                pass
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        if children:
+            _gone, alive = await asyncio.to_thread(psutil.wait_procs, children, 5)
+            for child in alive:
+                try:
+                    child.kill()
+                except psutil.Error:
+                    pass
+
+    # -- health ping (hub-proxy-hardening R6) ------------------------------
+
+    def _start_ping_loop(self, process: asyncio.subprocess.Process) -> None:
+        self._cancel_ping_loop()
+        if self.config.healthInterval > 0:
+            self._ping_task = asyncio.create_task(self._ping_loop(process))
+            self._ping_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+    def _cancel_ping_loop(self) -> None:
+        task, self._ping_task = self._ping_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _ping_loop(self, process: asyncio.subprocess.Process) -> None:
+        """Pings the upstream through the hub's own channel (no guard, so a long
+        tool call never blocks it). `healthFailures` unanswered pings in a row
+        mean the process is alive but not serving: it is terminated, and the
+        normal exit handling applies the restart policy.
+
+        A ping is neither sent nor counted while client requests are in flight:
+        a busy single-threaded server answers late, which is not evidence that
+        it is hung."""
+        failures = 0
+        while process is self.process and process.returncode is None and not self._stopping:
+            await asyncio.sleep(self.config.healthInterval)
+            if process is not self.process or process.returncode is not None or self._stopping:
+                return
+            if len(self.table) > 0:
+                continue
+            try:
+                response = await self.hub_request("ping", {}, timeout=HEALTH_PING_TIMEOUT)
+                answered = "result" in response
+            except (asyncio.TimeoutError, ConnectionError):
+                answered = False
+            if answered:
+                failures = 0
+                continue
+            if len(self.table) > 0 or process is not self.process or self._stopping:
+                continue  # it became busy (or went away) meanwhile: not a verdict
+            failures += 1
+            self.append_log(f"[hub] {self.name} did not answer ping ({failures}/{self.config.healthFailures})")
+            if failures >= self.config.healthFailures:
+                self.append_log(f"[hub] {self.name} is unresponsive: terminating it")
+                await self._terminate_process_tree()
+                return
+
     async def stop(self) -> None:
         """Stops this server's subprocess AND every descendant it has spawned.
 
@@ -375,39 +844,18 @@ class ManagedServer:
         `_reject_pending` finally, and every other managed server's own
         stop() in a sequential `stop_all()`).
         """
+        if self.is_isolated:
+            for child in list(self.children):  # their sessions get an error and may reconnect
+                await self.release_session_upstream(child)
+            return
         self._stopping = True
+        self._cancel_restart()
+        self._cancel_ping_loop()
+        self._cancel_idle_watch()
         if self._health_task is not None:
             self._health_task.cancel()
             self._health_task = None
-        if self.process is not None and self.process.returncode is None:
-            children: list[psutil.Process] = []
-            try:
-                children = psutil.Process(self.process.pid).children(recursive=True)
-            except psutil.Error:
-                children = []
-            for child in children:
-                try:
-                    child.terminate()
-                except psutil.Error:
-                    pass
-            try:
-                self.process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                try:
-                    self.process.kill()
-                except ProcessLookupError:
-                    pass
-            if children:
-                _gone, alive = await asyncio.to_thread(psutil.wait_procs, children, 5)
-                for child in alive:
-                    try:
-                        child.kill()
-                    except psutil.Error:
-                        pass
+        await self._terminate_process_tree()
         self.status = "stopped"
         port = self.config.effective_port
         if self.config.is_service and port is not None:
@@ -427,6 +875,8 @@ class HubManager:
         self._servers = {
             name: ManagedServer(name, sc) for name, sc in config.servers.items() if name != BUILTIN_RIZZO
         }
+        # Set by `drain`: the hub accepts no new MCP traffic (see hub_app.DrainGate).
+        self.draining = False
         self._sync_builtin()
 
     def _sync_builtin(self) -> None:
@@ -454,6 +904,28 @@ class HubManager:
     def get(self, name: str) -> ManagedServer:
         return self._servers[name]
 
+    def in_flight(self) -> int:
+        """Client requests currently waiting on an upstream, across every server
+        (an isolated server's per-session processes included)."""
+        total = 0
+        for server in self._servers.values():
+            total += len(server.table) + sum(len(child.table) for child in server.children)
+        return total
+
+    async def drain(self, timeout: float) -> bool:
+        """Stops accepting new MCP traffic and waits up to `timeout` seconds for
+        the requests already in flight to finish. Returns whether none remain.
+        `draining` stays set either way: the caller is about to stop the hub, or
+        calls `resume` to take it back."""
+        self.draining = True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self.in_flight() > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        return self.in_flight() == 0
+
+    def resume(self) -> None:
+        self.draining = False
+
     async def start_all(self) -> None:
         for server in self._servers.values():
             if server.config.starts_with_hub:
@@ -471,10 +943,16 @@ class HubManager:
         snapshot: dict[str, dict] = {}
         for name, s in self._servers.items():
             entry: dict = {"status": s.status, "concurrency": s.config.concurrency, "type": s.config.type}
+            if s.is_isolated:
+                # no process of its own: "running" while any session has one
+                entry["status"] = "running" if s.children else "idle"
+                entry["sessions"] = len(s.children)
             if name == BUILTIN_RIZZO:
                 entry["builtin"] = True  # owned by the GUI's Rizzo Flow tab
             if s.config.is_service and s.config.effective_port is not None:
                 entry["port"] = s.config.effective_port
+            if s.restart_count:
+                entry["restarts"] = s.restart_count
             snapshot[name] = entry
         return snapshot
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Callable
 
@@ -10,7 +11,8 @@ from starlette.routing import Route
 
 from dataclasses import asdict
 
-from mcp_hub.config import BUILTIN_RIZZO, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
+from mcp_hub.config import BUILTIN_RIZZO, CONCURRENCY_MODES, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
+from mcp_hub.filters import PREFIX_RE
 from mcp_hub.manager import HubManager
 
 
@@ -30,7 +32,10 @@ def management_routes(
             on_change()
 
     async def status(request: Request) -> JSONResponse:
-        return JSONResponse({"servers": manager.status_snapshot()})
+        body: dict = {"servers": manager.status_snapshot()}
+        if manager.draining:
+            body["draining"] = True  # additive: older clients only read "servers"
+        return JSONResponse(body)
 
     async def settings(request: Request) -> JSONResponse:
         return JSONResponse({
@@ -57,15 +62,63 @@ def management_routes(
     async def pid(request: Request) -> JSONResponse:
         return JSONResponse({"pid": os.getpid()})
 
+    async def _optional_json(request: Request) -> dict:
+        """An optional JSON object body: absent or empty means {}."""
+        raw = await request.body()
+        if not raw.strip():
+            return {}
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("body must be a JSON object")
+        return data
+
+    def _timeout_from(data: dict, key: str, default: float) -> float:
+        value = data.get(key, default)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 3600:
+            raise ValueError(f"{key} must be a number of seconds between 0 and 3600")
+        return float(value)
+
+    async def drain(request: Request) -> JSONResponse:
+        """Stop accepting new MCP traffic and wait (up to `timeout` seconds) for
+        requests in flight. The hub keeps running; DELETE resumes."""
+        try:
+            timeout = _timeout_from(await _optional_json(request), "timeout", manager.config.hub.drainTimeout)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        drained = await manager.drain(timeout)
+        return JSONResponse({"drained": drained, "inFlight": manager.in_flight()})
+
+    async def resume(request: Request) -> JSONResponse:
+        manager.resume()
+        return JSONResponse({"draining": False})
+
+    background: set[asyncio.Task] = set()
+
     async def shutdown(request: Request) -> JSONResponse:
         # Graceful: lets `serve_with_managed_shutdown`'s `finally` stop every
         # managed subprocess before the process exits, instead of a caller
         # killing the hub's OS process directly and orphaning them. Used by
         # the GUI's self-update flow, which needs the hub's exe file
         # unlocked (process exited) before it can be replaced on disk.
+        # Replies at once and does the draining in the background, so a caller with
+        # a short HTTP timeout (the GUI's) is not left waiting: new MCP traffic is
+        # refused from now, requests in flight get `drainTimeout` seconds to
+        # finish, then the hub exits.
+        try:
+            timeout = _timeout_from(await _optional_json(request), "drainTimeout", manager.config.hub.drainTimeout)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         if shutdown_event is not None:
-            shutdown_event.set()
-        return JSONResponse({"status": "shutting down"})
+            async def finish() -> None:
+                try:
+                    await manager.drain(timeout)
+                finally:
+                    shutdown_event.set()
+
+            task = asyncio.create_task(finish())
+            background.add(task)
+            task.add_done_callback(background.discard)
+        return JSONResponse({"status": "shutting down", "drainTimeout": timeout})
 
     def _unknown(name: str) -> JSONResponse:
         return JSONResponse({"error": f"unknown server: {name}"}, status_code=404)
@@ -129,6 +182,39 @@ def management_routes(
             return JSONResponse({"error": "type must be 'mcp' or 'service'"}, status_code=400)
         if server_config.is_service and not server_config.command:
             return JSONResponse({"error": "a service needs a command"}, status_code=400)
+        if server_config.concurrency not in CONCURRENCY_MODES:
+            return JSONResponse({"error": f"concurrency must be one of {', '.join(CONCURRENCY_MODES)}"}, status_code=400)
+        if server_config.restart not in ("never", "on-failure"):
+            return JSONResponse({"error": "restart must be 'never' or 'on-failure'"}, status_code=400)
+        attempts = server_config.restartMaxAttempts
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+            return JSONResponse({"error": "restartMaxAttempts must be an integer >= 1"}, status_code=400)
+        window = server_config.restartWindow
+        if not isinstance(window, (int, float)) or isinstance(window, bool) or window <= 0:
+            return JSONResponse({"error": "restartWindow must be a number > 0"}, status_code=400)
+        for key in ("toolsAllow", "toolsDeny"):
+            patterns = getattr(server_config, key)
+            if not isinstance(patterns, list) or not all(isinstance(p, str) and p for p in patterns):
+                return JSONResponse({"error": f"{key} must be a list of non-empty strings"}, status_code=400)
+        prefix = server_config.toolPrefix
+        if not isinstance(prefix, str) or not PREFIX_RE.fullmatch(prefix):
+            return JSONResponse(
+                {"error": "toolPrefix must be at most 64 characters of letters, digits, '_', '-' or '.'"},
+                status_code=400,
+            )
+        if server_config.startMode not in ("eager", "lazy"):
+            return JSONResponse({"error": "startMode must be 'eager' or 'lazy'"}, status_code=400)
+        idle = server_config.idleTimeout
+        if not isinstance(idle, (int, float)) or isinstance(idle, bool) or idle < 0:
+            return JSONResponse({"error": "idleTimeout must be a number >= 0"}, status_code=400)
+        if not isinstance(server_config.persistent, bool):
+            return JSONResponse({"error": "persistent must be a boolean"}, status_code=400)
+        interval = server_config.healthInterval
+        if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval < 0:
+            return JSONResponse({"error": "healthInterval must be a number >= 0"}, status_code=400)
+        failures = server_config.healthFailures
+        if not isinstance(failures, int) or isinstance(failures, bool) or failures < 1:
+            return JSONResponse({"error": "healthFailures must be an integer >= 1"}, status_code=400)
         # HubManager.upsert stops any previously-running process for `name`
         # itself before replacing the entry (round-2 review fix), so the
         # freshly-returned `managed` here is a brand-new ManagedServer with
@@ -167,6 +253,8 @@ def management_routes(
         Route("/api/rizzo", put_rizzo, methods=["PUT"]),
         Route("/api/pid", pid, methods=["GET"]),
         Route("/api/shutdown", shutdown, methods=["POST"]),
+        Route("/api/drain", drain, methods=["POST"]),
+        Route("/api/drain", resume, methods=["DELETE"]),
         Route("/api/reload", reload, methods=["POST"]),
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),

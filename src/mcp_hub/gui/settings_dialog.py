@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import secrets
 import sys
 
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout,
-    QCheckBox, QLabel, QWidget, QMessageBox,
+    QCheckBox, QLabel, QWidget, QMessageBox, QComboBox, QSpinBox,
 )
 
 from mcp_hub.gui.api_client import HubApiClient
+
+
+def _split_list(text: str) -> list[str]:
+    """'a, b,,c' -> ['a', 'b', 'c']"""
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
 class SettingsDialog(QDialog):
@@ -40,9 +46,19 @@ class SettingsDialog(QDialog):
                 QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
             )
         )
+        generate_btn = QPushButton("Genera")
+        generate_btn.setToolTip("Crea un token casuale. Dopo aver riavviato l'hub, riesegui 'apply' per aggiornare i client.")
+
+        def _generate_token() -> None:
+            self.token_edit.setText(secrets.token_urlsafe(32))
+            show_token_checkbox.setChecked(True)  # visible, so it can be copied
+
+        generate_btn.clicked.connect(_generate_token)
+        self.generate_token_btn = generate_btn
         token_row = QHBoxLayout()
         token_row.addWidget(self.token_edit)
         token_row.addWidget(show_token_checkbox)
+        token_row.addWidget(generate_btn)
         token_widget = QWidget()
         token_widget.setLayout(token_row)
 
@@ -51,7 +67,31 @@ class SettingsDialog(QDialog):
         form.addRow("Porta", self.port_edit)
         form.addRow("Auth token", token_widget)
 
-        warning = QLabel("Host / porta / token: serve riavviare l'hub per applicare le modifiche.")
+        self.allowed_hosts_edit = QLineEdit(", ".join(hub.allowedHosts))
+        self.allowed_hosts_edit.setPlaceholderText("nomi host extra separati da virgola (es. hub.interno)")
+        self.allowed_origins_edit = QLineEdit(", ".join(hub.allowedOrigins))
+        self.allowed_origins_edit.setPlaceholderText("origin extra separati da virgola (es. https://tool.interno)")
+        form.addRow("Host consentiti", self.allowed_hosts_edit)
+        form.addRow("Origin consentiti", self.allowed_origins_edit)
+
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItem("SSE (come sempre)", "sse")
+        self.transport_combo.addItem("Streamable HTTP", "http")
+        self.transport_combo.setCurrentIndex(1 if hub.preferredTransport == "http" else 0)
+        self.transport_combo.setToolTip("Quale endpoint 'apply' scrive nella config dei client: /<server>/sse o /<server>/mcp.")
+        self.drain_spin = QSpinBox()
+        self.drain_spin.setRange(0, 3600)
+        self.drain_spin.setSuffix(" s")
+        self.drain_spin.setSpecialValueText("subito")
+        self.drain_spin.setValue(int(hub.drainTimeout))
+        self.drain_spin.setToolTip("Alla chiusura (o all'aggiornamento) l'hub aspetta tanto le richieste in corso prima di uscire.")
+        form.addRow("Trasporto per 'apply'", self.transport_combo)
+        form.addRow("Attesa alla chiusura", self.drain_spin)
+
+        warning = QLabel(
+            "Host / porta / token / host e origin consentiti: serve riavviare l'hub per applicare le modifiche. "
+            "Cambiato il token, riesegui 'apply' perche' i client lo ricevano."
+        )
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #856404;")
 
@@ -102,6 +142,10 @@ class SettingsDialog(QDialog):
         hub.host = self.host_edit.text().strip() or hub.host
         hub.port = int(self.port_edit.text().strip())
         hub.authToken = self.token_edit.text() or None
+        hub.allowedHosts = _split_list(self.allowed_hosts_edit.text())
+        hub.allowedOrigins = _split_list(self.allowed_origins_edit.text())
+        hub.preferredTransport = self.transport_combo.currentData()
+        hub.drainTimeout = float(self.drain_spin.value())
         new_autostart = self.autostart_checkbox.isChecked()
         hub.autostart = new_autostart
         hub.checkForUpdates = self.check_updates_checkbox.isChecked()

@@ -48,7 +48,7 @@ async def test_stop_sets_status_stopped():
 @pytest.mark.asyncio
 async def test_crash_is_detected():
     crashing = ServerConfig(enabled=True, command=sys.executable,
-                             args=["-c", "import sys; sys.exit(1)"], env={})
+                             args=["-c", "import sys; sys.exit(1)"], env={}, restart="never")
     cfg = Config(hub=HubConfig(), servers={"a": crashing})
     manager = HubManager(cfg)
     await manager.start_all()

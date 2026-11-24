@@ -15,7 +15,7 @@ def _snapshot(pid: int) -> list[psutil.Process]:
         return []
 
 
-def shutdown_hub(client, wait: float = 30.0) -> bool:
+def shutdown_hub(client, wait: float = 60.0) -> bool:
     """Stops the background hub and everything it started, for real.
 
     1. Graceful: `POST /api/shutdown` lets the hub stop each managed server

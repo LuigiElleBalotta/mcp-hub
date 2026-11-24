@@ -177,7 +177,7 @@ async def test_api_start_stop_status_and_no_sse_route(tmp_path, monkeypatch):
     manager = HubManager(Config(hub=HubConfig(), servers={}))
     app = build_app(manager)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://hub") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:37450") as client:
         body = {k: v for k, v in _service(port).__dict__.items()}
         resp = await client.post("/api/servers/svc", json=body)
         assert resp.status_code == 200
@@ -198,7 +198,7 @@ async def test_api_rejects_invalid_type_and_commandless_service(monkeypatch):
     monkeypatch.setattr("mcp_hub.management_api.save_config", lambda *a, **k: None)
     manager = HubManager(Config(hub=HubConfig(), servers={}))
     transport = httpx.ASGITransport(app=build_app(manager))
-    async with httpx.AsyncClient(transport=transport, base_url="http://hub") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:37450") as client:
         bad_type = {"enabled": False, "command": "x", "args": [], "type": "daemon"}
         assert (await client.post("/api/servers/a", json=bad_type)).status_code == 400
         no_cmd = {"enabled": False, "command": "", "args": [], "type": "service"}

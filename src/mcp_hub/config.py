@@ -13,6 +13,8 @@ from mcp_hub.paths import data_dir
 
 CONFIG_PATH = data_dir() / "config.json"
 
+CONCURRENCY_MODES = ("exclusive", "parallel", "session-aware", "isolated")
+
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
 
 
@@ -26,7 +28,11 @@ class ServerConfig:
     command: str
     args: list[str]
     env: dict[str, str] = field(default_factory=dict)
-    concurrency: Literal["exclusive", "parallel"] = "exclusive"
+    # exclusive: one request at a time. parallel: shared upstream, no serialisation.
+    # session-aware: parallel, plus the hub tells the server which client session each
+    # request comes from (`_meta`, see session.SESSION_META_KEY). isolated: one upstream
+    # process per client session, started on connect and stopped on disconnect.
+    concurrency: Literal["exclusive", "parallel", "session-aware", "isolated"] = "exclusive"
     # `type == "service"`: a plain long-running process (e.g. an HTTP server
     # such as Rizzo Flow) that the hub only starts/stops/monitors. It is not
     # an MCP server: stdio is not proxied, no `/<name>/sse` route is mounted
@@ -43,10 +49,36 @@ class ServerConfig:
     healthTimeout: float = 120.0
     # With `enabled`, start the service when the hub starts (default: manual).
     autostart: bool = False
+    # MCP servers only (hub-proxy-hardening R5): what to do when the process
+    # exits without the hub asking it to. At most `restartMaxAttempts`
+    # restarts inside `restartWindow` seconds, then it stays `crashed`.
+    restart: Literal["never", "on-failure"] = "on-failure"
+    restartMaxAttempts: int = 5
+    restartWindow: float = 300.0
+    # Seconds between hub pings of an MCP server (0 = off) and how many
+    # unanswered pings in a row mark it unresponsive (hub-proxy-hardening R6).
+    healthInterval: float = 30.0
+    healthFailures: int = 3
+    # hub-proxy-efficiency R2. "lazy": not spawned with the hub, spawned on the
+    # first request the cache cannot answer. `idleTimeout` (seconds, 0 = never):
+    # stop it after that long with no client request, respawn on demand, unless
+    # `persistent` (a server that keeps state in memory must not be stopped).
+    startMode: Literal["eager", "lazy"] = "eager"
+    idleTimeout: float = 0.0
+    persistent: bool = False
+    # Tool filtering (hub-proxy-efficiency R6): glob patterns on the upstream's tool
+    # names (deny wins; empty allow = all) and a prefix the client sees on every name.
+    toolsAllow: list[str] = field(default_factory=list)
+    toolsDeny: list[str] = field(default_factory=list)
+    toolPrefix: str = ""
 
     @property
     def is_service(self) -> bool:
         return self.type == "service"
+
+    @property
+    def has_tool_filter(self) -> bool:
+        return bool(self.toolsAllow or self.toolsDeny or self.toolPrefix)
 
     @property
     def starts_with_hub(self) -> bool:
@@ -55,7 +87,10 @@ class ServerConfig:
         MCP servers: whenever `enabled`. Services: only `enabled` AND
         `autostart`, so a heavy local service (GPU model) is never started
         behind the user's back."""
-        return self.enabled and (self.autostart if self.is_service else True)
+        if self.is_service:
+            return self.enabled and self.autostart
+        # An isolated server has no shared process: its upstreams belong to sessions.
+        return self.enabled and self.startMode == "eager" and self.concurrency != "isolated"
 
     @property
     def effective_port(self) -> int | None:
@@ -68,6 +103,14 @@ class ServerConfig:
 
 
 _SERVICE_ONLY_FIELDS = ("cwd", "healthUrl", "port", "healthTimeout", "autostart")
+# MCP-only fields and their defaults: omitted from config.json while default,
+# so an untouched entry keeps its original on-disk shape.
+_MCP_ONLY_DEFAULTS = {
+    "restart": "on-failure", "restartMaxAttempts": 5, "restartWindow": 300.0,
+    "healthInterval": 30.0, "healthFailures": 3,
+    "startMode": "eager", "idleTimeout": 0.0, "persistent": False,
+    "toolsAllow": [], "toolsDeny": [], "toolPrefix": "",
+}
 
 
 def server_to_dict(sc: ServerConfig) -> dict:
@@ -77,6 +120,12 @@ def server_to_dict(sc: ServerConfig) -> dict:
     if not sc.is_service:
         data.pop("type")
         for key in _SERVICE_ONLY_FIELDS:
+            data.pop(key, None)
+        for key, default in _MCP_ONLY_DEFAULTS.items():
+            if data.get(key) == default:
+                data.pop(key, None)
+    else:
+        for key in _MCP_ONLY_DEFAULTS:
             data.pop(key, None)
     return data
 
@@ -89,6 +138,34 @@ class HubConfig:
     autostart: bool = False
     checkForUpdates: bool = True
     includeBetaUpdates: bool = False
+    # Extra Host header values / Origin values accepted besides the hub's own
+    # (see security.py). Empty = defaults only; omitted from config.json then.
+    allowedHosts: list[str] = field(default_factory=list)
+    allowedOrigins: list[str] = field(default_factory=list)
+    # Which endpoint `apply` writes into client configs: "sse" (`/<name>/sse`, what it always
+    # wrote) or "http" (Streamable HTTP, `/<name>/mcp`, the transport that replaces SSE).
+    preferredTransport: Literal["sse", "http"] = "sse"
+    # Seconds `/api/shutdown` (and so the GUI's quit / self-update) waits for requests
+    # already in flight before the hub exits (hub-proxy-efficiency R5). 0 = don't wait.
+    drainTimeout: float = 20.0
+
+
+_HUB_OPTIONAL_LISTS = ("allowedHosts", "allowedOrigins")
+
+
+def hub_to_dict(hub: HubConfig) -> dict:
+    """`asdict`, but empty optional lists are dropped so a config.json that
+    never used them keeps its original shape (an older hub rejects unknown
+    keys)."""
+    data = asdict(hub)
+    for key in _HUB_OPTIONAL_LISTS:
+        if not data[key]:
+            del data[key]
+    if data["preferredTransport"] == "sse":
+        del data["preferredTransport"]  # the default: keep the file as it was
+    if data["drainTimeout"] == 20.0:
+        del data["drainTimeout"]
+    return data
 
 
 # Name reserved for the built-in Rizzo Flow service. It is generated by the hub
@@ -180,7 +257,10 @@ def load_config(path: Path | None = None) -> Config:
     if not path.exists():
         return Config(hub=HubConfig(), servers={})
     raw = json.loads(path.read_text(encoding="utf-8"))
-    hub = HubConfig(**raw.get("hub", {}))
+    hub_known = set(HubConfig.__dataclass_fields__)
+    hub = HubConfig(**{k: v for k, v in raw.get("hub", {}).items() if k in hub_known})
+    if hub.preferredTransport not in ("sse", "http"):
+        hub.preferredTransport = "sse"  # a typo must not make `apply` write a dead URL
     servers = {name: ServerConfig(**sc) for name, sc in raw.get("servers", {}).items()}
     known = set(RizzoSettings.__dataclass_fields__)
     rizzo = RizzoSettings(**{k: v for k, v in raw.get("rizzo", {}).items() if k in known})
@@ -246,7 +326,7 @@ def save_config(config: Config, path: Path | None = None) -> None:
     path = path if path is not None else CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "hub": asdict(config.hub),
+        "hub": hub_to_dict(config.hub),
         "servers": {name: server_to_dict(sc) for name, sc in config.servers.items()},
     }
     # Only written once configured; older hubs ignore unknown top-level keys.

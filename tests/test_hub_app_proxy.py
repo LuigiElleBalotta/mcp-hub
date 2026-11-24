@@ -55,6 +55,7 @@ def _server_config(concurrency: str) -> ServerConfig:
         args=[FAKE_SERVER],
         env={},
         concurrency=concurrency,
+        restart="never",  # these tests exercise the dead-upstream paths themselves
     )
 
 
@@ -181,89 +182,59 @@ def _exception_messages(exc: BaseException) -> list[str]:
     return msgs
 
 
-@pytest.mark.asyncio
-async def test_subprocess_death_rejects_pending_request_and_unblocks_exclusive_guard():
-    """Round 2, Critical finding: a request in flight when the managed
-    subprocess dies (crash, or any other cause of stdout EOF) must be
-    rejected with an exception -- not left to hang forever with `await fut`
-    inside `write_and_maybe_wait()`. For an `exclusive` server this is also
-    what must release the guard's lock (`write_and_maybe_wait` runs directly
-    inside `async with self._lock:`), so a SUBSEQUENT request against a
-    fresh/restarted server on the same ManagedServer isn't stuck behind a
-    permanently-deadlocked guard.
-    """
-    server = await _start_managed("exclusive")
-
-    conn = _Connection(server)
-    conn.open()
-    await conn.send(1, "test/die", {})
-    # The fake subprocess exits immediately without ever writing a response
-    # to this request. The waiting connection must see an exception
-    # propagate out of `_proxy`, not hang. `conn.close()` has its own
-    # internal 5s `anyio.fail_after` around awaiting the proxy task -- relied
-    # on here as the sole timeout (nesting a second `fail_after` at the same
-    # deadline around it is unreliable: the two cancel scopes can race, and
-    # the outer one can end up swallowing the inner's exception instead of
-    # observing it, which is exactly what happened when this test was first
-    # written -- caught by manually reverting the fix and finding this
-    # version reported a false "test passed" via `DID NOT RAISE`).
-    caught: BaseException | None = None
-    try:
-        await conn.close()
-    except BaseException as exc:  # noqa: BLE001 -- intentionally broad, see below
-        caught = exc
-    assert caught is not None, (
-        "expected _proxy to raise once the subprocess died with this "
-        "request in flight -- got no exception at all (hang or silent drop)"
-    )
-    assert any("subprocess exited" in m for m in _exception_messages(caught))
-
-    # Simulate a restart: a fresh subprocess on the SAME ManagedServer, so
-    # the SAME ConcurrencyGuard/lock is reused. If the prior request's
-    # exception hadn't released the exclusive lock, this would hang forever
-    # instead of completing within the timeout below.
-    await server.start()
-    try:
-        conn2 = _Connection(server)
-        conn2.open()
-        await conn2.send(2, "test/echo", {"value": "still alive"})
-        reply = await conn2.recv(timeout=5.0)
-        assert reply["result"] == {"echo": "still alive"}
-        await conn2.close()
-    finally:
-        await server.stop()
+def _assert_server_down_error(reply: dict, req_id) -> None:
+    """hub-proxy-hardening R2: a request that cannot be served because the
+    upstream is gone is answered with a JSON-RPC error carrying the client's
+    own id (code -32000) -- not by tearing down the client's connection."""
+    assert reply["id"] == req_id
+    assert "result" not in reply
+    assert reply["error"]["code"] == -32000
+    assert "subprocess" in reply["error"]["message"]
 
 
 @pytest.mark.asyncio
-async def test_request_after_dead_reader_fails_fast_without_a_restart():
-    """Round 2, Critical finding, gap closed after advisor review: rejecting
-    futures already in `pending` when the reader exits is not enough on its
-    own. If a NEW request registers a future in `pending` AFTER the shared
-    reader has already run to completion (subprocess dead, no restart), no
-    reader is left alive to ever reject it -- `ensure_stdout_reader()` would
-    spawn a fresh reader against the same dead process, which hits EOF
-    immediately and exits having rejected nothing (because `pending` was
-    still empty at that instant). Without the fail-fast check in
-    `write_and_maybe_wait()` (before registering anything in `pending`), this
-    second request would hang forever -- the exact permanent-deadlock failure
-    mode the Critical finding describes, reachable even without ever calling
-    `server.start()` again.
+async def test_subprocess_death_answers_pending_request_with_jsonrpc_error_and_keeps_connection_open():
+    """R2 (was Round 2, Critical): a request in flight when the subprocess dies
+    must be answered -- not hang, and not kill the client's connection. The
+    answer is a JSON-RPC error with the client's original id. For an
+    `exclusive` server the guard is still released, so after a restart the SAME
+    connection can keep working.
     """
     server = await _start_managed("exclusive")
     try:
         conn = _Connection(server)
         conn.open()
         await conn.send(1, "test/die", {})
-        try:
-            await conn.close()
-        except BaseException:
-            pass  # already covered by the other test; just get past it here
+        _assert_server_down_error(await conn.recv(timeout=5.0), 1)
+        assert conn.task is not None and not conn.task.done(), "the connection must stay open"
 
-        # Give the shared reader time to actually observe EOF and finish
-        # (it rejects an already-empty `pending` and exits) before the next
-        # request tries to register anything -- this is the exact ordering
-        # the gap needed: reader fully done, no restart, pending currently
-        # empty.
+        # Restart on the SAME ManagedServer (same ConcurrencyGuard) and keep
+        # using the SAME connection: a leaked exclusive lock would hang here.
+        await server.start()
+        await conn.send(2, "test/echo", {"value": "still alive"})
+        reply = await conn.recv(timeout=5.0)
+        assert reply["result"] == {"echo": "still alive"}
+        await conn.close()  # closes cleanly: no exception escaped _proxy
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_request_after_dead_reader_fails_fast_without_a_restart():
+    """Round 2, Critical finding (kept): rejecting futures already in `pending`
+    when the reader exits is not enough on its own. A NEW request arriving
+    AFTER the shared reader has already finished (subprocess dead, no restart)
+    must fail fast instead of hanging. Under R2 "fail fast" means a JSON-RPC
+    error answer on the still-open connection.
+    """
+    server = await _start_managed("exclusive")
+    try:
+        conn = _Connection(server)
+        conn.open()
+        await conn.send(1, "test/die", {})
+        _assert_server_down_error(await conn.recv(timeout=5.0), 1)
+        await conn.close()
+
         for _ in range(50):
             if server._reader_task is not None and server._reader_task.done():
                 break
@@ -272,16 +243,11 @@ async def test_request_after_dead_reader_fails_fast_without_a_restart():
 
         conn2 = _Connection(server)
         conn2.open()  # deliberately NOT server.start() -- same dead process
+        start = time.monotonic()
         await conn2.send(2, "test/echo", {"value": "x"})
-        caught: BaseException | None = None
-        try:
-            await conn2.close()
-        except BaseException as exc:
-            caught = exc
-        assert caught is not None, (
-            "a request registered after the reader already exited, with no "
-            "restart, must fail fast -- got no exception at all (hang)"
-        )
+        _assert_server_down_error(await conn2.recv(timeout=3.0), 2)
+        assert time.monotonic() - start < 2.0
+        await conn2.close()
     finally:
         await server.stop()
 
@@ -389,55 +355,28 @@ async def _drive_second_message_after_reader_exit(server, monkeypatch) -> None:
     await conn.send(2, "test/echo", {"value": "still open"})
     await conn._read_send.aclose()  # same as _Connection.close()'s first step
 
-    # NOTE: deliberately NOT using `_Connection.close()`'s own
-    # `anyio.fail_after(5.0)` here. Empirically (verified with a standalone
-    # repro while writing this test), on this environment, cancelling the
-    # coroutine that's doing `await conn.task` -- whether via
-    # `anyio.fail_after` or a bare `asyncio.wait_for` without `shield` --
-    # also cancels `conn.task` itself, because CPython's
-    # `Task.cancel()` forwards the cancellation to whatever future/task it is
-    # currently suspended on (`Task._fut_waiter`). That masks a genuine hang
-    # as a clean-looking early return instead of a timeout, which is exactly
-    # the ambiguity this test exists to rule out. `asyncio.shield(...)`
-    # prevents that forwarding, so a real hang in `conn.task` reliably
-    # surfaces here as `asyncio.TimeoutError`/`TimeoutError`, not silence.
+    # R2: the second message is answered with a JSON-RPC error by a live
+    # reader rejecting the freshly-registered future, well before any timeout,
+    # and the connection is still open afterwards.
     start = time.monotonic()
-    caught: BaseException | None = None
-    try:
-        await asyncio.wait_for(asyncio.shield(conn.task), timeout=3.0)
-    except BaseException as exc:  # noqa: BLE001 -- see other tests in this file
-        caught = exc
+    reply = await conn.recv(timeout=3.0)
     elapsed = time.monotonic() - start
+    _assert_server_down_error(reply, 2)
+    assert "subprocess exited" in reply["error"]["message"]
+    assert elapsed < 2.0, f"expected a fast answer, took {elapsed:.2f}s"
+    assert conn.task is not None and not conn.task.done()
 
-    assert caught is not None, (
-        "a second message pipelined on the same already-open connection, "
-        "after its reader already exited, must fail fast -- got no "
-        "exception at all"
-    )
-    assert not isinstance(caught, (asyncio.TimeoutError, TimeoutError)), (
-        f"expected a fast failure well under the 3s wait, took {elapsed:.2f}s "
-        "and only surfaced via the outer timeout -- consistent with the "
-        "second message hanging forever (i.e. the original deadlock "
-        "reproduced), not with anything actually rejecting it"
-    )
-    assert elapsed < 2.0, (
-        f"expected a fast failure, took {elapsed:.2f}s"
-    )
-    # With stdin write/drain neutralized, the only remaining way for this to
-    # fail fast is a live reader rejecting the freshly-registered future --
-    # confirms it wasn't some other unrelated exception.
-    assert any("subprocess exited" in m for m in _exception_messages(caught))
-    assert conn.task.done()
+    await conn._read_send.aclose()  # same as _Connection.close()'s first step
+    await asyncio.wait_for(asyncio.shield(conn.task), timeout=3.0)  # closes cleanly
+    assert conn.task.done() and conn.task.exception() is None
 
 
 @pytest.mark.asyncio
-async def test_stop_rejects_a_request_in_flight():
-    """Round 2, Critical finding: the review explicitly asked to verify --
-    not assume -- that `stop()`'s deliberate termination path rejects a
-    request in flight the same way a crash does. `test/sleep` keeps the fake
-    subprocess busy (and its response line unwritten) long enough for
-    `server.stop()` to terminate it while the request is still outstanding.
-    """
+async def test_stop_answers_a_request_in_flight_with_an_error():
+    """Round 2, Critical finding (kept): `stop()`'s deliberate termination path
+    must answer a request in flight the same way a crash does. `test/sleep`
+    keeps the fake subprocess busy long enough for `server.stop()` to
+    terminate it while the request is still outstanding."""
     server = await _start_managed("exclusive")
     conn = _Connection(server)
     conn.open()
@@ -445,18 +384,11 @@ async def test_stop_rejects_a_request_in_flight():
     await asyncio.sleep(0.1)  # let the request actually reach the subprocess
 
     stop_task = asyncio.create_task(server.stop())
-    caught: BaseException | None = None
-    try:
-        await conn.close()
-    except BaseException as exc:
-        caught = exc
+    reply = await conn.recv(timeout=5.0)
     await stop_task
 
-    assert caught is not None, (
-        "expected the in-flight request to be rejected when stop() "
-        "terminates the subprocess, got no exception at all (hang)"
-    )
-    assert any("subprocess exited" in m for m in _exception_messages(caught))
+    _assert_server_down_error(reply, 1)
+    await conn.close()
 
 
 @pytest.mark.asyncio

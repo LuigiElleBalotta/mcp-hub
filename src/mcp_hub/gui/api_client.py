@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 import httpx
 
 
@@ -26,9 +28,69 @@ def _rizzo_json(resp: httpx.Response) -> dict:
         raise HubTooOldError(OLD_HUB_MESSAGE) from exc
 
 
+def _read_hub_config():
+    from mcp_hub.config import HubConfig, load_config
+
+    try:
+        return load_config().hub
+    except (OSError, ValueError, TypeError):
+        return HubConfig()
+
+
+class _BearerAuth(httpx.Auth):
+    """Adds `Authorization: Bearer <token>` when a token is set. On a 401 it
+    asks `reload` for a fresh token (the hub was restarted with another one)
+    and retries the request once."""
+
+    def __init__(self, token: str | None, reload: Callable[[], str | None] | None = None):
+        self.token = token or None
+        self._reload = reload
+
+    def auth_flow(self, request: httpx.Request):
+        if self.token:
+            request.headers["Authorization"] = f"Bearer {self.token}"
+        response = yield request
+        if response.status_code == 401 and self._reload is not None:
+            fresh = self._reload() or None
+            if fresh != self.token:
+                self.token = fresh
+                if fresh:
+                    request.headers["Authorization"] = f"Bearer {fresh}"
+                else:
+                    request.headers.pop("Authorization", None)
+                yield request
+
+
 class HubApiClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:37450"):
-        self._client = httpx.Client(base_url=base_url, timeout=5.0)
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:37450",
+        token: str | None = None,
+        token_reloader: Callable[[], str | None] | None = None,
+    ):
+        self._auth = _BearerAuth(token, token_reloader)
+        self._client = httpx.Client(base_url=base_url, timeout=5.0, auth=self._auth)
+
+    @classmethod
+    def from_config(cls) -> "HubApiClient":
+        """Client for the hub described by config.json: its host, port and
+        (when set) bearer token. Falls back to the defaults if the file is
+        unreadable, so the GUI can still open and show the problem. The token
+        is re-read from config.json when the hub answers 401, so a token
+        changed in Settings is picked up after the hub restarts."""
+        hub = _read_hub_config()
+        host = "127.0.0.1" if hub.host in ("0.0.0.0", "::") else hub.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return cls(
+            base_url=f"http://{host}:{hub.port}",
+            token=hub.authToken,
+            token_reloader=lambda: _read_hub_config().authToken,
+        )
+
+    def set_token(self, token: str | None) -> None:
+        """Sets (or clears) the bearer token sent with every request."""
+        self._auth.token = token or None
 
     def status(self) -> dict[str, dict[str, str]]:
         return self._client.get("/api/status").json()["servers"]
