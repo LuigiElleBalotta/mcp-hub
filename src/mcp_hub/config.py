@@ -150,6 +150,9 @@ class HubConfig:
     drainTimeout: float = 20.0
     # Collect per-server activity metrics for the dashboard (counters, latency, recent calls).
     metrics: bool = True
+    # Offer "search the MCP Registry" in the Add-server dialog. Off by default: a search sends
+    # its text to registry.modelcontextprotocol.io, so it is the user's explicit choice.
+    registrySearch: bool = False
 
 
 _HUB_OPTIONAL_LISTS = ("allowedHosts", "allowedOrigins")
@@ -169,6 +172,8 @@ def hub_to_dict(hub: HubConfig) -> dict:
         del data["drainTimeout"]
     if data["metrics"] is True:
         del data["metrics"]
+    if data["registrySearch"] is False:
+        del data["registrySearch"]
     return data
 
 

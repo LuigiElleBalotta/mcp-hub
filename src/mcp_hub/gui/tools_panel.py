@@ -8,27 +8,17 @@ from __future__ import annotations
 
 import json
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 from mcp_hub.filters import edit_filters
+from mcp_hub.gui.workers import ApiWorker
 
 
-class _ApiWorker(QThread):
-    done = Signal(object, object)  # (result, error text | None)
-
-    def __init__(self, fn, parent=None):
-        super().__init__(parent)
-        self._fn = fn
-
-    def run(self) -> None:
-        try:
-            self.done.emit(self._fn(), None)
-        except Exception as exc:  # noqa: BLE001 - shown to the user as text
-            self.done.emit(None, str(exc) or exc.__class__.__name__)
+_ApiWorker = ApiWorker
 
 
 class ArgsForm(QWidget):

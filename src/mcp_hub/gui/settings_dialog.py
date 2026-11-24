@@ -85,6 +85,11 @@ class SettingsDialog(QDialog):
         self.drain_spin.setSpecialValueText("subito")
         self.drain_spin.setValue(int(hub.drainTimeout))
         self.drain_spin.setToolTip("Alla chiusura (o all'aggiornamento) l'hub aspetta tanto le richieste in corso prima di uscire.")
+        self.registry_checkbox = QCheckBox("Abilita la ricerca nel registry MCP")
+        self.registry_checkbox.setChecked(hub.registrySearch)
+        self.registry_checkbox.setToolTip(
+            "Aggiunge 'Cerca nel registry MCP...' al dialog Add server. Una ricerca invia il testo cercato a "
+            "registry.modelcontextprotocol.io (nient'altro). Spento di default.")
         form.addRow("Trasporto per 'apply'", self.transport_combo)
         form.addRow("Attesa alla chiusura", self.drain_spin)
 
@@ -118,6 +123,7 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(warning)
+        layout.addWidget(self.registry_checkbox)
         layout.addWidget(self.autostart_checkbox)
         layout.addWidget(self.check_updates_checkbox)
         layout.addWidget(self.beta_checkbox)
@@ -146,6 +152,7 @@ class SettingsDialog(QDialog):
         hub.allowedOrigins = _split_list(self.allowed_origins_edit.text())
         hub.preferredTransport = self.transport_combo.currentData()
         hub.drainTimeout = float(self.drain_spin.value())
+        hub.registrySearch = self.registry_checkbox.isChecked()
         new_autostart = self.autostart_checkbox.isChecked()
         hub.autostart = new_autostart
         hub.checkForUpdates = self.check_updates_checkbox.isChecked()

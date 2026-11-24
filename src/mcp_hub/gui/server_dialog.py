@@ -24,10 +24,12 @@ def split_list(text: str) -> list[str]:
 
 
 class ServerDialog(QDialog):
-    def __init__(self, name: str = "", existing: dict | None = None, parent=None):
+    def __init__(self, name: str = "", existing: dict | None = None, parent=None, registry_enabled: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Server")
         existing = existing or {}
+        # "Search the MCP Registry" only when adding a server and the user turned it on in Settings.
+        self._registry_enabled = registry_enabled and not existing
 
         self.name_edit = QLineEdit(name)
         self.command_edit = QLineEdit(existing.get("command", ""))
@@ -108,6 +110,10 @@ class ServerDialog(QDialog):
 
         add_env_btn = QPushButton("Add env var")
         add_env_btn.clicked.connect(lambda: self._add_env_row("", ""))
+        self.registry_btn = QPushButton("Cerca nel registry MCP...")
+        self.registry_btn.setToolTip("Cerca un server nel registry ufficiale e precompila questo form (non avvia nulla).")
+        self.registry_btn.clicked.connect(self._search_registry)
+        self.registry_btn.setVisible(self._registry_enabled)
         # Secrets in the OS credential store instead of config.json (R4). Hidden when the
         # system has none: plaintext env keeps working either way.
         self.move_secrets_btn = QPushButton("Sposta i segreti nel credential store")
@@ -160,6 +166,7 @@ class ServerDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(self.env_table)
         layout.addWidget(add_env_btn)
+        layout.addWidget(self.registry_btn)
         layout.addWidget(self.move_secrets_btn)
         layout.addLayout(buttons)
 
@@ -208,6 +215,32 @@ class ServerDialog(QDialog):
             value_edit.setEchoMode(QLineEdit.EchoMode.Password)
         else:
             value_edit.setEchoMode(QLineEdit.EchoMode.Normal)
+
+    def _search_registry(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        from mcp_hub.gui.registry_dialog import RegistryDialog
+
+        dialog = RegistryDialog(parent=self)
+        if dialog.exec() and dialog.chosen:
+            self.apply_registry_choice(dialog.chosen)
+            if any(" " in arg for arg in dialog.chosen["args"]):
+                QMessageBox.warning(self, "Argomenti", "Alcuni argomenti contengono spazi: nel form sono separati "
+                                    "da spazi, controllali.")
+
+    def apply_registry_choice(self, chosen: dict) -> None:
+        """Pre-fills the form from a registry pick. Nothing is saved or run; the user
+        reads the command line and the environment, completes what is missing, and saves."""
+        if not self.name_edit.text().strip():
+            self.name_edit.setText(chosen["name"])
+        self.command_edit.setText(chosen["command"])
+        self.args_edit.setText(" ".join(chosen["args"]))
+        existing_keys = {self.env_table.item(r, 0).text() for r in range(self.env_table.rowCount())}
+        for key, value in chosen["env"].items():
+            if key not in existing_keys:
+                self._add_env_row(key, value)
+        if chosen.get("needs"):
+            self.args_edit.setToolTip("Da completare a mano: " + ", ".join(chosen["needs"]))
 
     def _move_secrets(self) -> None:
         """Stores every plaintext secret-looking env value in the credential store and

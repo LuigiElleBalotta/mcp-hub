@@ -634,7 +634,12 @@ class MainWindow(QMainWindow):
     def _add_server(self) -> None:
         from mcp_hub.gui.server_dialog import ServerDialog
         from PySide6.QtWidgets import QMessageBox
-        dialog = ServerDialog(parent=self)
+        from mcp_hub.config import load_config
+        try:
+            registry_enabled = load_config().hub.registrySearch
+        except (OSError, ValueError, TypeError):
+            registry_enabled = False
+        dialog = ServerDialog(parent=self, registry_enabled=registry_enabled)
         if dialog.exec():
             name = dialog.result_name()
             if not name:
