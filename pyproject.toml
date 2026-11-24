@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.27",
     "PySide6>=6.6",
     "psutil>=5.9",
+    "keyring>=25.0",
 ]
 
 [project.optional-dependencies]

@@ -135,6 +135,37 @@ def cmd_apply_client(args: argparse.Namespace, config) -> None:
     print(f"Written. Backup: {backup}" if backup else "Written (new file).")
 
 
+def cmd_secrets(args: argparse.Namespace) -> None:
+    """Manage the secrets kept in the OS credential store (never prints a value)."""
+    from mcp_hub import secrets as store
+
+    if not store.available():
+        sys.exit("No credential store is available on this system (is the 'keyring' package installed?).")
+    config = load_config()
+    if args.action == "list":
+        rows = store.stored_names(config.servers)
+        for ref, where, present in rows:
+            print(f"{'ok     ' if present else 'MISSING'}  {where}  {ref}")
+        if not rows:
+            print("No secret references in config.json.")
+    elif args.action == "migrate":
+        created = store.migrate_config_secrets(config.servers, only=args.server)
+        if created:
+            save_config(config)
+        print(f"Moved {len(created)} secret(s) into the credential store." + (
+            "\n" + "\n".join(created) if created else ""))
+    elif args.action == "set":
+        import getpass
+
+        value = getpass.getpass(f"Value for {args.server}/{args.key} (hidden): ")
+        if not value:
+            sys.exit("Empty value: nothing stored.")
+        store.set_secret(args.server, args.key, value)
+        print(f"Stored {store.make_ref(args.server, args.key)}")
+    elif args.action == "delete":
+        print("Deleted." if store.delete_secret(args.server, args.key) else "There was no such secret.")
+
+
 def cmd_rollback(args: argparse.Namespace) -> None:
     from mcp_hub.client_sync import ADAPTERS, rollback
 
@@ -199,6 +230,17 @@ def main() -> None:
     apply_parser.add_argument("--cleanup", action="store_true")
     apply_parser.add_argument("--yes", action="store_true")
     apply_parser.set_defaults(func=cmd_apply)
+
+    secrets_parser = sub.add_parser("secrets", help="keep env secrets in the OS credential store")
+    secrets_sub = secrets_parser.add_subparsers(dest="action", required=True)
+    secrets_sub.add_parser("list", help="show which secret references exist and whether each is stored")
+    migrate = secrets_sub.add_parser("migrate", help="move plaintext secrets of config.json into the store")
+    migrate.add_argument("--server", default=None, help="only this server")
+    for action in ("set", "delete"):
+        sp = secrets_sub.add_parser(action)
+        sp.add_argument("server")
+        sp.add_argument("key")
+    secrets_parser.set_defaults(func=cmd_secrets)
 
     rollback_parser = sub.add_parser("rollback", help="restore the newest backup of a client's config")
     rollback_parser.add_argument("--client", choices=["claude", "cursor", "vscode"], required=True)

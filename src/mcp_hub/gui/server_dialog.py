@@ -108,6 +108,15 @@ class ServerDialog(QDialog):
 
         add_env_btn = QPushButton("Add env var")
         add_env_btn.clicked.connect(lambda: self._add_env_row("", ""))
+        # Secrets in the OS credential store instead of config.json (R4). Hidden when the
+        # system has none: plaintext env keeps working either way.
+        self.move_secrets_btn = QPushButton("Sposta i segreti nel credential store")
+        self.move_secrets_btn.setToolTip(
+            "Salva i valori delle variabili che sembrano segreti (TOKEN, KEY, PASS...) nel credential "
+            "del sistema e lascia in config.json solo un riferimento ${secret:server/CHIAVE}.")
+        self.move_secrets_btn.clicked.connect(self._move_secrets)
+        from mcp_hub import secrets as _secrets
+        self.move_secrets_btn.setVisible(_secrets.available())
 
         form = QFormLayout()
         self._form = form
@@ -151,6 +160,7 @@ class ServerDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(self.env_table)
         layout.addWidget(add_env_btn)
+        layout.addWidget(self.move_secrets_btn)
         layout.addLayout(buttons)
 
     def is_service(self) -> bool:
@@ -198,6 +208,38 @@ class ServerDialog(QDialog):
             value_edit.setEchoMode(QLineEdit.EchoMode.Password)
         else:
             value_edit.setEchoMode(QLineEdit.EchoMode.Normal)
+
+    def _move_secrets(self) -> None:
+        """Stores every plaintext secret-looking env value in the credential store and
+        puts its `${secret:...}` reference in the field. Nothing is saved to config.json
+        until the dialog is accepted."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from mcp_hub import secrets
+
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Segreti", "Dai prima un nome al server: i segreti sono salvati per nome.")
+            return
+        moved = 0
+        for row in range(self.env_table.rowCount()):
+            key_item = self.env_table.item(row, 0)
+            value_widget = self.env_table.cellWidget(row, 1)
+            if key_item is None or value_widget is None:
+                continue
+            key, value = key_item.text(), value_widget.text()
+            if not key or not value or secrets.parse_ref(value) or not secrets.is_secret_key(key):
+                continue
+            try:
+                secrets.set_secret(name, key, value)
+            except secrets.SecretError as exc:
+                QMessageBox.warning(self, "Segreti", f"Non riesco a salvare {key}: {exc}")
+                return
+            value_widget.setText(secrets.make_ref(name, key))
+            moved += 1
+        QMessageBox.information(
+            self, "Segreti",
+            f"{moved} segreti spostati nel credential store." if moved else "Nessun segreto in chiaro da spostare.")
 
     def result_name(self) -> str:
         return self.name_edit.text().strip()

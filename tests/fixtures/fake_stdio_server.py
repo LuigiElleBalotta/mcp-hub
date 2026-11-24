@@ -44,6 +44,7 @@ Supported methods:
     "test/tool_calls" -> {"names": [every tool name called so far]}.
   - "test/list_calls" -> {"calls": {method: n}}; "test/emit_list_changed" ->
     emits notifications/tools/list_changed (bumping the version), then answers {}.
+  - "test/getenv" {"name": N} -> {"value": os.environ.get(N)}.
   - "test/pid" -> {"pid": <this process id>}; "test/echo_meta" -> {"meta": <the
     request's params._meta>}.
   - "test/handshake_stats" -> {"initializes": n, "initializeds": m,
@@ -145,6 +146,9 @@ def _dispatch(req: dict) -> None:
         if os.environ.get("FAKE_PAGINATE") and not params.get("cursor"):
             result["nextCursor"] = "p2"
         _write({"jsonrpc": "2.0", "id": req_id, "result": result})
+        return
+    if method == "test/getenv":
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"value": os.environ.get(params.get("name", ""))}})
         return
     if method == "test/pid":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {"pid": os.getpid()}})

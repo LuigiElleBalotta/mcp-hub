@@ -23,6 +23,7 @@ from mcp_hub.cache import DiskCache, ListCache, cache_key
 from mcp_hub.metrics import ServerMetrics
 from mcp_hub.concurrency import ConcurrencyGuard
 from mcp_hub.paths import data_dir
+from mcp_hub.secrets import resolve_env as resolve_secrets
 from mcp_hub.session import RequestTable
 
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
@@ -644,7 +645,14 @@ class ManagedServer:
         # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
         # PATH to resolve at all. A bare `self.config.env` would silently drop
         # PATH the moment any server sets custom env vars.
-        env = {**os.environ, **self.config.env}
+        try:
+            # Secret references (`${secret:server/KEY}`) become their stored values only
+            # here, for the child's environment: never logged, never kept.
+            env = {**os.environ, **resolve_secrets(self.config.env)}
+        except OSError as exc:
+            self.status = "crashed"
+            self.append_log(f"[hub] cannot start {self.name}: {exc}")
+            raise
         # stdin must be piped: the hub proxies MCP requests to this process
         # over stdio (see hub_app._proxy), so there must be a write channel.
         # stderr must be its own pipe, NOT merged into stdout (stderr=STDOUT):
@@ -760,7 +768,12 @@ class ManagedServer:
             self.status = "crashed"
             return
         self.status = "starting"
-        env = {**os.environ, **self.config.env}
+        try:
+            env = {**os.environ, **resolve_secrets(self.config.env)}
+        except OSError as exc:
+            self.append_log(f"[hub] cannot start {self.name}: {exc}")
+            self.status = "crashed"
+            return
         resolved_command = shutil.which(self.config.command) or self.config.command
         try:
             self.process = await asyncio.create_subprocess_exec(
