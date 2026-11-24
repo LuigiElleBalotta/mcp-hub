@@ -38,6 +38,9 @@ Supported methods:
     counted per method; tools are named "t<version>" and the version bumps on
     "test/emit_list_changed". With env FAKE_PAGINATE the first page (no cursor)
     carries nextCursor "p2" and a cursor request returns page 2.
+  - env FAKE_TOOLS="a,b,c": tools/list returns those tool names instead of "t<version>".
+  - "tools/call": records the tool name and answers {"called": <name>};
+    "test/tool_calls" -> {"names": [every tool name called so far]}.
   - "test/list_calls" -> {"calls": {method: n}}; "test/emit_list_changed" ->
     emits notifications/tools/list_changed (bumping the version), then answers {}.
   - "test/pid" -> {"pid": <this process id>}; "test/echo_meta" -> {"meta": <the
@@ -58,7 +61,7 @@ _LIST_KEYS = {
 _out_lock = threading.Lock()
 _state = {"last_cancel": None, "last_srv_reply": None, "initializes": 0, "initializeds": 0,
           "protocolVersion": None, "pings": 0,
-          "list_calls": {}, "list_version": 0}
+          "list_calls": {}, "list_version": 0, "tool_calls": []}
 
 
 def _write(obj: dict) -> None:
@@ -131,7 +134,8 @@ def _dispatch(req: dict) -> None:
         _state["list_calls"][method] = _state["list_calls"].get(method, 0) + 1
         key = _LIST_KEYS[method]
         if method == "tools/list":
-            items = [{"name": f"t{_state['list_version']}", "inputSchema": {"type": "object"}}]
+            names = [n for n in os.environ.get("FAKE_TOOLS", "").split(",") if n] or [f"t{_state['list_version']}"]
+            items = [{"name": n, "description": f"tool {n}", "inputSchema": {"type": "object"}} for n in names]
         else:
             items = []
         result = {key: items}
@@ -144,6 +148,13 @@ def _dispatch(req: dict) -> None:
         return
     if method == "test/echo_meta":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {"meta": params.get("_meta")}})
+        return
+    if method == "tools/call":
+        _state["tool_calls"].append(params.get("name"))
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"called": params.get("name")}})
+        return
+    if method == "test/tool_calls":
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"names": list(_state["tool_calls"])}})
         return
     if method == "test/list_calls":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {"calls": _state["list_calls"]}})

@@ -12,6 +12,7 @@ from starlette.routing import Route
 from dataclasses import asdict
 
 from mcp_hub.config import BUILTIN_RIZZO, CONCURRENCY_MODES, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
+from mcp_hub.filters import PREFIX_RE
 from mcp_hub.manager import HubManager
 
 
@@ -191,6 +192,16 @@ def management_routes(
         window = server_config.restartWindow
         if not isinstance(window, (int, float)) or isinstance(window, bool) or window <= 0:
             return JSONResponse({"error": "restartWindow must be a number > 0"}, status_code=400)
+        for key in ("toolsAllow", "toolsDeny"):
+            patterns = getattr(server_config, key)
+            if not isinstance(patterns, list) or not all(isinstance(p, str) and p for p in patterns):
+                return JSONResponse({"error": f"{key} must be a list of non-empty strings"}, status_code=400)
+        prefix = server_config.toolPrefix
+        if not isinstance(prefix, str) or not PREFIX_RE.fullmatch(prefix):
+            return JSONResponse(
+                {"error": "toolPrefix must be at most 64 characters of letters, digits, '_', '-' or '.'"},
+                status_code=400,
+            )
         if server_config.startMode not in ("eager", "lazy"):
             return JSONResponse({"error": "startMode must be 'eager' or 'lazy'"}, status_code=400)
         idle = server_config.idleTimeout

@@ -66,10 +66,19 @@ class ServerConfig:
     startMode: Literal["eager", "lazy"] = "eager"
     idleTimeout: float = 0.0
     persistent: bool = False
+    # Tool filtering (hub-proxy-efficiency R6): glob patterns on the upstream's tool
+    # names (deny wins; empty allow = all) and a prefix the client sees on every name.
+    toolsAllow: list[str] = field(default_factory=list)
+    toolsDeny: list[str] = field(default_factory=list)
+    toolPrefix: str = ""
 
     @property
     def is_service(self) -> bool:
         return self.type == "service"
+
+    @property
+    def has_tool_filter(self) -> bool:
+        return bool(self.toolsAllow or self.toolsDeny or self.toolPrefix)
 
     @property
     def starts_with_hub(self) -> bool:
@@ -100,6 +109,7 @@ _MCP_ONLY_DEFAULTS = {
     "restart": "on-failure", "restartMaxAttempts": 5, "restartWindow": 300.0,
     "healthInterval": 30.0, "healthFailures": 3,
     "startMode": "eager", "idleTimeout": 0.0, "persistent": False,
+    "toolsAllow": [], "toolsDeny": [], "toolPrefix": "",
 }
 
 

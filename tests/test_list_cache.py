@@ -135,7 +135,7 @@ async def test_second_list_is_served_from_the_cache_for_any_session():
         second = await b.call(1, "tools/list")  # a DIFFERENT session
         third = await a.call(2, "tools/list")
         assert first["result"] == second["result"] == third["result"] == {"tools": [
-            {"name": "t0", "inputSchema": {"type": "object"}}]}
+            {"name": "t0", "description": "tool t0", "inputSchema": {"type": "object"}}]}
         assert second["id"] == 1 and third["id"] == 2, "each answer carries its own client's id"
         assert (await _calls(a))["tools/list"] == 1, "the upstream was asked exactly once"
         await a.close()

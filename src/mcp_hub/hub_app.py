@@ -14,6 +14,7 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route
 
 from mcp_hub.cache import CACHEABLE_LISTS, has_cursor
+from mcp_hub.filters import filter_tools_result, resolve_call
 from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
 from mcp_hub.security import HubSecurityMiddleware
@@ -129,6 +130,13 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
 
     session = HubSession(deliver)
 
+    def shaped(method: str, result: dict) -> dict:
+        """What this client may see of a list answer (R6: tool filter + prefix)."""
+        cfg = managed.config
+        if method == "tools/list" and cfg.has_tool_filter:
+            return filter_tools_result(result, cfg.toolsAllow, cfg.toolsDeny, cfg.toolPrefix)
+        return result
+
     async def handle_message(session_message: SessionMessage) -> None:
         payload_text = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
         obj = json.loads(payload_text)
@@ -157,6 +165,20 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         # A list request the cache may answer or fill (R1): page requests never.
         cache_method = obj.get("method") if (is_request and obj.get("method") in CACHEABLE_LISTS
                                              and not has_cursor(obj.get("params"))) else None
+
+        cfg = managed.config
+        if is_request and obj.get("method") == "tools/call" and cfg.has_tool_filter:
+            # R6: the client names a tool as IT sees it (prefixed, filtered). Map it
+            # back to the upstream's own name, or refuse a tool that does not exist
+            # for this client without bothering the upstream.
+            call_params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+            original = resolve_call(call_params.get("name"), cfg.toolsAllow, cfg.toolsDeny, cfg.toolPrefix)
+            if original is None:
+                await deliver({"jsonrpc": "2.0", "id": client_id, "error": {
+                    "code": -32602, "message": f"Unknown tool: {call_params.get('name')}"}})
+                return
+            obj["params"] = {**call_params, "name": original}
+            payload_text = json.dumps(obj)
 
         client_progress_token = None
         req_params = obj.get("params")
@@ -300,6 +322,9 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                         if managed.cache.put(cache_method, response_obj["result"], cache_generation):
                             managed.persist_cache()
                     response_obj = {**response_obj, "id": client_id}
+                    # Every tools/list answer, pages included (they never reach the cache).
+                    if obj.get("method") == "tools/list" and isinstance(response_obj.get("result"), dict):
+                        response_obj["result"] = shaped("tools/list", response_obj["result"])
                     await deliver(response_obj)
             except Exception:
                 # Log the "error" outcome too (not just the happy path): a
@@ -335,7 +360,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                 if cached is not None:
                     # Answered without touching the upstream (and even while it
                     # is restarting): the same list every client would get.
-                    await deliver({"jsonrpc": "2.0", "id": client_id, "result": cached})
+                    await deliver({"jsonrpc": "2.0", "id": client_id, "result": shaped(cache_method, cached)})
                     return
             managed.touch()
             if method is not None:
