@@ -235,6 +235,8 @@ the config: treat the folder the same way.
 | `allowedHosts`       | `[]`          | Extra `Host` header values accepted besides `127.0.0.1`, `localhost`, `[::1]` and `host` (each with the port). A request with another `Host` gets `403` (DNS-rebinding protection). A hub bound to `0.0.0.0`/`::`, or `["*"]`, skips this check. Omitted from `config.json` while empty. |
 | `preferredTransport` | `"sse"`       | Which endpoint `apply` writes into client configs: `"sse"` → `/<server>/sse` (exactly what it always wrote) or `"http"` → `/<server>/mcp` (Streamable HTTP, the transport that replaces SSE in the MCP spec). Omitted from `config.json` while default. |
 | `drainTimeout`       | `20`          | Seconds `/api/shutdown` (so the GUI's quit and self-update) waits for requests already in flight before the hub exits. `0` = don't wait. |
+| `metrics`            | `true`        | Collect the per-server dashboard metrics (counters, latency, recent calls; never arguments or results). Needs a hub restart. |
+| `registrySearch`     | `false`       | Offer *Search the MCP Registry* in the Add server dialog. Off by default: a search sends its text to registry.modelcontextprotocol.io. |
 | `allowedOrigins`     | `[]`          | Extra `Origin` values accepted. A request carrying an `Origin` that is not the hub's own gets `403`, so a web page cannot drive the hub; clients without an `Origin` (Claude Code, the GUI, `curl`) are unaffected. |
 | `autostart`          | `false`       | Informational flag mirrored by the GUI's "Avvia con Windows" checkbox, which registers/removes a Windows Task Scheduler entry (see below). |
 | `checkForUpdates`    | `true`        | GUI checks GitHub Releases for a newer version on startup and shows a banner if one exists. Never downloads or installs anything without an explicit click on "Installa e riavvia" (see [Auto-update](#auto-update)). |
@@ -329,6 +331,51 @@ their default value, so an untouched entry keeps its original shape.
 - **Connected clients survive configuration changes.** Adding, editing or removing
   *another* server used to leave every connected SSE client without a session (it hung);
   transports are now kept per server across route rebuilds.
+
+### Dashboard, tools, clients, secrets, groups
+
+- **Dashboard.** The table shows calls per minute, p95 latency and sessions per server;
+  selecting a row opens the **Detail** tab (process, uptime, restarts, sessions, requests
+  in flight, calls, errors, cache hits, p50/p95, last error and the recent calls). Only
+  method names (plus a tool's *name*) and durations are kept: never arguments or results.
+  `GET /api/servers/{name}/metrics` has the same data; `hub.metrics: false` turns it off.
+- **Tool tab.** Lists a server's tools with a checkbox each: unticking hides a tool from
+  clients, live, with no restart (the sessions stay and clients are told the list
+  changed). A tool hidden by a deny *pattern* is shown greyed out: edit the pattern from
+  the server dialog. The same tab has a **tester**: an argument form generated from the
+  tool's input schema (JSON text when there is none) and the result with its timing. A
+  tool that is not declared read-only asks for confirmation first. Reading a lazy or idle
+  server's tools starts it, so the list loads only while the tab is open.
+- **Sync clients.** `mcp-hub apply --client claude|cursor|vscode` (and the GUI's *Sync
+  clients* button) writes the hub's endpoints into Claude Code (`~/.claude.json` or a
+  project `.mcp.json`), Cursor (`~/.cursor/mcp.json`, `.cursor/mcp.json`) and VS Code (the
+  user `mcp.json` on Windows, `.vscode/mcp.json` in a project). It always plans first and
+  shows a diff with secrets masked (`--dry-run` stops there), backs the file up, writes
+  atomically, keeps the file's own indentation and touches only entries named like a hub
+  server. A file with comments or trailing commas is refused rather than guessed.
+  `mcp-hub rollback --client X` restores the newest backup (and is itself undoable).
+  `--scope project --project-dir D` targets a project file; `--only a,b` and
+  `--group NAME` narrow the servers. The old `apply --to <file>` still works unchanged.
+  Not offered: the VS Code user file on macOS/Linux (path not confirmed); Cursor follows
+  its documentation but was not run here.
+- **Secrets.** An env value can be `${secret:<server>/<KEY>}`: the real value lives in the
+  OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service)
+  under service `mcp-hub`, and is looked up only when the hub starts the process; config.json,
+  logs, status and metrics only ever hold the reference. The server dialog has **Sposta i
+  segreti nel credential store**; the CLI has `mcp-hub secrets list|migrate|set|delete`
+  (never printing a value). With no credential store everything keeps working with plain
+  env values. Renaming or removing a server does not delete its stored secrets.
+- **Groups.** Named sets of servers (`groups` in config.json): a selector filters the
+  table, *Avvia/Ferma gruppo* start and stop a whole set, *Gestisci gruppi…* edits them,
+  and `apply --group NAME` writes only that set into a client or project. A group is not
+  an endpoint: there is no aggregated MCP server behind it.
+- **MCP Registry search** (off by default: *Settings → Abilita la ricerca nel registry
+  MCP*). *Add server* then offers **Cerca nel registry MCP…**: it searches the official
+  registry (the search text is the only thing sent) and shows the full command line, the
+  environment variables and what is still missing. A pick only *pre-fills* the form; you
+  read, complete and save it yourself. Only npm (`npx`), pypi (`uvx`) and oci (`docker`)
+  stdio packages are offered; remote servers and other package kinds are listed with the
+  reason. Results are cached for six hours.
 
 ### Rizzo Flow / Jev (built-in)
 
@@ -442,9 +489,10 @@ the first time.
   lines.
 - **Avvia con Windows**: registers/removes autostart via Windows Task
   Scheduler (see below).
-- **Import from Claude Code config / Apply to Claude Code config**: GUI
-  wrappers around the `import`/`apply` CLI commands below, with a
-  confirmation dialog before any write.
+- **Import from Claude Code / Sync clients**: GUI wrappers around the `import` and
+  `apply` commands below (*Sync clients* shows a diff and backs up before writing, for
+  Claude Code, Cursor and VS Code; see
+  [Dashboard, tools, clients, secrets, groups](#dashboard-tools-clients-secrets-groups)).
 - **Update banner**: if a newer version is published on GitHub Releases
   (and `hub.checkForUpdates` is true), a banner appears with a link to
   download it.
