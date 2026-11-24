@@ -53,6 +53,13 @@ class ServerConfig:
     # unanswered pings in a row mark it unresponsive (hub-proxy-hardening R6).
     healthInterval: float = 30.0
     healthFailures: int = 3
+    # hub-proxy-efficiency R2. "lazy": not spawned with the hub, spawned on the
+    # first request the cache cannot answer. `idleTimeout` (seconds, 0 = never):
+    # stop it after that long with no client request, respawn on demand, unless
+    # `persistent` (a server that keeps state in memory must not be stopped).
+    startMode: Literal["eager", "lazy"] = "eager"
+    idleTimeout: float = 0.0
+    persistent: bool = False
 
     @property
     def is_service(self) -> bool:
@@ -65,7 +72,9 @@ class ServerConfig:
         MCP servers: whenever `enabled`. Services: only `enabled` AND
         `autostart`, so a heavy local service (GPU model) is never started
         behind the user's back."""
-        return self.enabled and (self.autostart if self.is_service else True)
+        if self.is_service:
+            return self.enabled and self.autostart
+        return self.enabled and self.startMode == "eager"
 
     @property
     def effective_port(self) -> int | None:
@@ -83,6 +92,7 @@ _SERVICE_ONLY_FIELDS = ("cwd", "healthUrl", "port", "healthTimeout", "autostart"
 _MCP_ONLY_DEFAULTS = {
     "restart": "on-failure", "restartMaxAttempts": 5, "restartWindow": 300.0,
     "healthInterval": 30.0, "healthFailures": 3,
+    "startMode": "eager", "idleTimeout": 0.0, "persistent": False,
 }
 
 

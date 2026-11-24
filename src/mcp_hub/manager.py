@@ -19,14 +19,15 @@ import psutil
 from pathlib import Path
 
 from mcp_hub.config import BUILTIN_RIZZO, Config, RizzoSettings, ServerConfig, load_config
-from mcp_hub.cache import ListCache
+from mcp_hub.cache import DiskCache, ListCache, cache_key
 from mcp_hub.concurrency import ConcurrencyGuard
+from mcp_hub.paths import data_dir
 from mcp_hub.session import RequestTable
 
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
 
-Status = Literal["stopped", "starting", "running", "restarting", "crashed"]
+Status = Literal["stopped", "starting", "running", "restarting", "idle", "crashed"]
 
 # Default asyncio.StreamReader line-length limit is 64 KiB (65536), which
 # raises ValueError out of readline()/`async for` iteration on any single
@@ -79,6 +80,8 @@ class ManagedServer:
     process: asyncio.subprocess.Process | None = None
     guard: ConcurrencyGuard = field(init=False)
     logs: collections.deque = field(default_factory=lambda: collections.deque(maxlen=500))
+    # Where a lazy server keeps its on-disk cache (default: <data dir>/cache).
+    cache_dir: Path | None = None
     # `pending`/`subscribers`/`_reader_task` back the single shared stdout
     # reader below (see `ensure_stdout_reader`/`_read_stdout`): exactly one
     # task consumes `process.stdout` per subprocess, no matter how many SSE
@@ -126,10 +129,90 @@ class ManagedServer:
     _restart_task: asyncio.Task | None = field(default=None, init=False, repr=False)
     restart_count: int = field(default=0, init=False)
     _ping_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    # Lazy start / idle shutdown (hub-proxy-efficiency R2).
+    disk_cache: DiskCache | None = field(default=None, init=False, repr=False)
+    _spawn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _last_activity: float = field(default_factory=time.monotonic, init=False, repr=False)
+    _idle_task: asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
         self.table = RequestTable(self.name)
+        if not self.config.is_service and self.config.startMode == "lazy":
+            self._load_disk_cache()
+            if self.status == "stopped":
+                self.status = "idle"  # not "stopped": it starts by itself when asked
+
+    def _load_disk_cache(self) -> None:
+        """A lazy server can answer initialize and its lists from the previous
+        run's files before it is ever spawned."""
+        directory = self.cache_dir or (data_dir() / "cache")
+        cfg = self.config
+        self.disk_cache = DiskCache(directory, self.name, cache_key(cfg.command, cfg.args, list(cfg.env)))
+        loaded = self.disk_cache.load()
+        if loaded is not None:
+            self.initialize_result = loaded["initialize"]
+            self.cache.load(loaded["lists"])
+
+    def persist_cache(self) -> None:
+        if self.disk_cache is not None:
+            self.disk_cache.save(self.initialize_result, self.cache.snapshot())
+
+    def touch(self) -> None:
+        """Records client activity for the idle watcher."""
+        self._last_activity = time.monotonic()
+
+    async def ensure_running(self) -> None:
+        """Spawns an `idle` server (lazy, or stopped by the idle watcher) on
+        demand. One spawn however many requests arrive at once; any other
+        status is left as it is (a deliberate stop or a crash is not undone).
+        Raises ConnectionError if the process cannot be started."""
+        if self.status != "idle" and not self._spawn_lock.locked():
+            return
+        # A spawn in progress shows as "starting": wait for it (the lock) instead
+        # of racing ahead to a process that does not exist yet.
+        async with self._spawn_lock:
+            if self.status != "idle":
+                return  # someone else spawned it while we waited
+            self._stopping = False
+            try:
+                await self._spawn()
+            except OSError as exc:
+                raise ConnectionError(f"managed server {self.name!r} failed to start: {exc}") from exc
+            self.touch()
+
+    def _start_idle_watch(self, process: asyncio.subprocess.Process) -> None:
+        self._cancel_idle_watch()
+        if self.config.idleTimeout > 0 and not self.config.persistent:
+            self._idle_task = asyncio.create_task(self._idle_loop(process))
+            self._idle_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+    def _cancel_idle_watch(self) -> None:
+        task, self._idle_task = self._idle_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _idle_loop(self, process: asyncio.subprocess.Process) -> None:
+        """Stops the upstream after `idleTimeout` seconds without a client
+        request, but never with one in flight (that is the drain: nothing is
+        cut off). The next request respawns it through `ensure_running`."""
+        timeout = self.config.idleTimeout
+        while process is self.process and process.returncode is None and not self._stopping:
+            await asyncio.sleep(max(0.02, min(timeout / 2, 5.0)))
+            if process is not self.process or self._stopping:
+                return
+            if len(self.table) > 0 or time.monotonic() - self._last_activity < timeout:
+                continue
+            async with self._spawn_lock:  # a racing request waits for the stop, then respawns
+                if process is not self.process or self._stopping or len(self.table) > 0:
+                    continue
+                self.append_log(f"[hub] {self.name} idle for {timeout:g}s: stopping it (it restarts on demand)")
+                self._stopping = True  # so `_watch` does not call this exit a crash
+                self.status = "idle"
+                self._ready_process = None
+                self._cancel_ping_loop()
+                await self._terminate_process_tree(process)
+            return
 
     def append_log(self, line: str) -> None:
         self.logs.append(_redact_line(line))
@@ -165,6 +248,8 @@ class ManagedServer:
         once per proxied connection (hub_app._proxy does), since only the
         first call actually starts anything.
         """
+        if self.process is None or self.process.stdout is None:
+            return  # nothing to read yet (lazy / idle server)
         if self._reader_task is None or self._reader_task.done():
             self._reader_task = asyncio.create_task(self._read_stdout())
 
@@ -226,7 +311,8 @@ class ManagedServer:
                     continue
                 method = obj.get("method")
                 if method is not None and msg_id is None:
-                    self.cache.invalidate_for_notification(method)  # then still broadcast below
+                    if self.cache.invalidate_for_notification(method):  # then still broadcast below
+                        self.persist_cache()
                 if method == "notifications/progress":
                     await self._route_progress(obj)
                     continue
@@ -323,6 +409,8 @@ class ManagedServer:
         self.initialize_result = response["result"]
         self._ready_process = process
         self._start_ping_loop(process)
+        self._start_idle_watch(process)
+        self.persist_cache()
         self.append_log(f"[hub] initialized {self.name} (protocol {response['result'].get('protocolVersion')})")
 
     async def _write_to_upstream(self, obj: dict) -> None:
@@ -405,6 +493,12 @@ class ManagedServer:
 
     async def _spawn(self) -> None:
         """Spawns the MCP subprocess: a manual start or an automatic restart."""
+        # Whatever the previous process left behind is settled BEFORE the new one
+        # exists: its reader is stopped (a late EOF must not reject requests of
+        # the new process) and its in-flight requests are answered with errors.
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+        self._reject_pending()
         self.initialize_result = None
         self._ready_process = None
         self.cache.clear()
@@ -582,16 +676,17 @@ class ManagedServer:
                 return
             await asyncio.sleep(0.5)
 
-    async def _terminate_process_tree(self) -> None:
+    async def _terminate_process_tree(self, process: asyncio.subprocess.Process | None = None) -> None:
         """Terminates `self.process` and every descendant (see `stop()` for why
         the whole tree), killing survivors. No status or restart bookkeeping:
         callers decide what the exit means (a deliberate stop, or an upstream
         the hub gave up on because it stopped answering)."""
-        if self.process is None or self.process.returncode is not None:
+        process = process or self.process
+        if process is None or process.returncode is not None:
             return
         children: list[psutil.Process] = []
         try:
-            children = psutil.Process(self.process.pid).children(recursive=True)
+            children = psutil.Process(process.pid).children(recursive=True)
         except psutil.Error:
             children = []
         for child in children:
@@ -600,14 +695,14 @@ class ManagedServer:
             except psutil.Error:
                 pass
         try:
-            self.process.terminate()
+            process.terminate()
         except ProcessLookupError:
             pass
         try:
-            await asyncio.wait_for(self.process.wait(), timeout=5)
+            await asyncio.wait_for(process.wait(), timeout=5)
         except asyncio.TimeoutError:
             try:
-                self.process.kill()
+                process.kill()
             except ProcessLookupError:
                 pass
         if children:
@@ -710,6 +805,7 @@ class ManagedServer:
         self._stopping = True
         self._cancel_restart()
         self._cancel_ping_loop()
+        self._cancel_idle_watch()
         if self._health_task is not None:
             self._health_task.cancel()
             self._health_task = None

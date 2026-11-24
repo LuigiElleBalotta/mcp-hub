@@ -34,7 +34,8 @@ def _mount_for(name: str, manager: HubManager) -> Mount:
     transport = SseServerTransport("/messages/")
 
     async def handle_sse(request):
-        assert managed.process is not None
+        # No `process` assertion: a lazy or idle server has none until a request
+        # needs it (`ensure_running` in `handle_message`).
         # NOTE: no `managed.guard.run(...)` around this whole SSE lifetime.
         # Task 6 review finding: an `exclusive` server's guard must gate one
         # JSON-RPC request's turn talking to the subprocess, not an entire
@@ -103,7 +104,6 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
     session = HubSession(deliver)
 
     async def handle_message(session_message: SessionMessage) -> None:
-        assert managed.process is not None and managed.process.stdin is not None
         payload_text = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
         obj = json.loads(payload_text)
         client_id = obj.get("id")
@@ -265,7 +265,8 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                     )
                     dispatch_done_logged = True
                     if cache_method and isinstance(response_obj.get("result"), dict):
-                        managed.cache.put(cache_method, response_obj["result"], cache_generation)
+                        if managed.cache.put(cache_method, response_obj["result"], cache_generation):
+                            managed.persist_cache()
                     response_obj = {**response_obj, "id": client_id}
                     await deliver(response_obj)
             except Exception:
@@ -285,6 +286,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                 if fut is not None:
                     managed.pending.pop(hub_id, None)
                     managed.table.complete(hub_id)
+                    managed.touch()
                     # `_reject_pending` may have failed this future while the
                     # stdin write above was already raising, so nothing ever
                     # awaits it: mark its exception as retrieved, otherwise
@@ -303,7 +305,16 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                     # is restarting): the same list every client would get.
                     await deliver({"jsonrpc": "2.0", "id": client_id, "result": cached})
                     return
+            managed.touch()
             if method is not None:
+                if method == "initialize" and is_request and managed.status == "idle" \
+                        and managed.initialize_result is not None:
+                    # Lazy/idle server: its last handshake answers the client
+                    # without spawning anything; the process starts when a
+                    # request actually needs it.
+                    await deliver({"jsonrpc": "2.0", "id": client_id, "result": managed.initialize_result})
+                    return
+                await managed.ensure_running()
                 await managed.ensure_ready()
                 if method == "initialize" and is_request:
                     # hub-proxy-hardening R4: never forwarded. Every client of

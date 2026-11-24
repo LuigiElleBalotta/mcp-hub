@@ -10,7 +10,9 @@
   - No structural refactor needed: `_proxy(read, write, managed)` already only sees SDK streams, so it IS the transport-independent pump. What was missing: `deliver(obj, related_request_id)` (progress and server requests carry the client's request id so Streamable HTTP can route them); `RequestTable` now returns the client id with a progress owner and `oldest_request()`.
 - [x] 3. List cache (memory) with invalidation, then disk cache
   - `cache.py`: `ListCache` (generation guard against a stale answer racing a `list_changed`), `DiskCache` + `cache_key`. The disk cache is built and tested here but only wired to lazy start in task 4. Lists are also served while the upstream is down/restarting.
-- [ ] 4. Lazy start, `ensure_running`, idle watcher, `persistent`, `idle` status
+- [x] 4. Lazy start, `ensure_running`, idle watcher, `persistent`, `idle` status
+  - `startMode`/`idleTimeout`/`persistent` (MCP only, omitted while default). Status `idle` = not running but starts by itself when asked; a deliberate Stop or a crash is NOT undone by a request. A lazy server answers `initialize` and cached lists from `<data dir>/cache/<name>.json` without spawning (key = command line + env NAMES). Idle shutdown never cuts a request in flight; status flips to `idle` before the process is gone on purpose (a request arriving then waits on the spawn lock, then respawns).
+  - Fixed on the way: `handle_sse`/`handle_message` asserted a process exists; `_spawn` now stops the previous process's stdout reader and rejects its pending requests first, so a late EOF cannot reject the new process's requests.
 - [ ] 5. Session modes: `isolated` pool and `session-aware` `_meta` injection
 - [ ] 6. Streamable HTTP endpoint and `preferredTransport` in `apply`
 - [ ] 7. Graceful drain, shutdown/self-update integration
