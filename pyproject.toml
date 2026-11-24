@@ -1,6 +1,6 @@
 [project]
 name = "mcp-hub"
-version = "1.2.0"
+version = "1.3.0"
 description = "Shared local hub for MCP servers, one process instead of one per Claude Code session"
 requires-python = ">=3.11"
 dependencies = [
