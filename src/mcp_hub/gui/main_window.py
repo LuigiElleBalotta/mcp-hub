@@ -13,7 +13,10 @@ from PySide6.QtWidgets import (
 from mcp_hub.gui.api_client import HubApiClient
 from mcp_hub.updater import UpdateInfo, check_for_update
 
-_STATUS_COLOR = {"running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828", "starting": "#f9a825"}
+_STATUS_COLOR = {
+    "running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828",
+    "starting": "#f9a825", "restarting": "#ef6c00",
+}
 
 
 class _UpdateCheckWorker(QThread):
@@ -450,6 +453,8 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 1, QTableWidgetItem("Service" if is_service else "MCP"))
             status_item = QTableWidgetItem(status)
             status_item.setForeground(QColor(_STATUS_COLOR.get(status, "#000000")))
+            if info.get("restarts"):
+                status_item.setToolTip(f"Riavviato automaticamente {info['restarts']} volte dall'avvio dell'hub")
             self.table.setItem(row, 2, status_item)
             # A service has no concurrency mode and no SSE endpoint: show its
             # port instead. MCP servers keep showing their concurrency.
@@ -467,7 +472,8 @@ class MainWindow(QMainWindow):
             stop_btn = QPushButton("Stop")
             busy = name in self._busy
             start_btn.setEnabled(not busy and status in ("stopped", "crashed"))
-            stop_btn.setEnabled(not busy and status in ("starting", "running"))
+            # "restarting": Stop cancels the pending automatic restart.
+            stop_btn.setEnabled(not busy and status in ("starting", "running", "restarting"))
             edit_btn = QPushButton("Edit")
             remove_btn = QPushButton("Remove")
             start_btn.clicked.connect(lambda _, n=name: self._start(n))

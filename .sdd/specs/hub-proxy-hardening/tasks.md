@@ -14,6 +14,6 @@
 - [x] 5. Hub-owned handshake and initialize cache
 - [x] 6. Auto-restart supervisor with backoff, circuit breaker, `restarting` status
 - [x] 7. Health ping loop wired to the restart policy
-- [ ] 8. GUI: settings dialog (allow-lists, generate token), server dialog (restart/health fields), `restarting` status
+- [x] 8. GUI: settings dialog (allow-lists, generate token), server dialog (restart/health fields), `restarting` status
 - [ ] 9. Docs: README (EN+IT) security section and restart/health settings, `config.example.json`
 - [ ] 10. Manual verification with real servers (gitlab, mariadb, chrome-real), then review/merge (`git flow feature finish`); patch release for R1 first if wanted

@@ -4,7 +4,7 @@ import re
 
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QComboBox, QPushButton, QVBoxLayout,
-    QHBoxLayout, QTableWidget, QTableWidgetItem, QCheckBox, QWidget,
+    QHBoxLayout, QTableWidget, QTableWidgetItem, QCheckBox, QWidget, QSpinBox,
 )
 
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
@@ -22,6 +22,23 @@ class ServerDialog(QDialog):
         self.concurrency_combo = QComboBox()
         self.concurrency_combo.addItems(["exclusive", "parallel"])
         self.concurrency_combo.setCurrentText(existing.get("concurrency", "exclusive"))
+
+        # MCP-only supervision (hub-proxy-hardening R5/R6). `restartWindow` and
+        # `healthFailures` are not edited here; an existing value is preserved.
+        self.restart_combo = QComboBox()
+        self.restart_combo.addItem("Riavvia se si ferma", "on-failure")
+        self.restart_combo.addItem("Mai", "never")
+        self.restart_combo.setCurrentIndex(1 if existing.get("restart") == "never" else 0)
+        self.restart_attempts_spin = QSpinBox()
+        self.restart_attempts_spin.setRange(1, 100)
+        self.restart_attempts_spin.setValue(int(existing.get("restartMaxAttempts", 5)))
+        self.restart_attempts_spin.setToolTip("Tentativi massimi nella finestra; poi resta in crashed finche' non lo avvii a mano.")
+        self.health_interval_spin = QSpinBox()
+        self.health_interval_spin.setRange(0, 3600)
+        self.health_interval_spin.setSuffix(" s")
+        self.health_interval_spin.setSpecialValueText("disattivato")
+        self.health_interval_spin.setValue(int(existing.get("healthInterval", 30)))
+        self.health_interval_spin.setToolTip("Ping periodico: un server vivo ma che non risponde viene riavviato.")
 
         # Service-only fields (type "service": a plain long-running process
         # such as a local HTTP server -- not an MCP server, never proxied).
@@ -58,11 +75,16 @@ class ServerDialog(QDialog):
         form.addRow("Command", self.command_edit)
         form.addRow("Args (space-separated)", self.args_edit)
         form.addRow("Concurrency", self.concurrency_combo)
+        form.addRow("Riavvio automatico", self.restart_combo)
+        form.addRow("Max riavvii", self.restart_attempts_spin)
+        form.addRow("Ping di salute ogni", self.health_interval_spin)
         form.addRow("Working directory", self.cwd_edit)
         form.addRow("Health URL", self.health_url_edit)
         form.addRow("Port", self.port_edit)
         form.addRow("", self.autostart_check)
-        self._mcp_only_widgets = [self.concurrency_combo]
+        self._mcp_only_widgets = [
+            self.concurrency_combo, self.restart_combo, self.restart_attempts_spin, self.health_interval_spin,
+        ]
         self._service_only_widgets = [self.cwd_edit, self.health_url_edit, self.port_edit, self.autostart_check]
         self.type_combo.currentIndexChanged.connect(self._apply_type)
         self._apply_type()
@@ -145,6 +167,14 @@ class ServerDialog(QDialog):
             "enabled": True,
         }
         if not self.is_service():
+            config.update({
+                "restart": self.restart_combo.currentData(),
+                "restartMaxAttempts": self.restart_attempts_spin.value(),
+                "healthInterval": float(self.health_interval_spin.value()),
+            })
+            for key in ("restartWindow", "healthFailures"):
+                if key in self._existing:
+                    config[key] = self._existing[key]
             return config
         port_text = self.port_edit.text().strip()
         config.update({
