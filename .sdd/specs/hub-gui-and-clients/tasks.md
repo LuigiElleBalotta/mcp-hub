@@ -10,7 +10,8 @@
   - DECISION - adapters that ship: Claude Code, Cursor (user + project), VS Code (Windows user file + any workspace `.vscode/mcp.json`). Not shipped: the VS Code user file on macOS/Linux.
 - [x] 2. Metrics collection and `/metrics` route; status snapshot additions
   - `metrics.py` (`ServerMetrics`: counters, nearest-rank p50/p95 over the last 200 calls, calls/min, last 50 calls as method+ms+ok), `ManagedServer.record_call/metrics_detail/session_count`, `GET /api/servers/{name}/metrics`, additive fields on `/api/status` (pid, uptime, sessions, inFlight, calls, errors, callsPerMin, p50, p95), `hub.metrics` switch (default on, omitted while default). Privacy proven by a test: a secret argument never appears in any metric, only the tool NAME is kept. An isolated server's numbers aggregate its sessions' processes.
-- [ ] 3. GUI dashboard: metric columns and detail pane
+- [x] 3. GUI dashboard: metric columns and detail pane
+  - Table gets Chiamate/min, p95 and Sessioni columns ("-" against an older hub, blank for services); Actions moved to the last column behind `ACTIONS_COL` instead of a hard-coded 4. `detail_pane.py` shows process, uptime, restarts, sessions, in-flight, calls, errors, cache hits, p50/p95, last error and the recent calls for the selected server, fetched off the GUI thread with the status poll (`HubApiClient.metrics()` returns None for a hub without the route). Detail and Log are now two tabs under the table: a first render showed the 11-row detail squeezing the table to two rows, found by looking at the offscreen render.
 - [ ] 4. Tools API (`/tools`, `/call`) and the Tools tab with filter checkboxes and tester
 - [ ] 5. Client sync: adapter framework, Claude Code adapter, diff preview, backup, rollback, CLI flags, then the confirmed extra adapters
 - [ ] 6. Secrets: `keyring` wrapper, `${secret:...}` resolution, GUI masked editing and "move to credential store", packaging

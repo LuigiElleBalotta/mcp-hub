@@ -131,6 +131,14 @@ class HubApiClient:
     def update_settings(self, **fields) -> dict:
         return self._client.put("/api/settings", json=fields).json()
 
+    def metrics(self, name: str) -> dict | None:
+        """Dashboard detail of one server, or None when the hub cannot give it
+        (an older hub has no such route and answers a plain-text 404)."""
+        resp = self._client.get(f"/api/servers/{name}/metrics")
+        if resp.status_code != 200 or "json" not in resp.headers.get("content-type", ""):
+            return None
+        return resp.json()
+
     def pid(self) -> int:
         return self._client.get("/api/pid").json()["pid"]
 

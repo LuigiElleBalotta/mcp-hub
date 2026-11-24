@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QEvent, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
@@ -12,6 +12,25 @@ from PySide6.QtWidgets import (
 
 from mcp_hub.gui.api_client import HubApiClient
 from mcp_hub.updater import UpdateInfo, check_for_update
+
+COLUMNS = ["Server", "Type", "Status", "Details", "Chiamate/min", "p95", "Sessioni", "Actions"]
+COL_CALLS, COL_P95, COL_SESSIONS, ACTIONS_COL = 4, 5, 6, 7
+
+
+def dashboard_cells(info: dict, is_service: bool) -> tuple[str, str, str]:
+    """(calls/min, p95, sessions) as shown in the table. A service has none of
+    these; an older hub does not send them (shown as "-")."""
+    if is_service:
+        return "", "", ""
+    calls = info.get("callsPerMin")
+    p95 = info.get("p95")
+    sessions = info.get("sessions")
+    return (
+        "-" if calls is None else str(calls),
+        "-" if p95 is None else (f"{p95:.0f} ms" if p95 >= 10 else f"{p95:.1f} ms"),
+        "-" if sessions is None else str(sessions),
+    )
+
 
 _STATUS_COLOR = {
     "running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828",
@@ -60,7 +79,8 @@ class _StatusWorker(QThread):
     thread's own direct calls (start/stop/upsert/remove, all short-lived
     and user-initiated) is fine.
     """
-    done = Signal(bool, object, object)  # (ok, statuses dict | None, (name, log lines) | None)
+    # (ok, statuses dict | None, (name, log lines) | None, (name, metrics dict | None) | None)
+    done = Signal(bool, object, object, object)
 
     def __init__(self, client: HubApiClient, log_name: str | None = None, parent=None):
         super().__init__(parent)
@@ -71,7 +91,7 @@ class _StatusWorker(QThread):
         try:
             statuses = self._client.status()
         except Exception:
-            self.done.emit(False, None, None)
+            self.done.emit(False, None, None, None)
             return
         # The selected server's log is refreshed on every tick too (a
         # service's startup output is the whole point of looking at it),
@@ -82,7 +102,13 @@ class _StatusWorker(QThread):
                 logs = (self._log_name, self._client.logs(self._log_name))
             except Exception:
                 logs = None
-        self.done.emit(True, statuses, logs)
+        metrics = None
+        if self._log_name is not None and self._log_name in statuses:
+            try:
+                metrics = (self._log_name, self._client.metrics(self._log_name))
+            except Exception:
+                metrics = (self._log_name, None)  # old hub / hiccup: the pane says "not available"
+        self.done.emit(True, statuses, logs, metrics)
 
 
 class _ActionWorker(QThread):
@@ -150,8 +176,8 @@ class MainWindow(QMainWindow):
         self._action_workers: list[_ActionWorker] = []
         self._busy: set[str] = set()  # servers with a start/stop call in flight
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Server", "Type", "Status", "Details", "Actions"])
+        self.table = QTableWidget(0, len(COLUMNS))
+        self.table.setHorizontalHeaderLabels(COLUMNS)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -161,7 +187,9 @@ class MainWindow(QMainWindow):
         # ResizeToContents (ignores cell widgets) nor Fixed (uses the default
         # section size) honour the button row, which then overflowed
         # leftwards and covered the Status/Details text.
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        for col in (COL_CALLS, COL_P95, COL_SESSIONS):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(ACTIONS_COL, QHeaderView.ResizeMode.Interactive)
         self._actions_width = 0
 
         self.connection_banner = QLabel("Hub non raggiungibile — nuovo tentativo tra 2s...")
@@ -213,10 +241,17 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
+        from mcp_hub.gui.detail_pane import DetailPane
         from mcp_hub.gui.log_panel import LogPanel
+        self.detail_pane = DetailPane()
         self.log_panel = LogPanel()
         self.table.itemSelectionChanged.connect(self._on_row_selected)
-        layout.addWidget(self.log_panel, 1)
+        # Under the table: the selected server's dashboard detail and its log, as tabs so
+        # neither squeezes the table (it is the thing people look at).
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.addTab(self.detail_pane, "Dettaglio")
+        self.bottom_tabs.addTab(self.log_panel, "Log")
+        layout.addWidget(self.bottom_tabs, 1)
 
         version_label = QLabel(f"mcp-hub v{mcp_hub.__version__}")
         version_label.setStyleSheet("color: #888; padding: 2px 4px;")
@@ -410,7 +445,7 @@ class MainWindow(QMainWindow):
 
     def _fit_actions_column(self) -> None:
         if self._actions_width:
-            self.table.setColumnWidth(4, self._actions_width)
+            self.table.setColumnWidth(ACTIONS_COL, self._actions_width)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -421,7 +456,7 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, 0) if row >= 0 else None
         return item.text() if item is not None else None
 
-    def _on_status_result(self, ok: bool, statuses: dict | None, logs: object = None) -> None:
+    def _on_status_result(self, ok: bool, statuses: dict | None, logs: object = None, metrics: object = None) -> None:
         if not ok:
             # Hub unreachable -- could be the first-run wizard's freshly
             # spawned hub still starting up, or a transient blip on an
@@ -466,6 +501,10 @@ class MainWindow(QMainWindow):
                 if info.get("sessions") is not None:  # an isolated server: one process per session
                     details = f"{details} ({info['sessions']})"
             self.table.setItem(row, 3, QTableWidgetItem(details))
+            for col, text in zip((COL_CALLS, COL_P95, COL_SESSIONS), dashboard_cells(info, is_service)):
+                cell = QTableWidgetItem(text)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(row, col, cell)
 
             actions = QWidget()
             actions_layout = QHBoxLayout(actions)
@@ -489,7 +528,7 @@ class MainWindow(QMainWindow):
             actions_layout.addWidget(stop_btn)
             actions_layout.addWidget(edit_btn)
             actions_layout.addWidget(remove_btn)
-            self.table.setCellWidget(row, 4, actions)
+            self.table.setCellWidget(row, ACTIONS_COL, actions)
             buttons = (start_btn, stop_btn, edit_btn, remove_btn)
             self._actions_width = max(
                 self._actions_width,
@@ -514,6 +553,12 @@ class MainWindow(QMainWindow):
             name, lines = logs
             if name == self._selected_name():
                 self.log_panel.show_logs(name, lines)
+        if metrics is not None:
+            name, data = metrics
+            if name == self._selected_name():
+                self.detail_pane.show_metrics(name, data)
+        elif selected is None:
+            self.detail_pane.clear()
 
     def _maybe_launch_hub(self) -> None:
         """Best-effort attempt to start the hub ourselves when it's never

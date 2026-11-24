@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QPushButton
 
 from mcp_hub import config as config_module
 from mcp_hub.config import Config, HubConfig, load_config, save_config
-from mcp_hub.gui.main_window import MainWindow
+from mcp_hub.gui.main_window import ACTIONS_COL, MainWindow
 from mcp_hub.gui.server_dialog import ServerDialog
 from mcp_hub.gui.settings_dialog import SettingsDialog
 
@@ -59,7 +59,7 @@ def test_restarting_status_has_its_own_color_tooltip_and_stop_button(window):
     assert item.text() == "restarting"
     assert item.foreground().color().name() == "#ef6c00"
     assert "3 volte" in item.toolTip()
-    buttons = {b.text(): b for b in window.table.cellWidget(row, 4).findChildren(QPushButton)}
+    buttons = {b.text(): b for b in window.table.cellWidget(row, ACTIONS_COL).findChildren(QPushButton)}
     assert buttons["Stop"].isEnabled(), "Stop cancels the pending automatic restart"
     assert not buttons["Start"].isEnabled()
     assert window.table.item(_row(window, "steady"), 2).toolTip() == ""
