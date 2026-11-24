@@ -48,6 +48,17 @@ def available() -> bool:
     return True
 
 
+def backend_name() -> str | None:
+    """Human name of the credential store in use ("Windows Credential Manager"...), or
+    None when there is none."""
+    try:
+        keyring = _backend()
+    except SecretStoreUnavailable:
+        return None
+    backend = keyring.get_keyring()
+    return str(getattr(backend, "name", None) or type(backend).__name__)
+
+
 def make_ref(server: str, key: str) -> str:
     return f"${{secret:{server}/{key}}}"
 

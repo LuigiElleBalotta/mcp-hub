@@ -85,6 +85,17 @@ class SettingsDialog(QDialog):
         self.drain_spin.setSpecialValueText("subito")
         self.drain_spin.setValue(int(hub.drainTimeout))
         self.drain_spin.setToolTip("Alla chiusura (o all'aggiornamento) l'hub aspetta tanto le richieste in corso prima di uscire.")
+        self.metrics_checkbox = QCheckBox("Raccogli le metriche di utilizzo (colonne e scheda Dettaglio)")
+        self.metrics_checkbox.setChecked(hub.metrics)
+        self.metrics_checkbox.setToolTip(
+            "Conteggi, latenza e chiamate recenti per server: solo il nome del metodo (e del tool) e la durata, "
+            "mai argomenti o risultati. Serve riavviare l'hub.")
+        from mcp_hub import secrets as _secrets
+        store = _secrets.backend_name()
+        self.secret_store_label = QLabel(
+            f"Credential store per i segreti: {store}" if store
+            else "Credential store per i segreti: non disponibile (le variabili restano in config.json)")
+        self.secret_store_label.setStyleSheet("color: #666;")
         self.registry_checkbox = QCheckBox("Abilita la ricerca nel registry MCP")
         self.registry_checkbox.setChecked(hub.registrySearch)
         self.registry_checkbox.setToolTip(
@@ -123,7 +134,9 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(warning)
+        layout.addWidget(self.metrics_checkbox)
         layout.addWidget(self.registry_checkbox)
+        layout.addWidget(self.secret_store_label)
         layout.addWidget(self.autostart_checkbox)
         layout.addWidget(self.check_updates_checkbox)
         layout.addWidget(self.beta_checkbox)
@@ -153,6 +166,7 @@ class SettingsDialog(QDialog):
         hub.preferredTransport = self.transport_combo.currentData()
         hub.drainTimeout = float(self.drain_spin.value())
         hub.registrySearch = self.registry_checkbox.isChecked()
+        hub.metrics = self.metrics_checkbox.isChecked()
         new_autostart = self.autostart_checkbox.isChecked()
         hub.autostart = new_autostart
         hub.checkForUpdates = self.check_updates_checkbox.isChecked()
