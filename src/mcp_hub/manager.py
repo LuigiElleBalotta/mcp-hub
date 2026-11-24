@@ -43,6 +43,9 @@ HANDSHAKE_TIMEOUT = 120.0
 # attempt waits BASE * 2**n seconds, capped, with +/-20% jitter so several
 # servers that died together do not all respawn in the same instant.
 RESTART_BASE_DELAY = 1.0
+
+# How long a hub ping may stay unanswered before it counts as a failure.
+HEALTH_PING_TIMEOUT = 10.0
 RESTART_MAX_DELAY = 60.0
 
 
@@ -117,6 +120,7 @@ class ManagedServer:
     _restart_times: collections.deque = field(default_factory=collections.deque, init=False, repr=False)
     _restart_task: asyncio.Task | None = field(default=None, init=False, repr=False)
     restart_count: int = field(default=0, init=False)
+    _ping_task: asyncio.Task | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
@@ -311,6 +315,7 @@ class ManagedServer:
         await self._write_to_upstream({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.initialize_result = response["result"]
         self._ready_process = process
+        self._start_ping_loop(process)
         self.append_log(f"[hub] initialized {self.name} (protocol {response['result'].get('protocolVersion')})")
 
     async def _write_to_upstream(self, obj: dict) -> None:
@@ -391,6 +396,7 @@ class ManagedServer:
         """Spawns the MCP subprocess: a manual start or an automatic restart."""
         self.initialize_result = None
         self._ready_process = None
+        self._cancel_ping_loop()
         self.status = "starting"
         # Merge with the parent's environment rather than replacing it: several
         # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
@@ -564,6 +570,88 @@ class ManagedServer:
                 return
             await asyncio.sleep(0.5)
 
+    async def _terminate_process_tree(self) -> None:
+        """Terminates `self.process` and every descendant (see `stop()` for why
+        the whole tree), killing survivors. No status or restart bookkeeping:
+        callers decide what the exit means (a deliberate stop, or an upstream
+        the hub gave up on because it stopped answering)."""
+        if self.process is None or self.process.returncode is not None:
+            return
+        children: list[psutil.Process] = []
+        try:
+            children = psutil.Process(self.process.pid).children(recursive=True)
+        except psutil.Error:
+            children = []
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.Error:
+                pass
+        try:
+            self.process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                self.process.kill()
+            except ProcessLookupError:
+                pass
+        if children:
+            _gone, alive = await asyncio.to_thread(psutil.wait_procs, children, 5)
+            for child in alive:
+                try:
+                    child.kill()
+                except psutil.Error:
+                    pass
+
+    # -- health ping (hub-proxy-hardening R6) ------------------------------
+
+    def _start_ping_loop(self, process: asyncio.subprocess.Process) -> None:
+        self._cancel_ping_loop()
+        if self.config.healthInterval > 0:
+            self._ping_task = asyncio.create_task(self._ping_loop(process))
+            self._ping_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+    def _cancel_ping_loop(self) -> None:
+        task, self._ping_task = self._ping_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _ping_loop(self, process: asyncio.subprocess.Process) -> None:
+        """Pings the upstream through the hub's own channel (no guard, so a long
+        tool call never blocks it). `healthFailures` unanswered pings in a row
+        mean the process is alive but not serving: it is terminated, and the
+        normal exit handling applies the restart policy.
+
+        A ping is neither sent nor counted while client requests are in flight:
+        a busy single-threaded server answers late, which is not evidence that
+        it is hung."""
+        failures = 0
+        while process is self.process and process.returncode is None and not self._stopping:
+            await asyncio.sleep(self.config.healthInterval)
+            if process is not self.process or process.returncode is not None or self._stopping:
+                return
+            if len(self.table) > 0:
+                continue
+            try:
+                response = await self.hub_request("ping", {}, timeout=HEALTH_PING_TIMEOUT)
+                answered = "result" in response
+            except (asyncio.TimeoutError, ConnectionError):
+                answered = False
+            if answered:
+                failures = 0
+                continue
+            if len(self.table) > 0 or process is not self.process or self._stopping:
+                continue  # it became busy (or went away) meanwhile: not a verdict
+            failures += 1
+            self.append_log(f"[hub] {self.name} did not answer ping ({failures}/{self.config.healthFailures})")
+            if failures >= self.config.healthFailures:
+                self.append_log(f"[hub] {self.name} is unresponsive: terminating it")
+                await self._terminate_process_tree()
+                return
+
     async def stop(self) -> None:
         """Stops this server's subprocess AND every descendant it has spawned.
 
@@ -609,38 +697,11 @@ class ManagedServer:
         """
         self._stopping = True
         self._cancel_restart()
+        self._cancel_ping_loop()
         if self._health_task is not None:
             self._health_task.cancel()
             self._health_task = None
-        if self.process is not None and self.process.returncode is None:
-            children: list[psutil.Process] = []
-            try:
-                children = psutil.Process(self.process.pid).children(recursive=True)
-            except psutil.Error:
-                children = []
-            for child in children:
-                try:
-                    child.terminate()
-                except psutil.Error:
-                    pass
-            try:
-                self.process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                try:
-                    self.process.kill()
-                except ProcessLookupError:
-                    pass
-            if children:
-                _gone, alive = await asyncio.to_thread(psutil.wait_procs, children, 5)
-                for child in alive:
-                    try:
-                        child.kill()
-                    except psutil.Error:
-                        pass
+        await self._terminate_process_tree()
         self.status = "stopped"
         port = self.config.effective_port
         if self.config.is_service and port is not None:

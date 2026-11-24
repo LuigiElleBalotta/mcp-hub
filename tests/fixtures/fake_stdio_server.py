@@ -31,6 +31,9 @@ Supported methods:
   - "initialize": counted; answers a plausible MCP initialize result, or a
     JSON-RPC error when the env var FAKE_FAIL_INIT is set. A client's
     `notifications/initialized` is counted too.
+  - "ping": counted and answered {} -- unless env FAKE_IGNORE_PING is set, in
+    which case it is swallowed (an alive-but-hung server).
+  - "test/ping_count" -> {"pings": n}.
   - "test/handshake_stats" -> {"initializes": n, "initializeds": m,
     "protocolVersion": <version the initialize asked for>}.
 """
@@ -42,7 +45,7 @@ import time
 
 _out_lock = threading.Lock()
 _state = {"last_cancel": None, "last_srv_reply": None, "initializes": 0, "initializeds": 0,
-          "protocolVersion": None}
+          "protocolVersion": None, "pings": 0}
 
 
 def _write(obj: dict) -> None:
@@ -101,6 +104,15 @@ def _dispatch(req: dict) -> None:
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "fake", "version": "9.9"},
         }})
+        return
+    if method == "ping":
+        _state["pings"] += 1
+        if os.environ.get("FAKE_IGNORE_PING"):
+            return
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {}})
+        return
+    if method == "test/ping_count":
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"pings": _state["pings"]}})
         return
     if method == "test/handshake_stats":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {

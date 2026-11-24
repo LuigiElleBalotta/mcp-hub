@@ -137,6 +137,12 @@ def management_routes(
         window = server_config.restartWindow
         if not isinstance(window, (int, float)) or isinstance(window, bool) or window <= 0:
             return JSONResponse({"error": "restartWindow must be a number > 0"}, status_code=400)
+        interval = server_config.healthInterval
+        if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval < 0:
+            return JSONResponse({"error": "healthInterval must be a number >= 0"}, status_code=400)
+        failures = server_config.healthFailures
+        if not isinstance(failures, int) or isinstance(failures, bool) or failures < 1:
+            return JSONResponse({"error": "healthFailures must be an integer >= 1"}, status_code=400)
         # HubManager.upsert stops any previously-running process for `name`
         # itself before replacing the entry (round-2 review fix), so the
         # freshly-returned `managed` here is a brand-new ManagedServer with

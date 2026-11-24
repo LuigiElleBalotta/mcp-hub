@@ -49,6 +49,10 @@ class ServerConfig:
     restart: Literal["never", "on-failure"] = "on-failure"
     restartMaxAttempts: int = 5
     restartWindow: float = 300.0
+    # Seconds between hub pings of an MCP server (0 = off) and how many
+    # unanswered pings in a row mark it unresponsive (hub-proxy-hardening R6).
+    healthInterval: float = 30.0
+    healthFailures: int = 3
 
     @property
     def is_service(self) -> bool:
@@ -76,7 +80,10 @@ class ServerConfig:
 _SERVICE_ONLY_FIELDS = ("cwd", "healthUrl", "port", "healthTimeout", "autostart")
 # MCP-only fields and their defaults: omitted from config.json while default,
 # so an untouched entry keeps its original on-disk shape.
-_MCP_ONLY_DEFAULTS = {"restart": "on-failure", "restartMaxAttempts": 5, "restartWindow": 300.0}
+_MCP_ONLY_DEFAULTS = {
+    "restart": "on-failure", "restartMaxAttempts": 5, "restartWindow": 300.0,
+    "healthInterval": 30.0, "healthFailures": 3,
+}
 
 
 def server_to_dict(sc: ServerConfig) -> dict:
