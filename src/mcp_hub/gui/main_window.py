@@ -7,7 +7,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QHBoxLayout, QLabel, QHeaderView, QMenu, QStyle,
-    QSystemTrayIcon, QTabWidget,
+    QSystemTrayIcon, QTabWidget, QComboBox,
 )
 
 from mcp_hub.gui.api_client import HubApiClient
@@ -220,24 +220,43 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.tabs, 1)
         servers_page = QWidget()
         layout = QVBoxLayout(servers_page)
+        # Groups: filter the list, start/stop a whole set, manage them (R5).
+        self.group_combo = QComboBox()
+        self.group_combo.addItem("Tutti i server", None)
+        self.group_start_btn = QPushButton("Avvia gruppo")
+        self.group_stop_btn = QPushButton("Ferma gruppo")
+        self.manage_groups_btn = QPushButton("Gestisci gruppi...")
+        self.group_combo.currentIndexChanged.connect(self._group_changed)
+        self.group_start_btn.clicked.connect(lambda: self._group_action("start"))
+        self.group_stop_btn.clicked.connect(lambda: self._group_action("stop"))
+        self.manage_groups_btn.clicked.connect(self._manage_groups)
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel("Gruppo:"))
+        group_row.addWidget(self.group_combo, 1)
+        group_row.addWidget(self.group_start_btn)
+        group_row.addWidget(self.group_stop_btn)
+        group_row.addWidget(self.manage_groups_btn)
+        layout.addLayout(group_row)
+        self._groups: dict[str, list[str]] = {}
         layout.addWidget(self.table, 2)
 
         add_btn = QPushButton("Add server")
         add_btn.clicked.connect(self._add_server)
-        layout.addWidget(add_btn)
-
-        import_btn = QPushButton("Import from Claude Code config")
-        apply_btn = QPushButton("Sync clients (Claude Code, Cursor, VS Code)")
+        import_btn = QPushButton("Import from Claude Code")
+        apply_btn = QPushButton("Sync clients")
+        apply_btn.setToolTip("Scrive gli endpoint dell'hub in Claude Code, Cursor e VS Code (con anteprima e backup)")
         reload_btn = QPushButton("Reload config.json")
         settings_btn = QPushButton("Settings")
         import_btn.clicked.connect(self._import_from_claude)
         apply_btn.clicked.connect(self._sync_clients)
         reload_btn.clicked.connect(self._reload_config)
         settings_btn.clicked.connect(self._open_settings)
-        layout.addWidget(import_btn)
-        layout.addWidget(apply_btn)
-        layout.addWidget(reload_btn)
-        layout.addWidget(settings_btn)
+        # One row, not five full-width buttons stacked: those took ~150 px and squeezed the
+        # server table (the thing people look at) down to a row or two.
+        buttons_row = QHBoxLayout()
+        for button in (add_btn, import_btn, apply_btn, reload_btn, settings_btn):
+            buttons_row.addWidget(button)
+        layout.addLayout(buttons_row)
 
         self.setCentralWidget(central)
 
@@ -270,6 +289,7 @@ class MainWindow(QMainWindow):
             lambda i: self.rizzo_panel.refresh_detection() if i == 1 else None)
 
         self._init_tray()
+        self._reload_groups()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -483,6 +503,9 @@ class MainWindow(QMainWindow):
         builtin = {n: i for n, i in statuses.items() if i.get("builtin")}
         self.rizzo_panel.on_hub_status(next(iter(builtin.values()), None), reachable=True)
         statuses = {n: i for n, i in statuses.items() if n not in builtin}
+        group = self.group_combo.currentData()
+        if group is not None:  # a group narrows the list to its members
+            statuses = {n: i for n, i in statuses.items() if n in self._groups.get(group, [])}
         selected = self._selected_name()
         self.table.setRowCount(len(statuses))
         for row, (name, info) in enumerate(sorted(statuses.items())):
@@ -653,6 +676,51 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(client=self.client, parent=self)
         if dialog.exec():
             dialog.apply()
+
+    def _reload_groups(self, groups: dict[str, list[str]] | None = None) -> None:
+        """Re-reads the groups (config.json, which the hub keeps up to date) into the
+        selector, keeping the current choice if it still exists."""
+        if groups is None:
+            from mcp_hub.config import load_config
+            try:
+                groups = load_config().groups
+            except (OSError, ValueError, TypeError):
+                groups = self._groups
+        self._groups = groups
+        current = self.group_combo.currentData()
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("Tutti i server", None)
+        for name in groups:
+            self.group_combo.addItem(name, name)
+        index = self.group_combo.findData(current)
+        self.group_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.group_combo.blockSignals(False)
+        self._update_group_buttons()
+
+    def _update_group_buttons(self) -> None:
+        has_group = self.group_combo.currentData() is not None
+        self.group_start_btn.setEnabled(has_group)
+        self.group_stop_btn.setEnabled(has_group)
+
+    def _group_changed(self, _index: int) -> None:
+        self._update_group_buttons()
+        self.refresh()
+
+    def _group_action(self, action: str) -> None:
+        group = self.group_combo.currentData()
+        if group is not None:
+            self._run_action(lambda g, a=action: self.client.group_action(g, a), group)
+
+    def _manage_groups(self) -> None:
+        from mcp_hub.config import BUILTIN_RIZZO, load_config
+        from mcp_hub.gui.groups_dialog import GroupsDialog
+        servers = [n for n in load_config().servers if n != BUILTIN_RIZZO]
+        dialog = GroupsDialog(self.client, servers, self._groups, parent=self)
+        dialog.exec()
+        if dialog.changed:
+            self._reload_groups()
+            self.refresh()
 
     def _sync_tools_panel(self) -> None:
         """Points the Tool tab at the selected row. Its list is only FETCHED while the

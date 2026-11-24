@@ -68,6 +68,7 @@ class DetailPane(QWidget):
         self.recent = QPlainTextEdit()
         self.recent.setReadOnly(True)
         self.recent.setPlaceholderText("Nessuna chiamata recente")
+        self.recent.setMinimumHeight(48)  # a small floor: the table above matters more than this list
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.addWidget(self.title)

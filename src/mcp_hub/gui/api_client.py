@@ -164,6 +164,19 @@ class HubApiClient:
             body["toolPrefix"] = prefix
         return self._json_or_raise(self._client.put(f"/api/servers/{name}/filters", json=body))
 
+    def groups(self) -> dict[str, list[str]]:
+        return self._json_or_raise(self._client.get("/api/groups"))["groups"]
+
+    def put_group(self, name: str, servers: list[str]) -> dict:
+        return self._json_or_raise(self._client.put(f"/api/groups/{name}", json={"servers": servers}))
+
+    def delete_group(self, name: str) -> dict:
+        return self._json_or_raise(self._client.delete(f"/api/groups/{name}"))
+
+    def group_action(self, name: str, action: str) -> dict:
+        """Starts or stops every server of a group; returns each server's resulting status."""
+        return self._json_or_raise(self._client.post(f"/api/groups/{name}/{action}", timeout=_SLOW_TIMEOUT))
+
     def pid(self) -> int:
         return self._client.get("/api/pid").json()["pid"]
 

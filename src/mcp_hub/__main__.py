@@ -116,7 +116,11 @@ def cmd_apply_client(args: argparse.Namespace, config) -> None:
                  "use --scope project --project-dir <dir> for a project file.")
     only = [n for n in args.only.split(",") if n] if args.only else None
     path = _client_path(adapter, args)
-    plan = plan_sync(adapter, path, config, sync_names(config, only))
+    try:
+        names = sync_names(config, only, group=args.group)
+    except ValueError as exc:
+        sys.exit(f"{exc} (known groups: {', '.join(sorted(config.groups)) or 'none'})")
+    plan = plan_sync(adapter, path, config, names)
     print(plan.summary())
     print(f"File: {path}")
     if plan.error:
@@ -166,6 +170,32 @@ def cmd_secrets(args: argparse.Namespace) -> None:
         print("Deleted." if store.delete_secret(args.server, args.key) else "There was no such secret.")
 
 
+def cmd_groups(args: argparse.Namespace) -> None:
+    from mcp_hub.config import valid_group_name
+
+    config = load_config()
+    if args.action == "list":
+        for name, members in config.groups.items():
+            print(f"{name}: {', '.join(members) or '(empty)'}")
+        if not config.groups:
+            print("No groups.")
+    elif args.action == "set":
+        if not valid_group_name(args.name):
+            sys.exit("Group name: 1-40 characters of letters, digits, space . _ -")
+        members = [m for m in args.servers.split(",") if m]
+        unknown = [m for m in members if m not in config.servers]
+        if unknown:
+            sys.exit(f"Unknown server(s): {', '.join(unknown)}")
+        config.groups[args.name] = list(dict.fromkeys(members))
+        save_config(config)
+        print(f"Group {args.name}: {', '.join(config.groups[args.name]) or '(empty)'}")
+    elif args.action == "delete":
+        if config.groups.pop(args.name, None) is None:
+            sys.exit(f"Unknown group: {args.name}")
+        save_config(config)
+        print("Deleted.")
+
+
 def cmd_rollback(args: argparse.Namespace) -> None:
     from mcp_hub.client_sync import ADAPTERS, rollback
 
@@ -180,7 +210,7 @@ def cmd_rollback(args: argparse.Namespace) -> None:
 
 def cmd_apply(args: argparse.Namespace) -> None:
     config = load_config()
-    if args.client or args.dry_run:
+    if args.client or args.dry_run or args.group:
         cmd_apply_client(args, config)
         return
     if not args.to_path:
@@ -226,10 +256,21 @@ def main() -> None:
     apply_parser.add_argument("--scope", choices=["user", "project"], default="user")
     apply_parser.add_argument("--project-dir", default=None, help="folder of the project file (--scope project)")
     apply_parser.add_argument("--only", default=None, help="comma-separated server names")
+    apply_parser.add_argument("--group", default=None, help="only the servers of this group")
     apply_parser.add_argument("--dry-run", action="store_true", help="show the diff, write nothing")
     apply_parser.add_argument("--cleanup", action="store_true")
     apply_parser.add_argument("--yes", action="store_true")
     apply_parser.set_defaults(func=cmd_apply)
+
+    groups_parser = sub.add_parser("groups", help="named sets of servers")
+    groups_sub = groups_parser.add_subparsers(dest="action", required=True)
+    groups_sub.add_parser("list")
+    gset = groups_sub.add_parser("set", help="create or replace a group")
+    gset.add_argument("name")
+    gset.add_argument("servers", help="comma-separated server names")
+    gdel = groups_sub.add_parser("delete")
+    gdel.add_argument("name")
+    groups_parser.set_defaults(func=cmd_groups)
 
     secrets_parser = sub.add_parser("secrets", help="keep env secrets in the OS credential store")
     secrets_sub = secrets_parser.add_subparsers(dest="action", required=True)

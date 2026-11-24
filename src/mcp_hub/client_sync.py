@@ -273,8 +273,13 @@ def rollback(path: Path) -> Path:
     return chosen
 
 
-def sync_names(hub_config: Config, only: list[str] | None = None) -> list[str]:
+def sync_names(hub_config: Config, only: list[str] | None = None, group: str | None = None) -> list[str]:
     """The servers worth writing into a client: enabled MCP servers (a service is not
-    an MCP server), optionally narrowed to `only`."""
+    an MCP server), optionally narrowed to `only` and to the members of `group`.
+    An unknown group is an error, not "nothing": a typo must not write an empty set."""
     names = [n for n, s in hub_config.servers.items() if s.enabled and not s.is_service]
+    if group is not None:
+        if group not in hub_config.groups:
+            raise ValueError(f"unknown group: {group}")
+        names = [n for n in names if n in hub_config.groups[group]]
     return [n for n in names if only is None or n in only]

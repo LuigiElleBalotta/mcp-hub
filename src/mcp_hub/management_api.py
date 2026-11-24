@@ -13,7 +13,7 @@ from starlette.routing import Route
 
 from dataclasses import asdict
 
-from mcp_hub.config import BUILTIN_RIZZO, CONCURRENCY_MODES, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
+from mcp_hub.config import BUILTIN_RIZZO, CONCURRENCY_MODES, CONFIG_PATH, ServerConfig, valid_group_name, rizzo_settings_from_dict, save_config
 from mcp_hub.filters import PREFIX_RE, is_glob, tool_visible
 from mcp_hub.manager import HubManager
 
@@ -281,6 +281,64 @@ def management_routes(
             "ms": round((time.monotonic() - started) * 1000, 1), "readOnly": read_only,
         })
 
+    async def groups_list(request: Request) -> JSONResponse:
+        return JSONResponse({"groups": {n: list(m) for n, m in manager.config.groups.items()}})
+
+    async def group_put(request: Request) -> JSONResponse:
+        """Creates or replaces a group. Members must be existing servers (the built-in
+        Rizzo service is managed on its own tab and cannot be grouped)."""
+        name = request.path_params["name"]
+        if not valid_group_name(name):
+            return JSONResponse({"error": "group name: 1-40 characters of letters, digits, space . _ -"}, status_code=400)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+        members = body.get("servers") if isinstance(body, dict) else None
+        if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+            return JSONResponse({"error": "expected {servers: [name, ...]}"}, status_code=400)
+        unknown = [m for m in members if m not in manager.config.servers]
+        if unknown:
+            return JSONResponse({"error": f"unknown server(s): {', '.join(unknown)}"}, status_code=400)
+        manager.config.groups[name] = list(dict.fromkeys(members))  # no duplicates, order kept
+        save_config(manager.config)
+        return JSONResponse({"group": name, "servers": manager.config.groups[name]})
+
+    async def group_delete(request: Request) -> JSONResponse:
+        name = request.path_params["name"]
+        if name not in manager.config.groups:
+            return JSONResponse({"error": f"unknown group: {name}"}, status_code=404)
+        del manager.config.groups[name]
+        save_config(manager.config)
+        return JSONResponse({"status": "removed"})
+
+    async def group_action(request: Request) -> JSONResponse:
+        """Starts or stops every server of a group, one after the other."""
+        name = request.path_params["name"]
+        action = request.path_params["action"]
+        if name not in manager.config.groups:
+            return JSONResponse({"error": f"unknown group: {name}"}, status_code=404)
+        results: dict[str, str] = {}
+        for member in manager.config.groups[name]:
+            try:
+                server = manager.get(member)
+            except KeyError:
+                results[member] = "missing"  # a server removed after it was grouped
+                continue
+            if action == "start":
+                if not server.config.enabled:
+                    results[member] = "disabled"
+                    continue
+                try:
+                    await server.start()
+                except OSError as exc:
+                    results[member] = f"error: {exc}"
+                    continue
+            else:
+                await server.stop()
+            results[member] = server.status
+        return JSONResponse({"results": results})
+
     def _rizzo_state() -> dict:
         snapshot = manager.status_snapshot().get(BUILTIN_RIZZO)
         return {"settings": asdict(manager.config.rizzo), "status": snapshot["status"] if snapshot else None}
@@ -394,6 +452,10 @@ def management_routes(
         Route("/api/servers/{name}/metrics", server_metrics, methods=["GET"]),
         Route("/api/servers/{name}/tools", server_tools, methods=["GET"]),
         Route("/api/servers/{name}/call", call_tool, methods=["POST"]),
+        Route("/api/groups", groups_list, methods=["GET"]),
+        Route("/api/groups/{name}", group_put, methods=["PUT"]),
+        Route("/api/groups/{name}", group_delete, methods=["DELETE"]),
+        Route("/api/groups/{name}/{action}", group_action, methods=["POST"]),
         Route("/api/servers/{name}/filters", set_filters, methods=["PUT"]),
         Route("/api/servers/{name}", upsert, methods=["POST"]),
         Route("/api/servers/{name}", remove, methods=["DELETE"]),

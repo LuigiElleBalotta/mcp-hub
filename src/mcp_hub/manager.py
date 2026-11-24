@@ -1105,6 +1105,9 @@ class HubManager:
         if existing is not None:
             await existing.stop()
         self.config.servers.pop(name, None)
+        for members in self.config.groups.values():  # a removed server leaves its groups too
+            while name in members:
+                members.remove(name)
 
     async def reload_from_disk(self, path: Path) -> tuple[list[str], list[str], list[str]]:
         """Re-reads `config.json` and applies the difference against the
@@ -1148,6 +1151,7 @@ class HubManager:
             if name not in new_config.servers:
                 removed.append(name)
                 await self.remove(name)
+        self.config.groups = new_config.groups  # a hand-edited config.json may have changed them too
         if new_config.rizzo != self.config.rizzo:
             updated.append(BUILTIN_RIZZO)
             managed = await self.apply_rizzo(new_config.rizzo)
