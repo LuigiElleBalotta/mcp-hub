@@ -478,7 +478,10 @@ a cui instradare la prima volta.
   [Dashboard, tool, client, segreti, gruppi](#dashboard-tool-client-segreti-gruppi)).
 - **Banner aggiornamento**: se una versione più recente è pubblicata su
   GitHub Releases (e `hub.checkForUpdates` è vero), compare un banner con
-  un link per scaricarla.
+  un link per scaricarla. Se l'app può aggiornarsi da sola (vedi sotto),
+  la GUI **chiede** anche con una finestra: *Installa e riavvia*, *Più tardi*
+  o *Salta questa versione* (ricordata). Chiede una sola volta per versione
+  e per avvio, ricontrolla ogni 6 ore e non installa mai senza risposta.
 - **Installa e riavvia** (mostrato solo eseguendo l'`.exe` compilato, non
   `python -m mcp_hub.gui`, e solo quando la release ha entrambi gli asset
   exe): un click scarica `mcp-hub.exe`/`mcp-hub-gui.exe` per la nuova

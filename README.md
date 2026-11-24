@@ -493,6 +493,9 @@ the first time.
   `apply` commands below (*Sync clients* shows a diff and backs up before writing, for
   Claude Code, Cursor and VS Code; see
   [Dashboard, tools, clients, secrets, groups](#dashboard-tools-clients-secrets-groups)).
+- **Update prompt**: when the app can update itself (see below) the GUI also *asks*
+  in a dialog: *Installa e riavvia*, *Più tardi* or *Salta questa versione* (remembered).
+  It asks once per version per run, re-checks every 6 hours, and never installs without an answer.
 - **Update banner**: if a newer version is published on GitHub Releases
   (and `hub.checkForUpdates` is true), a banner appears with a link to
   download it.
