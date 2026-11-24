@@ -77,10 +77,10 @@ async def test_start_merges_custom_env_with_parent_environment():
 def test_status_snapshot_reflects_all_servers():
     cfg = Config(hub=HubConfig(), servers={"a": _python_sleep_config(), "b": _python_sleep_config()})
     manager = HubManager(cfg)
-    assert manager.status_snapshot() == {
-        "a": {"status": "stopped", "concurrency": "exclusive", "type": "mcp"},
-        "b": {"status": "stopped", "concurrency": "exclusive", "type": "mcp"},
-    }
+    snapshot = manager.status_snapshot()
+    base = {"status": "stopped", "concurrency": "exclusive", "type": "mcp"}
+    # (the snapshot is additive: dashboard metrics ride along, see test_metrics.py)
+    assert {n: {k: e[k] for k in base} for n, e in snapshot.items()} == {"a": base, "b": base}
 
 
 def test_append_log_redacts_secret_like_lines():

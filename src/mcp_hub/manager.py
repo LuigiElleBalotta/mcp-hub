@@ -20,6 +20,7 @@ from pathlib import Path
 
 from mcp_hub.config import BUILTIN_RIZZO, Config, RizzoSettings, ServerConfig, load_config
 from mcp_hub.cache import DiskCache, ListCache, cache_key
+from mcp_hub.metrics import ServerMetrics
 from mcp_hub.concurrency import ConcurrencyGuard
 from mcp_hub.paths import data_dir
 from mcp_hub.session import RequestTable
@@ -118,6 +119,10 @@ class ManagedServer:
     # upstream again (hub-proxy-efficiency R1). Dropped on `*/list_changed`
     # and whenever the process is respawned.
     cache: ListCache = field(default_factory=ListCache, init=False, repr=False)
+    # Activity counters and latency for the dashboard (never arguments or results).
+    metrics: ServerMetrics = field(default_factory=ServerMetrics, init=False, repr=False)
+    # Monotonic time the current process was spawned (uptime), None while not running.
+    started_at: float | None = field(default=None, init=False, repr=False)
     # Hub-owned MCP handshake (hub-proxy-hardening R4): the upstream is
     # initialised once per spawn by the hub itself and the result is cached;
     # clients' own `initialize` is answered from it, never forwarded.
@@ -167,6 +172,36 @@ class ManagedServer:
     def persist_cache(self) -> None:
         if self.disk_cache is not None:
             self.disk_cache.save(self.initialize_result, self.cache.snapshot())
+
+    def record_call(self, label: str, seconds: float, ok: bool, error: str | None = None) -> None:
+        """One client request finished. An isolated session's process reports to
+        its server too, so the server's numbers cover all of its sessions."""
+        self.metrics.record(label, seconds, ok, error)
+        if self.parent is not None:
+            self.parent.metrics.record(label, seconds, ok, error)
+
+    def record_cache_hit(self) -> None:
+        self.metrics.record_cache_hit()
+        if self.parent is not None:
+            self.parent.metrics.record_cache_hit()
+
+    @property
+    def session_count(self) -> int:
+        """Connected client sessions: for an isolated server one per private process."""
+        return len(self.children) if self.is_isolated else len(self.subscribers)
+
+    def metrics_detail(self) -> dict:
+        """Everything the dashboard shows for this server."""
+        alive = self.process is not None and self.process.returncode is None
+        return {
+            "status": self.status,
+            "pid": self.process.pid if alive else None,
+            "uptime": round(time.monotonic() - self.started_at, 1) if alive and self.started_at else None,
+            "restarts": self.restart_count,
+            "sessions": self.session_count,
+            "inFlight": len(self.table) + sum(len(c.table) for c in self.children),
+            **self.metrics.summary(),
+        }
 
     def touch(self) -> None:
         """Records client activity for the idle watcher."""
@@ -586,6 +621,7 @@ class ManagedServer:
             self.append_log(f"[hub] failed to start {self.name}: {exc}")
             raise
         self.status = "running"
+        self.started_at = time.monotonic()
         asyncio.create_task(self._watch(self.process))
 
     async def _watch(self, process: asyncio.subprocess.Process) -> None:
@@ -873,11 +909,16 @@ class HubManager:
     def __init__(self, config: Config):
         self.config = config
         self._servers = {
-            name: ManagedServer(name, sc) for name, sc in config.servers.items() if name != BUILTIN_RIZZO
+            name: self._new_server(name, sc) for name, sc in config.servers.items() if name != BUILTIN_RIZZO
         }
         # Set by `drain`: the hub accepts no new MCP traffic (see hub_app.DrainGate).
         self.draining = False
         self._sync_builtin()
+
+    def _new_server(self, name: str, sc: ServerConfig) -> ManagedServer:
+        server = ManagedServer(name, sc)
+        server.metrics.enabled = self.config.hub.metrics
+        return server
 
     def _sync_builtin(self) -> None:
         """(Re)creates the built-in Rizzo Flow service from `config.rizzo`;
@@ -953,6 +994,10 @@ class HubManager:
                 entry["port"] = s.config.effective_port
             if s.restart_count:
                 entry["restarts"] = s.restart_count
+            if s.metrics.enabled and not s.config.is_service:
+                detail = s.metrics_detail()
+                entry.update({k: detail[k] for k in ("pid", "uptime", "sessions", "inFlight", "calls", "errors",
+                                                      "callsPerMin", "p50", "p95")})
             snapshot[name] = entry
         return snapshot
 
@@ -974,7 +1019,7 @@ class HubManager:
         if existing is not None:
             await existing.stop()
         self.config.servers[name] = server_config
-        self._servers[name] = ManagedServer(name, server_config)
+        self._servers[name] = self._new_server(name, server_config)
         return self._servers[name]
 
     async def remove(self, name: str) -> None:

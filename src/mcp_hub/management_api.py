@@ -149,6 +149,20 @@ def management_routes(
             return _unknown(name)
         return JSONResponse({"lines": list(server.logs)})
 
+    async def server_metrics(request: Request) -> JSONResponse:
+        """Dashboard detail of one server: counters, latency, recent calls.
+        Method names and durations only, never arguments or results."""
+        name = request.path_params["name"]
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        return JSONResponse({
+            **server.metrics_detail(),
+            "enabled": server.metrics.enabled,
+            "recent": server.metrics.recent(),
+        })
+
     def _rizzo_state() -> dict:
         snapshot = manager.status_snapshot().get(BUILTIN_RIZZO)
         return {"settings": asdict(manager.config.rizzo), "status": snapshot["status"] if snapshot else None}
@@ -259,6 +273,7 @@ def management_routes(
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),
         Route("/api/servers/{name}/logs", logs, methods=["GET"]),
+        Route("/api/servers/{name}/metrics", server_metrics, methods=["GET"]),
         Route("/api/servers/{name}", upsert, methods=["POST"]),
         Route("/api/servers/{name}", remove, methods=["DELETE"]),
     ]

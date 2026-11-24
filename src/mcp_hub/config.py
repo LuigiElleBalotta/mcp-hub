@@ -148,6 +148,8 @@ class HubConfig:
     # Seconds `/api/shutdown` (and so the GUI's quit / self-update) waits for requests
     # already in flight before the hub exits (hub-proxy-efficiency R5). 0 = don't wait.
     drainTimeout: float = 20.0
+    # Collect per-server activity metrics for the dashboard (counters, latency, recent calls).
+    metrics: bool = True
 
 
 _HUB_OPTIONAL_LISTS = ("allowedHosts", "allowedOrigins")
@@ -165,6 +167,8 @@ def hub_to_dict(hub: HubConfig) -> dict:
         del data["preferredTransport"]  # the default: keep the file as it was
     if data["drainTimeout"] == 20.0:
         del data["drainTimeout"]
+    if data["metrics"] is True:
+        del data["metrics"]
     return data
 
 
