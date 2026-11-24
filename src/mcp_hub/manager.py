@@ -18,6 +18,7 @@ from pathlib import Path
 
 from mcp_hub.config import BUILTIN_RIZZO, Config, RizzoSettings, ServerConfig, load_config
 from mcp_hub.concurrency import ConcurrencyGuard
+from mcp_hub.session import RequestTable
 
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
@@ -85,8 +86,14 @@ class ManagedServer:
     _stopping: bool = field(default=False, init=False, repr=False)
     _health_task: asyncio.Task | None = field(default=None, init=False, repr=False)
 
+    # Which session owns which in-flight request / progress token (see
+    # session.py): routes progress and server-initiated requests to the right
+    # client instead of broadcasting them to every connection.
+    table: RequestTable = field(init=False, repr=False)
+
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
+        self.table = RequestTable(self.name)
 
     def append_log(self, line: str) -> None:
         self.logs.append(_redact_line(line))
@@ -181,6 +188,13 @@ class ManagedServer:
                     # unrelated client's connection and misattribute someone
                     # else's abandoned response to it.
                     continue
+                method = obj.get("method")
+                if method == "notifications/progress":
+                    await self._route_progress(obj)
+                    continue
+                if method is not None and msg_id is not None:
+                    await self._route_server_request(obj)
+                    continue
                 for sub in list(self.subscribers):
                     try:
                         await sub(obj)
@@ -191,6 +205,54 @@ class ManagedServer:
                         pass
         finally:
             self._reject_pending()
+
+    async def _write_to_upstream(self, obj: dict) -> None:
+        """Best-effort single-line write to the subprocess's stdin."""
+        if self.process is None or self.process.stdin is None or self.process.returncode is not None:
+            return
+        try:
+            self.process.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+            await self.process.stdin.drain()
+        except (ConnectionError, OSError):
+            pass  # the process is going away; its reader handles the rest
+
+    async def _route_progress(self, obj: dict) -> None:
+        """`notifications/progress` goes only to the session that asked for it,
+        with that client's own token restored. A token with no owner belongs to
+        a request that already finished: dropped, never broadcast."""
+        params = obj.get("params") or {}
+        owner = self.table.progress_owner(params.get("progressToken"))
+        if owner is None:
+            return
+        session, original_token = owner
+        try:
+            await session.deliver({**obj, "params": {**params, "progressToken": original_token}})
+        except Exception:
+            pass  # that session is mid-teardown; nobody else may see its progress
+
+    async def _route_server_request(self, obj: dict) -> None:
+        """A request the upstream makes of its client (roots/list, sampling,
+        elicitation, ping). Several sessions share this upstream, so it must
+        not be broadcast: the first answer would win and the rest would be
+        stray responses. `ping` is answered by the hub itself; anything else
+        goes to the session owning the oldest in-flight request, or is refused
+        with a JSON-RPC error when no session could plausibly answer."""
+        req_id = obj["id"]
+        if obj.get("method") == "ping":
+            await self._write_to_upstream({"jsonrpc": "2.0", "id": req_id, "result": {}})
+            return
+        session = self.table.oldest_session()
+        if session is not None:
+            try:
+                await session.deliver(obj)
+                return
+            except Exception:
+                pass  # fall through: refuse it rather than leave the server waiting
+        await self._write_to_upstream({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": "no client session available to handle this server request"},
+        })
 
     def _reject_pending(self) -> None:
         """Rejects every future still waiting in `self.pending` (subprocess

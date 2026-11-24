@@ -1,9 +1,9 @@
 """Minimal JSON-RPC-over-stdio test double, NOT a real MCP server.
 
 Reads newline-delimited JSON-RPC requests from stdin, writes newline-delimited
-JSON-RPC responses to stdout. Used by tests/test_hub_app_proxy.py to drive
-`mcp_hub.hub_app._proxy` against a real subprocess without depending on a real
-MCP server being installed.
+JSON-RPC responses to stdout. Used by tests/test_hub_app_proxy.py and
+tests/test_session_routing.py to drive `mcp_hub.hub_app._proxy` against a real
+subprocess without depending on a real MCP server being installed.
 
 Supported methods:
   - "test/echo": {"params": {"value": ...}} -> {"result": {"echo": ...}}
@@ -16,42 +16,114 @@ Supported methods:
   - "test/die": exits the process immediately, WITHOUT writing any response
     (used to simulate a subprocess crashing/dying while a request is still
     in flight, per the round-2 review's Critical finding)
+  - "test/progress": emits `notifications/progress` carrying the request's
+    own `_meta.progressToken` (after an optional `seconds` sleep), then
+    answers {"sawToken": <token as received>}. Used to prove the hub remaps
+    progress tokens and routes progress to the owning session only.
+  - "test/ask_roots": sends a server-initiated `roots/list` request, waits for
+    the client's answer, and returns {"asked": <result or error>}.
+  - "test/ask_later": answers at once, then ~0.3s later sends an unsolicited
+    server-initiated `roots/list` request (no request in flight) and records
+    whatever answer comes back (see "test/last_srv_reply").
+  - "test/last_cancel" -> {"cancel": <params of the last notifications/cancelled
+    received, or None>}.
+  - "test/last_srv_reply" -> {"reply": <last answer to a server request>}.
 """
 import json
 import os
 import sys
+import threading
 import time
+
+_out_lock = threading.Lock()
+_state = {"last_cancel": None, "last_srv_reply": None}
+
+
+def _write(obj: dict) -> None:
+    with _out_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def _read_line_obj() -> dict | None:
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            return json.loads(line)
+    return None
+
+
+def _wait_for_srv_reply(srv_id) -> dict | None:
+    """Consumes stdin until the client's answer to server request `srv_id`."""
+    while True:
+        msg = _read_line_obj()
+        if msg is None:
+            return None
+        if msg.get("id") == srv_id and "method" not in msg:
+            return msg
+        _dispatch(msg)  # unrelated traffic is still served
+
+
+def _later_ask() -> None:
+    time.sleep(0.3)
+    _write({"jsonrpc": "2.0", "id": "srv-later", "method": "roots/list"})
+
+
+def _dispatch(req: dict) -> None:
+    method = req.get("method")
+    params = req.get("params") or {}
+    req_id = req.get("id")
+
+    if method is None:  # an answer to a server-initiated request
+        if req_id == "srv-later":
+            _state["last_srv_reply"] = req
+        return
+    if method == "notifications/cancelled":
+        _state["last_cancel"] = params
+        return
+
+    if method == "test/echo":
+        result = {"echo": params.get("value")}
+    elif method == "test/big":
+        result = {"blob": "x" * int(params.get("size", 200_000))}
+    elif method == "test/sleep":
+        time.sleep(float(params.get("seconds", 0)))
+        result = {"slept": params.get("seconds", 0)}
+    elif method == "test/die":
+        # Hard-exit with no response and no clean shutdown: closes stdout
+        # immediately, simulating a crash while this request is still
+        # registered as in-flight on the hub side.
+        os._exit(1)
+    elif method == "test/progress":
+        time.sleep(float(params.get("seconds", 0)))
+        token = (params.get("_meta") or {}).get("progressToken")
+        _write({"jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": token, "progress": 1, "total": 2}})
+        result = {"sawToken": token}
+    elif method == "test/ask_roots":
+        _write({"jsonrpc": "2.0", "id": "srv-1", "method": "roots/list"})
+        answer = _wait_for_srv_reply("srv-1") or {}
+        result = {"asked": answer.get("result", answer.get("error"))}
+    elif method == "test/ask_later":
+        threading.Thread(target=_later_ask, daemon=True).start()
+        result = {}
+    elif method == "test/last_cancel":
+        result = {"cancel": _state["last_cancel"]}
+    elif method == "test/last_srv_reply":
+        result = {"reply": _state["last_srv_reply"]}
+    else:
+        result = {}
+
+    if req_id is not None:
+        _write({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
 def main() -> None:
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        req = json.loads(line)
-        method = req.get("method")
-        params = req.get("params") or {}
-        req_id = req.get("id")
-
-        if method == "test/echo":
-            result = {"echo": params.get("value")}
-        elif method == "test/big":
-            result = {"blob": "x" * int(params.get("size", 200_000))}
-        elif method == "test/sleep":
-            time.sleep(float(params.get("seconds", 0)))
-            result = {"slept": params.get("seconds", 0)}
-        elif method == "test/die":
-            # Hard-exit with no response and no clean shutdown: closes stdout
-            # immediately, simulating a crash while this request is still
-            # registered as in-flight on the hub side.
-            os._exit(1)
-        else:
-            result = {}
-
-        if req_id is not None:
-            resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
-            sys.stdout.write(json.dumps(resp) + "\n")
-            sys.stdout.flush()
+    while True:
+        req = _read_line_obj()
+        if req is None:
+            return
+        _dispatch(req)
 
 
 if __name__ == "__main__":

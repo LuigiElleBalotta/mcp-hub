@@ -15,6 +15,7 @@ from starlette.routing import Mount, Route
 from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
 from mcp_hub.security import HubSecurityMiddleware
+from mcp_hub.session import HubSession
 
 
 # JSON-RPC "server error" range (-32000..-32099): the managed server is down.
@@ -92,6 +93,8 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         message = jsonrpc_message_adapter.validate_python(obj)
         await write.send(SessionMessage(message))
 
+    session = HubSession(deliver)
+
     async def handle_message(session_message: SessionMessage) -> None:
         assert managed.process is not None and managed.process.stdin is not None
         payload_text = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
@@ -102,6 +105,26 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         # server-initiated request has an id but no method — none of the
         # latter two get a future registered, since nothing will resolve it.
         is_request = client_id is not None and "method" in obj
+
+        if obj.get("method") == "notifications/cancelled":
+            # hub-proxy-hardening R3: the client names ITS request id, which
+            # the upstream never saw (it knows only the hub id). Translate it;
+            # an unknown, finished or foreign id is ignored, which the spec
+            # explicitly allows, and must never cancel another session's call.
+            cancel_params = obj.get("params")
+            cancel_params = cancel_params if isinstance(cancel_params, dict) else {}
+            hub_request_id = managed.table.translate_cancel(session, cancel_params.get("requestId"))
+            if hub_request_id is None:
+                return
+            obj["params"] = {**cancel_params, "requestId": hub_request_id}
+            payload_text = json.dumps(obj)
+
+        # The client's own progress token (if any), swapped for a hub token at
+        # dispatch time so two sessions that both picked "tok" cannot collide.
+        client_progress_token = None
+        req_params = obj.get("params")
+        if is_request and isinstance(req_params, dict) and isinstance(req_params.get("_meta"), dict):
+            client_progress_token = req_params["_meta"].get("progressToken")
 
         # Round-2 review fix (Important finding): the client-supplied `id` is
         # only unique within that one client's own session, not across the
@@ -168,9 +191,14 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             # either resolved normally or rejected -- never orphaned.
             managed.ensure_stdout_reader()
             fut: asyncio.Future | None = None
+            out_text = payload_text
             if hub_id is not None:
                 fut = asyncio.get_running_loop().create_future()
                 managed.pending[hub_id] = fut
+                hub_progress = managed.table.register(session, client_id, hub_id, client_progress_token)
+                if hub_progress is not None:
+                    out_params = {**obj["params"], "_meta": {**obj["params"]["_meta"], "progressToken": hub_progress}}
+                    out_text = json.dumps({**obj, "params": out_params})
                 # Permanent hub-side dispatch timing (Task 13 review finding:
                 # scripts/concurrency_check.py's client-observed completion
                 # timestamps can appear near-simultaneous for two calls to an
@@ -205,7 +233,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             dispatch_done_logged = False
             try:
                 try:
-                    managed.process.stdin.write((payload_text + "\n").encode("utf-8"))
+                    managed.process.stdin.write((out_text + "\n").encode("utf-8"))
                     await managed.process.stdin.drain()
                 except (ConnectionError, OSError) as exc:
                     # asyncio's own text here ("Connection lost") names no
@@ -242,6 +270,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             finally:
                 if fut is not None:
                     managed.pending.pop(hub_id, None)
+                    managed.table.complete(hub_id)
                     # `_reject_pending` may have failed this future while the
                     # stdin write above was already raising, so nothing ever
                     # awaits it: mark its exception as retrieved, otherwise
@@ -250,7 +279,15 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                         fut.exception()
 
         try:
-            await managed.guard.run(write_and_maybe_wait)
+            if is_request:
+                await managed.guard.run(write_and_maybe_wait)
+            else:
+                # A notification or a client's answer to a server request takes
+                # no "turn" on the upstream. Behind an exclusive guard it would
+                # queue behind the very request it concerns: the answer to the
+                # server's question could never arrive (deadlock) and a
+                # cancellation would wait for the call it wants to cancel.
+                await write_and_maybe_wait()
         except ConnectionError as exc:
             # hub-proxy-hardening R2: the upstream is gone (exited with this
             # request in flight, a stdin write hit a dead pipe, or it was
