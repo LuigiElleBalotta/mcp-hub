@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Callable
 
@@ -30,7 +31,10 @@ def management_routes(
             on_change()
 
     async def status(request: Request) -> JSONResponse:
-        return JSONResponse({"servers": manager.status_snapshot()})
+        body: dict = {"servers": manager.status_snapshot()}
+        if manager.draining:
+            body["draining"] = True  # additive: older clients only read "servers"
+        return JSONResponse(body)
 
     async def settings(request: Request) -> JSONResponse:
         return JSONResponse({
@@ -57,15 +61,63 @@ def management_routes(
     async def pid(request: Request) -> JSONResponse:
         return JSONResponse({"pid": os.getpid()})
 
+    async def _optional_json(request: Request) -> dict:
+        """An optional JSON object body: absent or empty means {}."""
+        raw = await request.body()
+        if not raw.strip():
+            return {}
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("body must be a JSON object")
+        return data
+
+    def _timeout_from(data: dict, key: str, default: float) -> float:
+        value = data.get(key, default)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 3600:
+            raise ValueError(f"{key} must be a number of seconds between 0 and 3600")
+        return float(value)
+
+    async def drain(request: Request) -> JSONResponse:
+        """Stop accepting new MCP traffic and wait (up to `timeout` seconds) for
+        requests in flight. The hub keeps running; DELETE resumes."""
+        try:
+            timeout = _timeout_from(await _optional_json(request), "timeout", manager.config.hub.drainTimeout)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        drained = await manager.drain(timeout)
+        return JSONResponse({"drained": drained, "inFlight": manager.in_flight()})
+
+    async def resume(request: Request) -> JSONResponse:
+        manager.resume()
+        return JSONResponse({"draining": False})
+
+    background: set[asyncio.Task] = set()
+
     async def shutdown(request: Request) -> JSONResponse:
         # Graceful: lets `serve_with_managed_shutdown`'s `finally` stop every
         # managed subprocess before the process exits, instead of a caller
         # killing the hub's OS process directly and orphaning them. Used by
         # the GUI's self-update flow, which needs the hub's exe file
         # unlocked (process exited) before it can be replaced on disk.
+        # Replies at once and does the draining in the background, so a caller with
+        # a short HTTP timeout (the GUI's) is not left waiting: new MCP traffic is
+        # refused from now, requests in flight get `drainTimeout` seconds to
+        # finish, then the hub exits.
+        try:
+            timeout = _timeout_from(await _optional_json(request), "drainTimeout", manager.config.hub.drainTimeout)
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         if shutdown_event is not None:
-            shutdown_event.set()
-        return JSONResponse({"status": "shutting down"})
+            async def finish() -> None:
+                try:
+                    await manager.drain(timeout)
+                finally:
+                    shutdown_event.set()
+
+            task = asyncio.create_task(finish())
+            background.add(task)
+            task.add_done_callback(background.discard)
+        return JSONResponse({"status": "shutting down", "drainTimeout": timeout})
 
     def _unknown(name: str) -> JSONResponse:
         return JSONResponse({"error": f"unknown server: {name}"}, status_code=404)
@@ -190,6 +242,8 @@ def management_routes(
         Route("/api/rizzo", put_rizzo, methods=["PUT"]),
         Route("/api/pid", pid, methods=["GET"]),
         Route("/api/shutdown", shutdown, methods=["POST"]),
+        Route("/api/drain", drain, methods=["POST"]),
+        Route("/api/drain", resume, methods=["DELETE"]),
         Route("/api/reload", reload, methods=["POST"]),
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),

@@ -135,6 +135,9 @@ class HubConfig:
     # Which endpoint `apply` writes into client configs: "sse" (`/<name>/sse`, what it always
     # wrote) or "http" (Streamable HTTP, `/<name>/mcp`, the transport that replaces SSE).
     preferredTransport: Literal["sse", "http"] = "sse"
+    # Seconds `/api/shutdown` (and so the GUI's quit / self-update) waits for requests
+    # already in flight before the hub exits (hub-proxy-efficiency R5). 0 = don't wait.
+    drainTimeout: float = 20.0
 
 
 _HUB_OPTIONAL_LISTS = ("allowedHosts", "allowedOrigins")
@@ -150,6 +153,8 @@ def hub_to_dict(hub: HubConfig) -> dict:
             del data[key]
     if data["preferredTransport"] == "sse":
         del data["preferredTransport"]  # the default: keep the file as it was
+    if data["drainTimeout"] == 20.0:
+        del data["drainTimeout"]
     return data
 
 

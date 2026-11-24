@@ -875,6 +875,8 @@ class HubManager:
         self._servers = {
             name: ManagedServer(name, sc) for name, sc in config.servers.items() if name != BUILTIN_RIZZO
         }
+        # Set by `drain`: the hub accepts no new MCP traffic (see hub_app.DrainGate).
+        self.draining = False
         self._sync_builtin()
 
     def _sync_builtin(self) -> None:
@@ -901,6 +903,28 @@ class HubManager:
 
     def get(self, name: str) -> ManagedServer:
         return self._servers[name]
+
+    def in_flight(self) -> int:
+        """Client requests currently waiting on an upstream, across every server
+        (an isolated server's per-session processes included)."""
+        total = 0
+        for server in self._servers.values():
+            total += len(server.table) + sum(len(child.table) for child in server.children)
+        return total
+
+    async def drain(self, timeout: float) -> bool:
+        """Stops accepting new MCP traffic and waits up to `timeout` seconds for
+        the requests already in flight to finish. Returns whether none remain.
+        `draining` stays set either way: the caller is about to stop the hub, or
+        calls `resume` to take it back."""
+        self.draining = True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self.in_flight() > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        return self.in_flight() == 0
+
+    def resume(self) -> None:
+        self.draining = False
 
     async def start_all(self) -> None:
         for server in self._servers.values():

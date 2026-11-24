@@ -395,6 +395,27 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         managed.subscribers.discard(deliver)
 
 
+class DrainGate:
+    """While the hub drains (shutting down, or told to via /api/drain) it takes
+    no new MCP traffic: 503 + Retry-After so a client tries again after the
+    restart. The management API stays open, and so does DELETE so a Streamable
+    client can still end its session cleanly."""
+
+    def __init__(self, app, manager: HubManager) -> None:
+        self.app = app
+        self.manager = manager
+
+    async def __call__(self, scope, receive, send) -> None:
+        if (scope["type"] == "http" and self.manager.draining
+                and not scope["path"].startswith("/api/") and scope["method"] != "DELETE"):
+            from starlette.responses import JSONResponse
+
+            await JSONResponse({"error": "hub is shutting down, try again shortly"}, status_code=503,
+                               headers={"Retry-After": "5"})(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 def _shutdown_later(endpoints: "_Endpoints") -> None:
     """Ends a replaced/removed server's Streamable sessions in the background
     (route rebuilds are synchronous). Without a running loop nothing can be
@@ -447,7 +468,10 @@ def build_app(manager: HubManager, shutdown_event: asyncio.Event | None = None) 
 
     app = Starlette(
         routes=[],
-        middleware=[Middleware(HubSecurityMiddleware, hub=manager.config.hub)],
+        middleware=[
+            Middleware(HubSecurityMiddleware, hub=manager.config.hub),
+            Middleware(DrainGate, manager=manager),
+        ],
         lifespan=lifespan,
     )
 
