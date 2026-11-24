@@ -66,12 +66,27 @@ jobs:
       - name: Build GUI exe (mcp-hub-gui)
         run: pyinstaller --onefile --windowed --name mcp-hub-gui src/mcp_hub/gui/app.py
 
+      # One installer for the two exes (per user, no admin, Start menu entry, optional
+      # PATH). The exes stay published on their own as well: the GUI's self-update
+      # downloads them by name. This step never blocks the release: if the installer
+      # cannot be built, the two exes are still published.
+      - name: Build the installer (mcp-hub-setup.exe)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $v = "${{ needs.check-tag.outputs.version }}" -replace '^v', ''
+          & $iscc "/DVersion=$v" "/DDistDir=$PWD\dist" installer\mcp-hub.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
             dist/mcp-hub.exe
             dist/mcp-hub-gui.exe
+            dist/mcp-hub-setup.exe
 
   # The app is not signed or notarized: the README explains how to open it the
   # first time. Intel is best effort: if its runner is unavailable or fails, the
@@ -153,6 +168,7 @@ jobs:
           name: ${{ needs.check-tag.outputs.version }}
           prerelease: ${{ needs.check-tag.outputs.kind == 'beta' }}
           files: |
+            artifacts/mcp-hub-setup.exe
             artifacts/mcp-hub.exe
             artifacts/mcp-hub-gui.exe
             artifacts/mcp-hub-macos-arm64.tar.gz

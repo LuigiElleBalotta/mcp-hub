@@ -59,11 +59,26 @@ Claude Code session N ─┘                 │
 
 ## Installing the exe (end users)
 
-No installer, no admin rights needed — it's two standalone files:
+**The easy way: one installer.** Download `mcp-hub-setup.exe` from the repo's
+[Releases page](https://github.com/LuigiElleBalotta/mcp-hub/releases) and run
+it. It installs per user (no administrator rights) into
+`%LOCALAPPDATA%\Programs\mcp-hub\`, adds a Start menu entry and an uninstaller
+(Settings → Apps), and offers two options: a desktop icon, and adding `mcp-hub`
+to your PATH so the command line works from any terminal (`mcp-hub apply
+--client cursor --dry-run`, `mcp-hub secrets list`, …). Your data in
+`%LOCALAPPDATA%\mcp-hub\` (config, backups, cache) is never touched by install,
+update or uninstall, and uninstalling stops only the programs running from the
+install folder. Installing a newer `mcp-hub-setup.exe` over an old one updates it
+in place; the GUI's own **Installa e riavvia** button keeps working too.
+
+**The manual way**: no installer, no admin rights, two standalone files:
 
 1. Go to the repo's [Releases page](https://github.com/LuigiElleBalotta/mcp-hub/releases)
    and download `mcp-hub.exe` and `mcp-hub-gui.exe` from whichever version
-   you want (a plain `x.y.z` tag is stable; `x.y.z-n` is beta).
+   you want (a plain `x.y.z` tag is stable; `x.y.z-n` is beta). They stay
+   published next to the installer: the GUI's self-update downloads them by
+   name, and the CLI needs a console that the windowed GUI exe does not have,
+   which is why they are not merged into one file.
 2. Put **both files in the same folder** (e.g.
    `C:\Users\<you>\AppData\Local\Programs\mcp-hub\`) — the GUI's self-update
    assumes `mcp-hub.exe` sits right next to it, and this is also the layout

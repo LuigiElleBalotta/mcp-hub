@@ -60,12 +60,29 @@ Sessione Claude Code N ─┘                 │
 
 ## Installare l'exe (utenti finali)
 
-Nessun installer, nessun diritto da amministratore richiesto — sono due
+**La via facile: un installer unico.** Scarica `mcp-hub-setup.exe` dalla
+[pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases) del
+repo e avvialo. Si installa per utente (nessun diritto da amministratore) in
+`%LOCALAPPDATA%\Programs\mcp-hub\`, aggiunge una voce nel menu Start e un
+disinstallatore (Impostazioni → App), e offre due opzioni: un'icona sul
+desktop e l'aggiunta di `mcp-hub` al PATH, così la riga di comando funziona da
+qualsiasi terminale (`mcp-hub apply --client cursor --dry-run`,
+`mcp-hub secrets list`, …). I tuoi dati in `%LOCALAPPDATA%\mcp-hub\` (config,
+backup, cache) non vengono mai toccati da installazione, aggiornamento o
+disinstallazione, e la disinstallazione ferma solo i programmi in esecuzione
+dalla cartella di installazione. Installare un `mcp-hub-setup.exe` più nuovo
+sopra uno vecchio aggiorna sul posto; anche il pulsante **Installa e riavvia**
+della GUI continua a funzionare.
+
+**La via manuale**: nessun installer, nessun diritto da amministratore, due
 file standalone:
 
 1. Vai alla [pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases)
    del repo e scarica `mcp-hub.exe` e `mcp-hub-gui.exe` dalla versione che
-   preferisci (un tag `x.y.z` semplice è stabile; `x.y.z-n` è beta).
+   preferisci (un tag `x.y.z` semplice è stabile; `x.y.z-n` è beta). Restano
+   pubblicati accanto all'installer: l'auto-update della GUI li scarica per
+   nome, e la CLI ha bisogno di una console che l'exe grafico non ha, ed è
+   per questo che non sono fusi in un file solo.
 2. Metti **entrambi i file nella stessa cartella** (es.
    `C:\Users\<tu>\AppData\Local\Programs\mcp-hub\`) — l'auto-update della
    GUI presuppone che `mcp-hub.exe` sia proprio accanto a sé stessa, ed è
