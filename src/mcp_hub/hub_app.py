@@ -15,6 +15,7 @@ from starlette.routing import Mount, Route
 
 from mcp_hub.cache import CACHEABLE_LISTS, has_cursor
 from mcp_hub.filters import filter_tools_result, resolve_call
+from mcp_hub.metrics import label_for
 from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
 from mcp_hub.security import HubSecurityMiddleware
@@ -162,6 +163,10 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
 
         # The client's own progress token (if any), swapped for a hub token at
         # dispatch time so two sessions that both picked "tok" cannot collide.
+        # What the dashboard calls this request (method, plus a tool's NAME for tools/call;
+        # never arguments or results). Only requests are recorded.
+        metric_label = label_for(obj.get("method") or "", obj.get("params")) if is_request else None
+
         # A list request the cache may answer or fill (R1): page requests never.
         cache_method = obj.get("method") if (is_request and obj.get("method") in CACHEABLE_LISTS
                                              and not has_cursor(obj.get("params"))) else None
@@ -297,6 +302,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             # a dispatch one, and this timing is specifically NOT about the
             # delivery leg (see comment above `deliver` below).
             dispatch_done_logged = False
+            dispatched_at = time.monotonic()
             try:
                 try:
                     managed.process.stdin.write((out_text + "\n").encode("utf-8"))
@@ -318,6 +324,11 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                         f"t={time.monotonic():.6f}"
                     )
                     dispatch_done_logged = True
+                    failed = "error" in response_obj
+                    managed.record_call(
+                        metric_label or "?", time.monotonic() - dispatched_at, not failed,
+                        error=(response_obj.get("error") or {}).get("message") if failed else None,
+                    )
                     if cache_method and isinstance(response_obj.get("result"), dict):
                         if managed.cache.put(cache_method, response_obj["result"], cache_generation):
                             managed.persist_cache()
@@ -360,6 +371,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
                 if cached is not None:
                     # Answered without touching the upstream (and even while it
                     # is restarting): the same list every client would get.
+                    managed.record_cache_hit()
                     await deliver({"jsonrpc": "2.0", "id": client_id, "result": shaped(cache_method, cached)})
                     return
             managed.touch()
@@ -399,6 +411,7 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
             # Never replayed: a tool call may have had side effects.
             managed.append_log(f"[hub] request {client_id!r} failed: {exc}")
             if is_request:
+                managed.record_call(metric_label or "?", 0.0, False, error=str(exc))
                 try:
                     await deliver({
                         "jsonrpc": "2.0",

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QPushButton
 
 from mcp_hub import config as config_module
 from mcp_hub.config import CONCURRENCY_MODES, Config, HubConfig, load_config, save_config
-from mcp_hub.gui.main_window import MainWindow
+from mcp_hub.gui.main_window import ACTIONS_COL, MainWindow
 from mcp_hub.gui.server_dialog import MODE_HELP, ServerDialog, split_list
 from mcp_hub.gui.settings_dialog import SettingsDialog
 
@@ -55,7 +55,7 @@ def _row(win, name):
 
 
 def _buttons(win, name):
-    return {b.text(): b for b in win.table.cellWidget(_row(win, name), 4).findChildren(QPushButton)}
+    return {b.text(): b for b in win.table.cellWidget(_row(win, name), ACTIONS_COL).findChildren(QPushButton)}
 
 
 def test_idle_status_color_and_start_button(window):

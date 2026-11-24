@@ -148,6 +148,11 @@ class HubConfig:
     # Seconds `/api/shutdown` (and so the GUI's quit / self-update) waits for requests
     # already in flight before the hub exits (hub-proxy-efficiency R5). 0 = don't wait.
     drainTimeout: float = 20.0
+    # Collect per-server activity metrics for the dashboard (counters, latency, recent calls).
+    metrics: bool = True
+    # Offer "search the MCP Registry" in the Add-server dialog. Off by default: a search sends
+    # its text to registry.modelcontextprotocol.io, so it is the user's explicit choice.
+    registrySearch: bool = False
 
 
 _HUB_OPTIONAL_LISTS = ("allowedHosts", "allowedOrigins")
@@ -165,6 +170,10 @@ def hub_to_dict(hub: HubConfig) -> dict:
         del data["preferredTransport"]  # the default: keep the file as it was
     if data["drainTimeout"] == 20.0:
         del data["drainTimeout"]
+    if data["metrics"] is True:
+        del data["metrics"]
+    if data["registrySearch"] is False:
+        del data["registrySearch"]
     return data
 
 
@@ -244,11 +253,22 @@ def rizzo_settings_from_dict(data: dict) -> RizzoSettings:
     return settings
 
 
+GROUP_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,39}")
+
+
+def valid_group_name(name: object) -> bool:
+    return isinstance(name, str) and GROUP_NAME_RE.fullmatch(name) is not None
+
+
 @dataclass
 class Config:
     hub: HubConfig
     servers: dict[str, ServerConfig]
     rizzo: RizzoSettings = field(default_factory=RizzoSettings)
+    # Named sets of servers ("Lavoro", "Progetto X"): filter and start/stop together in the
+    # GUI, and `apply --group` writes only that set into a client. A group is not an endpoint:
+    # there is no aggregated MCP server behind it. Omitted from config.json while empty.
+    groups: dict[str, list[str]] = field(default_factory=dict)
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -274,7 +294,11 @@ def load_config(path: Path | None = None) -> Config:
             if legacy.effective_port:
                 rizzo.port = legacy.effective_port
         del servers[BUILTIN_RIZZO]
-    return Config(hub=hub, servers=servers, rizzo=rizzo)
+    groups: dict[str, list[str]] = {}
+    for name, members in (raw.get("groups") or {}).items():
+        if valid_group_name(name) and isinstance(members, list):
+            groups[name] = [m for m in members if isinstance(m, str)]
+    return Config(hub=hub, servers=servers, rizzo=rizzo, groups=groups)
 
 
 BACKUP_DIR_NAME = "backups"
@@ -332,6 +356,8 @@ def save_config(config: Config, path: Path | None = None) -> None:
     # Only written once configured; older hubs ignore unknown top-level keys.
     if config.rizzo != RizzoSettings():
         payload["rizzo"] = asdict(config.rizzo)
+    if config.groups:
+        payload["groups"] = {name: list(members) for name, members in config.groups.items()}
     tmp_path = path.with_suffix(".json.tmp")
     text = json.dumps(payload, indent=2)
     _backup_existing(path, text.encode("utf-8"))

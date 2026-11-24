@@ -60,12 +60,29 @@ Sessione Claude Code N ─┘                 │
 
 ## Installare l'exe (utenti finali)
 
-Nessun installer, nessun diritto da amministratore richiesto — sono due
+**La via facile: un installer unico.** Scarica `mcp-hub-setup.exe` dalla
+[pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases) del
+repo e avvialo. Si installa per utente (nessun diritto da amministratore) in
+`%LOCALAPPDATA%\Programs\mcp-hub\`, aggiunge una voce nel menu Start e un
+disinstallatore (Impostazioni → App), e offre due opzioni: un'icona sul
+desktop e l'aggiunta di `mcp-hub` al PATH, così la riga di comando funziona da
+qualsiasi terminale (`mcp-hub apply --client cursor --dry-run`,
+`mcp-hub secrets list`, …). I tuoi dati in `%LOCALAPPDATA%\mcp-hub\` (config,
+backup, cache) non vengono mai toccati da installazione, aggiornamento o
+disinstallazione, e la disinstallazione ferma solo i programmi in esecuzione
+dalla cartella di installazione. Installare un `mcp-hub-setup.exe` più nuovo
+sopra uno vecchio aggiorna sul posto; anche il pulsante **Installa e riavvia**
+della GUI continua a funzionare.
+
+**La via manuale**: nessun installer, nessun diritto da amministratore, due
 file standalone:
 
 1. Vai alla [pagina Releases](https://github.com/LuigiElleBalotta/mcp-hub/releases)
    del repo e scarica `mcp-hub.exe` e `mcp-hub-gui.exe` dalla versione che
-   preferisci (un tag `x.y.z` semplice è stabile; `x.y.z-n` è beta).
+   preferisci (un tag `x.y.z` semplice è stabile; `x.y.z-n` è beta). Restano
+   pubblicati accanto all'installer: l'auto-update della GUI li scarica per
+   nome, e la CLI ha bisogno di una console che l'exe grafico non ha, ed è
+   per questo che non sono fusi in un file solo.
 2. Metti **entrambi i file nella stessa cartella** (es.
    `C:\Users\<tu>\AppData\Local\Programs\mcp-hub\`) — l'auto-update della
    GUI presuppone che `mcp-hub.exe` sia proprio accanto a sé stessa, ed è
@@ -221,6 +238,8 @@ contengono gli stessi segreti della config: trattali allo stesso modo.
 | `allowedHosts`       | `[]`          | Valori di `Host` extra accettati oltre a `127.0.0.1`, `localhost`, `[::1]` e `host` (ognuno con la porta). Una richiesta con un altro `Host` riceve `403` (protezione DNS-rebinding). Un hub in bind su `0.0.0.0`/`::`, oppure `["*"]`, salta questo controllo. Omesso da `config.json` finché è vuoto. |
 | `preferredTransport` | `"sse"`       | Quale endpoint scrive `apply` nella config dei client: `"sse"` → `/<server>/sse` (esattamente quello che ha sempre scritto) oppure `"http"` → `/<server>/mcp` (Streamable HTTP, il trasporto che nella spec MCP sostituisce SSE). Omesso da `config.json` finché è il default. |
 | `drainTimeout`       | `20`          | Secondi che `/api/shutdown` (quindi la chiusura dalla GUI e l'auto-update) aspetta le richieste già in corso prima che l'hub esca. `0` = non aspettare. |
+| `metrics`            | `true`        | Raccoglie le metriche per server della dashboard (contatori, latenza, chiamate recenti; mai argomenti o risultati). Serve riavviare l'hub. |
+| `registrySearch`     | `false`       | Offre *Cerca nel registry MCP* nel dialog Add server. Spento di default: una ricerca invia il testo a registry.modelcontextprotocol.io. |
 | `allowedOrigins`     | `[]`          | `Origin` extra accettati. Una richiesta con un `Origin` che non è quello dell'hub riceve `403`, così una pagina web non può pilotare l'hub; i client senza `Origin` (Claude Code, la GUI, `curl`) non sono toccati. |
 | `autostart`          | `false`       | Flag informativo rispecchiato dalla checkbox "Avvia con Windows" della GUI, che registra/rimuove una voce di Windows Task Scheduler (vedi sotto). |
 | `checkForUpdates`    | `true`        | La GUI controlla GitHub Releases per una versione più recente all'avvio e mostra un banner se esiste. Non scarica o installa mai nulla senza un click esplicito su "Installa e riavvia" (vedi [Auto-update](#auto-update)). |
@@ -322,6 +341,54 @@ valore di default, così una voce non toccata mantiene la forma originale.
   sessione (restava appeso); i trasporti ora restano per server tra un rebuild delle
   route e l'altro.
 
+### Dashboard, tool, client, segreti, gruppi
+
+- **Dashboard.** La tabella mostra chiamate al minuto, latenza p95 e sessioni per
+  server; selezionando una riga si apre la scheda **Dettaglio** (processo, tempo di
+  esecuzione, riavvii, sessioni, richieste in corso, chiamate, errori, hit di cache,
+  p50/p95, ultimo errore e chiamate recenti). Si tengono solo i nomi dei metodi (più il
+  *nome* di un tool) e le durate: mai argomenti o risultati.
+  `GET /api/servers/{name}/metrics` dà gli stessi dati; `hub.metrics: false` li spegne.
+- **Scheda Tool.** Elenca i tool di un server con una spunta ciascuno: togliendola il tool
+  sparisce per i client, subito e senza riavvio (le sessioni restano e i client vengono
+  avvisati che l'elenco è cambiato). Un tool nascosto da un *pattern* di deny appare
+  in grigio: il pattern si modifica dal dialog del server. Nella stessa scheda c'è un
+  **tester**: un form di argomenti generato dallo schema del tool (testo JSON se non ce
+  n'è uno) e il risultato con la durata. Un tool non dichiarato di sola lettura chiede
+  prima conferma. Leggere i tool di un server lazy o fermato lo avvia, quindi l'elenco si
+  carica solo a scheda aperta.
+- **Sync clients.** `mcp-hub apply --client claude|cursor|vscode` (e il pulsante *Sync
+  clients* della GUI) scrive gli endpoint dell'hub in Claude Code (`~/.claude.json` o un
+  `.mcp.json` di progetto), Cursor (`~/.cursor/mcp.json`, `.cursor/mcp.json`) e VS Code
+  (il `mcp.json` utente su Windows, `.vscode/mcp.json` in un progetto). Prima pianifica e
+  mostra un diff con i segreti mascherati (`--dry-run` si ferma lì), fa un backup, scrive in
+  modo atomico, mantiene l'indentazione del file e tocca solo le voci con il nome di un
+  server dell'hub. Un file con commenti o virgole finali viene rifiutato, non indovinato.
+  `mcp-hub rollback --client X` ripristina l'ultimo backup (ed è a sua volta annullabile).
+  `--scope project --project-dir D` punta a un file di progetto; `--only a,b` e
+  `--group NOME` restringono i server. Il vecchio `apply --to <file>` funziona come prima.
+  Non offerti: il file utente di VS Code su macOS/Linux (percorso non confermato); Cursor
+  segue la sua documentazione ma qui non è stato eseguito.
+- **Segreti.** Un valore di env può essere `${secret:<server>/<CHIAVE>}`: il valore vero sta
+  nel credential store del sistema (Windows Credential Manager, Keychain macOS, Secret
+  Service su Linux) sotto il servizio `mcp-hub`, e viene letto solo quando l'hub avvia il
+  processo; config.json, log, stato e metriche contengono sempre e solo il riferimento. Il
+  dialog del server ha **Sposta i segreti nel credential store**; la CLI ha
+  `mcp-hub secrets list|migrate|set|delete` (senza mai stampare un valore). Senza credential
+  store tutto continua a funzionare con i valori in chiaro. Rinominare o rimuovere un
+  server non cancella i suoi segreti.
+- **Gruppi.** Insiemi di server con un nome (`groups` in config.json): un selettore filtra la
+  tabella, *Avvia/Ferma gruppo* avviano e fermano un insieme intero, *Gestisci gruppi…* li
+  modifica, e `apply --group NOME` scrive solo quell'insieme in un client o progetto. Un
+  gruppo non è un endpoint: dietro non c'è nessun server MCP aggregato.
+- **Ricerca nel registry MCP** (spenta di default: *Settings → Abilita la ricerca nel
+  registry MCP*). *Add server* allora offre **Cerca nel registry MCP…**: cerca nel registry
+  ufficiale (l'unica cosa inviata è il testo cercato) e mostra la riga di comando completa,
+  le variabili d'ambiente e cosa manca ancora. Una scelta *precompila* soltanto il form;
+  lo leggi, lo completi e lo salvi tu. Si offrono solo pacchetti stdio npm (`npx`), pypi
+  (`uvx`) e oci (`docker`); i server remoti e gli altri tipi di pacchetto sono elencati
+  con il motivo. I risultati restano in cache sei ore.
+
 ### Rizzo Flow / Jev (integrato)
 
 Rizzo Flow — il server di modelli locale compatibile con Jev usato dal plugin
@@ -405,9 +472,10 @@ a cui instradare la prima volta.
   log (oscurate) di quel server.
 - **Avvia con Windows**: registra/rimuove l'autostart via Windows Task
   Scheduler (vedi sotto).
-- **Import from Claude Code config / Apply to Claude Code config**:
-  wrapper GUI dei comandi CLI `import`/`apply` sotto, con un dialogo di
-  conferma prima di ogni scrittura.
+- **Import from Claude Code / Sync clients**: wrapper GUI dei comandi `import` e
+  `apply` sotto (*Sync clients* mostra un diff e fa un backup prima di scrivere, per
+  Claude Code, Cursor e VS Code; vedi
+  [Dashboard, tool, client, segreti, gruppi](#dashboard-tool-client-segreti-gruppi)).
 - **Banner aggiornamento**: se una versione più recente è pubblicata su
   GitHub Releases (e `hub.checkForUpdates` è vero), compare un banner con
   un link per scaricarla.

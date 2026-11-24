@@ -18,10 +18,44 @@ from fnmatch import fnmatchcase
 PREFIX_RE = re.compile(r"[A-Za-z0-9_.-]{0,64}")
 
 
+def is_glob(pattern: str) -> bool:
+    """Whether `pattern` has wildcard characters (else it is an exact tool name)."""
+    return any(ch in pattern for ch in "*?[")
+
+
 def tool_visible(name: str, allow: list[str], deny: list[str]) -> bool:
     if any(fnmatchcase(name, pattern) for pattern in deny):
         return False
     return not allow or any(fnmatchcase(name, pattern) for pattern in allow)
+
+
+def edit_filters(
+    tool_names: list[str], visible: set[str], allow: list[str], deny: list[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """The smallest change to the allow/deny lists that makes exactly `visible`
+    of `tool_names` visible. Returns (allow, deny, locked).
+
+    Hiding adds the exact name to `deny`. Showing removes an exact name from
+    `deny`, and adds it to `allow` when the allow-list is what hides it. A tool
+    hidden by a deny GLOB cannot be shown by editing exact names (deny wins):
+    it is reported in `locked` and left as it is. The inputs are not modified."""
+    allow, deny, locked = list(allow), list(deny), []
+    for name in tool_names:
+        want = name in visible
+        if want == tool_visible(name, allow, deny):
+            continue
+        if not want:
+            deny.append(name)
+            continue
+        while name in deny:
+            deny.remove(name)
+        if tool_visible(name, allow, deny):
+            continue
+        if any(is_glob(p) and fnmatchcase(name, p) for p in deny):
+            locked.append(name)
+            continue
+        allow.append(name)  # only the allow-list was hiding it
+    return allow, deny, locked
 
 
 def filter_tools_result(result: dict, allow: list[str], deny: list[str], prefix: str) -> dict:

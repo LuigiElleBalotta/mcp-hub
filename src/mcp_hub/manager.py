@@ -20,8 +20,10 @@ from pathlib import Path
 
 from mcp_hub.config import BUILTIN_RIZZO, Config, RizzoSettings, ServerConfig, load_config
 from mcp_hub.cache import DiskCache, ListCache, cache_key
+from mcp_hub.metrics import ServerMetrics
 from mcp_hub.concurrency import ConcurrencyGuard
 from mcp_hub.paths import data_dir
+from mcp_hub.secrets import resolve_env as resolve_secrets
 from mcp_hub.session import RequestTable
 
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
@@ -118,6 +120,10 @@ class ManagedServer:
     # upstream again (hub-proxy-efficiency R1). Dropped on `*/list_changed`
     # and whenever the process is respawned.
     cache: ListCache = field(default_factory=ListCache, init=False, repr=False)
+    # Activity counters and latency for the dashboard (never arguments or results).
+    metrics: ServerMetrics = field(default_factory=ServerMetrics, init=False, repr=False)
+    # Monotonic time the current process was spawned (uptime), None while not running.
+    started_at: float | None = field(default=None, init=False, repr=False)
     # Hub-owned MCP handshake (hub-proxy-hardening R4): the upstream is
     # initialised once per spawn by the hub itself and the result is cached;
     # clients' own `initialize` is answered from it, never forwarded.
@@ -167,6 +173,95 @@ class ManagedServer:
     def persist_cache(self) -> None:
         if self.disk_cache is not None:
             self.disk_cache.save(self.initialize_result, self.cache.snapshot())
+
+    def record_call(self, label: str, seconds: float, ok: bool, error: str | None = None) -> None:
+        """One client request finished. An isolated session's process reports to
+        its server too, so the server's numbers cover all of its sessions."""
+        self.metrics.record(label, seconds, ok, error)
+        if self.parent is not None:
+            self.parent.metrics.record(label, seconds, ok, error)
+
+    def record_cache_hit(self) -> None:
+        self.metrics.record_cache_hit()
+        if self.parent is not None:
+            self.parent.metrics.record_cache_hit()
+
+    @property
+    def session_count(self) -> int:
+        """Connected client sessions: for an isolated server one per private process."""
+        return len(self.children) if self.is_isolated else len(self.subscribers)
+
+    def metrics_detail(self) -> dict:
+        """Everything the dashboard shows for this server."""
+        alive = self.process is not None and self.process.returncode is None
+        return {
+            "status": self.status,
+            "pid": self.process.pid if alive else None,
+            "uptime": round(time.monotonic() - self.started_at, 1) if alive and self.started_at else None,
+            "restarts": self.restart_count,
+            "sessions": self.session_count,
+            "inFlight": len(self.table) + sum(len(c.table) for c in self.children),
+            **self.metrics.summary(),
+        }
+
+    async def fetch_tools(self) -> tuple[list[dict], str]:
+        """The upstream's RAW tool list (every page), from the shared list cache
+        when it has it, else asked live through the hub's own channel (and cached).
+        Returns (tools, "cache" | "live"). An isolated server has no shared
+        process to ask: its tools exist per session."""
+        if self.is_isolated:
+            raise ValueError("isolated server: its tools exist per session, there is no shared process to ask")
+        cached = self.cache.get("tools/list")
+        if cached is not None:
+            return list(cached.get("tools", [])), "cache"
+        await self.ensure_running()
+        await self.ensure_ready()
+        generation = self.cache.generation("tools/list")
+        tools: list[dict] = []
+        cursor = None
+        for _ in range(50):  # a hard stop against a server that never ends its pages
+            response = await self.hub_request("tools/list", {"cursor": cursor} if cursor else {}, timeout=30.0)
+            if "result" not in response:
+                message = (response.get("error") or {}).get("message", "unknown error")
+                raise ConnectionError(f"managed server {self.name!r} refused tools/list: {message}")
+            result = response["result"]
+            tools.extend(result.get("tools", []))
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        if self.cache.put("tools/list", {"tools": tools}, generation):
+            self.persist_cache()
+        return tools, "live"
+
+    async def notify_tools_changed(self) -> None:
+        """Tells every connected client its tool list changed (a filter was edited),
+        so it asks again instead of keeping the old one."""
+        for subscriber in list(self.subscribers):
+            try:
+                await subscriber({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            except Exception:
+                pass  # a session mid-teardown
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 120.0) -> dict:
+        """Calls one tool on behalf of the hub itself (the GUI's tester): behind
+        the server's concurrency guard like any client request, and counted in
+        its metrics. Returns the JSON-RPC response object (`result` or `error`)."""
+        await self.ensure_running()
+        await self.ensure_ready()
+        started = time.monotonic()
+
+        async def ask() -> dict:
+            return await self.hub_request("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
+
+        try:
+            response = await self.guard.run(ask)
+        except (ConnectionError, asyncio.TimeoutError) as exc:
+            self.record_call(f"tools/call {name}"[:80], time.monotonic() - started, False, error=str(exc) or "timeout")
+            raise
+        failed = "error" in response
+        self.record_call(f"tools/call {name}"[:80], time.monotonic() - started, not failed,
+                         error=(response.get("error") or {}).get("message") if failed else None)
+        return response
 
     def touch(self) -> None:
         """Records client activity for the idle watcher."""
@@ -550,7 +645,14 @@ class ManagedServer:
         # real servers (mariadb, gitlab, ...) run via `npx`/`uvx`, which need
         # PATH to resolve at all. A bare `self.config.env` would silently drop
         # PATH the moment any server sets custom env vars.
-        env = {**os.environ, **self.config.env}
+        try:
+            # Secret references (`${secret:server/KEY}`) become their stored values only
+            # here, for the child's environment: never logged, never kept.
+            env = {**os.environ, **resolve_secrets(self.config.env)}
+        except OSError as exc:
+            self.status = "crashed"
+            self.append_log(f"[hub] cannot start {self.name}: {exc}")
+            raise
         # stdin must be piped: the hub proxies MCP requests to this process
         # over stdio (see hub_app._proxy), so there must be a write channel.
         # stderr must be its own pipe, NOT merged into stdout (stderr=STDOUT):
@@ -586,6 +688,7 @@ class ManagedServer:
             self.append_log(f"[hub] failed to start {self.name}: {exc}")
             raise
         self.status = "running"
+        self.started_at = time.monotonic()
         asyncio.create_task(self._watch(self.process))
 
     async def _watch(self, process: asyncio.subprocess.Process) -> None:
@@ -665,7 +768,12 @@ class ManagedServer:
             self.status = "crashed"
             return
         self.status = "starting"
-        env = {**os.environ, **self.config.env}
+        try:
+            env = {**os.environ, **resolve_secrets(self.config.env)}
+        except OSError as exc:
+            self.append_log(f"[hub] cannot start {self.name}: {exc}")
+            self.status = "crashed"
+            return
         resolved_command = shutil.which(self.config.command) or self.config.command
         try:
             self.process = await asyncio.create_subprocess_exec(
@@ -873,11 +981,16 @@ class HubManager:
     def __init__(self, config: Config):
         self.config = config
         self._servers = {
-            name: ManagedServer(name, sc) for name, sc in config.servers.items() if name != BUILTIN_RIZZO
+            name: self._new_server(name, sc) for name, sc in config.servers.items() if name != BUILTIN_RIZZO
         }
         # Set by `drain`: the hub accepts no new MCP traffic (see hub_app.DrainGate).
         self.draining = False
         self._sync_builtin()
+
+    def _new_server(self, name: str, sc: ServerConfig) -> ManagedServer:
+        server = ManagedServer(name, sc)
+        server.metrics.enabled = self.config.hub.metrics
+        return server
 
     def _sync_builtin(self) -> None:
         """(Re)creates the built-in Rizzo Flow service from `config.rizzo`;
@@ -953,6 +1066,10 @@ class HubManager:
                 entry["port"] = s.config.effective_port
             if s.restart_count:
                 entry["restarts"] = s.restart_count
+            if s.metrics.enabled and not s.config.is_service:
+                detail = s.metrics_detail()
+                entry.update({k: detail[k] for k in ("pid", "uptime", "sessions", "inFlight", "calls", "errors",
+                                                      "callsPerMin", "p50", "p95")})
             snapshot[name] = entry
         return snapshot
 
@@ -974,7 +1091,7 @@ class HubManager:
         if existing is not None:
             await existing.stop()
         self.config.servers[name] = server_config
-        self._servers[name] = ManagedServer(name, server_config)
+        self._servers[name] = self._new_server(name, server_config)
         return self._servers[name]
 
     async def remove(self, name: str) -> None:
@@ -988,6 +1105,9 @@ class HubManager:
         if existing is not None:
             await existing.stop()
         self.config.servers.pop(name, None)
+        for members in self.config.groups.values():  # a removed server leaves its groups too
+            while name in members:
+                members.remove(name)
 
     async def reload_from_disk(self, path: Path) -> tuple[list[str], list[str], list[str]]:
         """Re-reads `config.json` and applies the difference against the
@@ -1031,6 +1151,7 @@ class HubManager:
             if name not in new_config.servers:
                 removed.append(name)
                 await self.remove(name)
+        self.config.groups = new_config.groups  # a hand-edited config.json may have changed them too
         if new_config.rizzo != self.config.rizzo:
             updated.append(BUILTIN_RIZZO)
             managed = await self.apply_rizzo(new_config.rizzo)

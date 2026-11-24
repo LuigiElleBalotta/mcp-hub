@@ -10,7 +10,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication, QPushButton
 
-from mcp_hub.gui.main_window import MainWindow
+from mcp_hub.gui.main_window import ACTIONS_COL, MainWindow
 from mcp_hub.gui.server_dialog import ServerDialog
 
 
@@ -63,7 +63,7 @@ def _row(win, name):
 
 
 def _buttons(win, name):
-    cell = win.table.cellWidget(_row(win, name), 4)
+    cell = win.table.cellWidget(_row(win, name), ACTIONS_COL)
     return {b.text(): b for b in cell.findChildren(QPushButton)}
 
 

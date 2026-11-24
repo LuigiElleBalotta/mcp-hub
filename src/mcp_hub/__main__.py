@@ -93,8 +93,128 @@ def cmd_import(args: argparse.Namespace) -> None:
         print("Nothing new to import.")
 
 
+def _client_path(adapter, args: argparse.Namespace) -> Path:
+    """The file to sync: --to wins, else the client's user-level file or (with
+    --scope project) the one inside --project-dir."""
+    if args.to_path:
+        return Path(args.to_path)
+    if args.scope == "project":
+        return adapter.project_path(Path(args.project_dir or "."))
+    path = adapter.user_path()
+    if path is None:
+        sys.exit(f"{adapter.label}: the user-level config path is not confirmed on this system; pass --to <file>.")
+    return path
+
+
+def cmd_apply_client(args: argparse.Namespace, config) -> None:
+    """`apply --client X`: plan, show the diff, then (unless --dry-run) back up and write."""
+    from mcp_hub.client_sync import ADAPTERS, apply_plan, plan_sync, sync_names
+
+    adapter = ADAPTERS[args.client or "claude"]
+    if args.project:
+        sys.exit("--project (Claude Code's per-project section) belongs to the legacy form `apply --to`; "
+                 "use --scope project --project-dir <dir> for a project file.")
+    only = [n for n in args.only.split(",") if n] if args.only else None
+    path = _client_path(adapter, args)
+    try:
+        names = sync_names(config, only, group=args.group)
+    except ValueError as exc:
+        sys.exit(f"{exc} (known groups: {', '.join(sorted(config.groups)) or 'none'})")
+    plan = plan_sync(adapter, path, config, names)
+    print(plan.summary())
+    print(f"File: {path}")
+    if plan.error:
+        sys.exit(1)
+    if not plan.changed:
+        print("Nothing to change.")
+        return
+    print(plan.diff())
+    if args.dry_run:
+        print("(dry run: nothing was written)")
+        return
+    if not args.yes and input("Write these changes? [y/N] ").strip().lower() != "y":
+        print("Cancelled.")
+        return
+    backup = apply_plan(plan)
+    print(f"Written. Backup: {backup}" if backup else "Written (new file).")
+
+
+def cmd_secrets(args: argparse.Namespace) -> None:
+    """Manage the secrets kept in the OS credential store (never prints a value)."""
+    from mcp_hub import secrets as store
+
+    if not store.available():
+        sys.exit("No credential store is available on this system (is the 'keyring' package installed?).")
+    config = load_config()
+    if args.action == "list":
+        rows = store.stored_names(config.servers)
+        for ref, where, present in rows:
+            print(f"{'ok     ' if present else 'MISSING'}  {where}  {ref}")
+        if not rows:
+            print("No secret references in config.json.")
+    elif args.action == "migrate":
+        created = store.migrate_config_secrets(config.servers, only=args.server)
+        if created:
+            save_config(config)
+        print(f"Moved {len(created)} secret(s) into the credential store." + (
+            "\n" + "\n".join(created) if created else ""))
+    elif args.action == "set":
+        import getpass
+
+        value = getpass.getpass(f"Value for {args.server}/{args.key} (hidden): ")
+        if not value:
+            sys.exit("Empty value: nothing stored.")
+        store.set_secret(args.server, args.key, value)
+        print(f"Stored {store.make_ref(args.server, args.key)}")
+    elif args.action == "delete":
+        print("Deleted." if store.delete_secret(args.server, args.key) else "There was no such secret.")
+
+
+def cmd_groups(args: argparse.Namespace) -> None:
+    from mcp_hub.config import valid_group_name
+
+    config = load_config()
+    if args.action == "list":
+        for name, members in config.groups.items():
+            print(f"{name}: {', '.join(members) or '(empty)'}")
+        if not config.groups:
+            print("No groups.")
+    elif args.action == "set":
+        if not valid_group_name(args.name):
+            sys.exit("Group name: 1-40 characters of letters, digits, space . _ -")
+        members = [m for m in args.servers.split(",") if m]
+        unknown = [m for m in members if m not in config.servers]
+        if unknown:
+            sys.exit(f"Unknown server(s): {', '.join(unknown)}")
+        config.groups[args.name] = list(dict.fromkeys(members))
+        save_config(config)
+        print(f"Group {args.name}: {', '.join(config.groups[args.name]) or '(empty)'}")
+    elif args.action == "delete":
+        if config.groups.pop(args.name, None) is None:
+            sys.exit(f"Unknown group: {args.name}")
+        save_config(config)
+        print("Deleted.")
+
+
+def cmd_rollback(args: argparse.Namespace) -> None:
+    from mcp_hub.client_sync import ADAPTERS, rollback
+
+    adapter = ADAPTERS[args.client]
+    path = _client_path(adapter, args)
+    try:
+        restored = rollback(path)
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(str(exc))
+    print(f"Restored {path} from {restored}")
+
+
 def cmd_apply(args: argparse.Namespace) -> None:
     config = load_config()
+    if args.client or args.dry_run or args.group:
+        cmd_apply_client(args, config)
+        return
+    if not args.to_path:
+        sys.exit("apply: pass --to <file> (Claude Code) or --client claude|cursor|vscode.")
     migrated = apply_servers(Path(args.to_path), config, project_scope=args.project)
     print(f"Applied {len(migrated)} server(s) to {args.to_path}: {', '.join(migrated) or '(none)'}")
 
@@ -129,11 +249,46 @@ def main() -> None:
     import_parser.set_defaults(func=cmd_import)
 
     apply_parser = sub.add_parser("apply")
-    apply_parser.add_argument("--to", dest="to_path", required=True)
+    apply_parser.add_argument("--to", dest="to_path", default=None)
     apply_parser.add_argument("--project", default=None)
+    apply_parser.add_argument("--client", choices=["claude", "cursor", "vscode"], default=None,
+                              help="write the hub's endpoints into this client's config (with a diff preview)")
+    apply_parser.add_argument("--scope", choices=["user", "project"], default="user")
+    apply_parser.add_argument("--project-dir", default=None, help="folder of the project file (--scope project)")
+    apply_parser.add_argument("--only", default=None, help="comma-separated server names")
+    apply_parser.add_argument("--group", default=None, help="only the servers of this group")
+    apply_parser.add_argument("--dry-run", action="store_true", help="show the diff, write nothing")
     apply_parser.add_argument("--cleanup", action="store_true")
     apply_parser.add_argument("--yes", action="store_true")
     apply_parser.set_defaults(func=cmd_apply)
+
+    groups_parser = sub.add_parser("groups", help="named sets of servers")
+    groups_sub = groups_parser.add_subparsers(dest="action", required=True)
+    groups_sub.add_parser("list")
+    gset = groups_sub.add_parser("set", help="create or replace a group")
+    gset.add_argument("name")
+    gset.add_argument("servers", help="comma-separated server names")
+    gdel = groups_sub.add_parser("delete")
+    gdel.add_argument("name")
+    groups_parser.set_defaults(func=cmd_groups)
+
+    secrets_parser = sub.add_parser("secrets", help="keep env secrets in the OS credential store")
+    secrets_sub = secrets_parser.add_subparsers(dest="action", required=True)
+    secrets_sub.add_parser("list", help="show which secret references exist and whether each is stored")
+    migrate = secrets_sub.add_parser("migrate", help="move plaintext secrets of config.json into the store")
+    migrate.add_argument("--server", default=None, help="only this server")
+    for action in ("set", "delete"):
+        sp = secrets_sub.add_parser(action)
+        sp.add_argument("server")
+        sp.add_argument("key")
+    secrets_parser.set_defaults(func=cmd_secrets)
+
+    rollback_parser = sub.add_parser("rollback", help="restore the newest backup of a client's config")
+    rollback_parser.add_argument("--client", choices=["claude", "cursor", "vscode"], required=True)
+    rollback_parser.add_argument("--scope", choices=["user", "project"], default="user")
+    rollback_parser.add_argument("--project-dir", default=None)
+    rollback_parser.add_argument("--to", dest="to_path", default=None)
+    rollback_parser.set_defaults(func=cmd_rollback)
 
     args = parser.parse_args()
     args.func(args)

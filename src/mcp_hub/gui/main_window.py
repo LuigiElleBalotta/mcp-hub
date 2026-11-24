@@ -2,16 +2,35 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QEvent, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QHBoxLayout, QLabel, QHeaderView, QMenu, QStyle,
-    QSystemTrayIcon, QTabWidget,
+    QSystemTrayIcon, QTabWidget, QComboBox,
 )
 
 from mcp_hub.gui.api_client import HubApiClient
 from mcp_hub.updater import UpdateInfo, check_for_update
+
+COLUMNS = ["Server", "Type", "Status", "Details", "Chiamate/min", "p95", "Sessioni", "Actions"]
+COL_CALLS, COL_P95, COL_SESSIONS, ACTIONS_COL = 4, 5, 6, 7
+
+
+def dashboard_cells(info: dict, is_service: bool) -> tuple[str, str, str]:
+    """(calls/min, p95, sessions) as shown in the table. A service has none of
+    these; an older hub does not send them (shown as "-")."""
+    if is_service:
+        return "", "", ""
+    calls = info.get("callsPerMin")
+    p95 = info.get("p95")
+    sessions = info.get("sessions")
+    return (
+        "-" if calls is None else str(calls),
+        "-" if p95 is None else (f"{p95:.0f} ms" if p95 >= 10 else f"{p95:.1f} ms"),
+        "-" if sessions is None else str(sessions),
+    )
+
 
 _STATUS_COLOR = {
     "running": "#2e7d32", "stopped": "#757575", "crashed": "#c62828",
@@ -60,7 +79,8 @@ class _StatusWorker(QThread):
     thread's own direct calls (start/stop/upsert/remove, all short-lived
     and user-initiated) is fine.
     """
-    done = Signal(bool, object, object)  # (ok, statuses dict | None, (name, log lines) | None)
+    # (ok, statuses dict | None, (name, log lines) | None, (name, metrics dict | None) | None)
+    done = Signal(bool, object, object, object)
 
     def __init__(self, client: HubApiClient, log_name: str | None = None, parent=None):
         super().__init__(parent)
@@ -71,7 +91,7 @@ class _StatusWorker(QThread):
         try:
             statuses = self._client.status()
         except Exception:
-            self.done.emit(False, None, None)
+            self.done.emit(False, None, None, None)
             return
         # The selected server's log is refreshed on every tick too (a
         # service's startup output is the whole point of looking at it),
@@ -82,7 +102,13 @@ class _StatusWorker(QThread):
                 logs = (self._log_name, self._client.logs(self._log_name))
             except Exception:
                 logs = None
-        self.done.emit(True, statuses, logs)
+        metrics = None
+        if self._log_name is not None and self._log_name in statuses:
+            try:
+                metrics = (self._log_name, self._client.metrics(self._log_name))
+            except Exception:
+                metrics = (self._log_name, None)  # old hub / hiccup: the pane says "not available"
+        self.done.emit(True, statuses, logs, metrics)
 
 
 class _ActionWorker(QThread):
@@ -150,8 +176,8 @@ class MainWindow(QMainWindow):
         self._action_workers: list[_ActionWorker] = []
         self._busy: set[str] = set()  # servers with a start/stop call in flight
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Server", "Type", "Status", "Details", "Actions"])
+        self.table = QTableWidget(0, len(COLUMNS))
+        self.table.setHorizontalHeaderLabels(COLUMNS)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -161,7 +187,9 @@ class MainWindow(QMainWindow):
         # ResizeToContents (ignores cell widgets) nor Fixed (uses the default
         # section size) honour the button row, which then overflowed
         # leftwards and covered the Status/Details text.
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        for col in (COL_CALLS, COL_P95, COL_SESSIONS):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(ACTIONS_COL, QHeaderView.ResizeMode.Interactive)
         self._actions_width = 0
 
         self.connection_banner = QLabel("Hub non raggiungibile — nuovo tentativo tra 2s...")
@@ -192,31 +220,61 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.tabs, 1)
         servers_page = QWidget()
         layout = QVBoxLayout(servers_page)
+        # Groups: filter the list, start/stop a whole set, manage them (R5).
+        self.group_combo = QComboBox()
+        self.group_combo.addItem("Tutti i server", None)
+        self.group_start_btn = QPushButton("Avvia gruppo")
+        self.group_stop_btn = QPushButton("Ferma gruppo")
+        self.manage_groups_btn = QPushButton("Gestisci gruppi...")
+        self.group_combo.currentIndexChanged.connect(self._group_changed)
+        self.group_start_btn.clicked.connect(lambda: self._group_action("start"))
+        self.group_stop_btn.clicked.connect(lambda: self._group_action("stop"))
+        self.manage_groups_btn.clicked.connect(self._manage_groups)
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel("Gruppo:"))
+        group_row.addWidget(self.group_combo, 1)
+        group_row.addWidget(self.group_start_btn)
+        group_row.addWidget(self.group_stop_btn)
+        group_row.addWidget(self.manage_groups_btn)
+        layout.addLayout(group_row)
+        self._groups: dict[str, list[str]] = {}
         layout.addWidget(self.table, 2)
 
         add_btn = QPushButton("Add server")
         add_btn.clicked.connect(self._add_server)
-        layout.addWidget(add_btn)
-
-        import_btn = QPushButton("Import from Claude Code config")
-        apply_btn = QPushButton("Apply to Claude Code config")
+        import_btn = QPushButton("Import from Claude Code")
+        apply_btn = QPushButton("Sync clients")
+        apply_btn.setToolTip("Scrive gli endpoint dell'hub in Claude Code, Cursor e VS Code (con anteprima e backup)")
         reload_btn = QPushButton("Reload config.json")
         settings_btn = QPushButton("Settings")
         import_btn.clicked.connect(self._import_from_claude)
-        apply_btn.clicked.connect(self._apply_to_claude)
+        apply_btn.clicked.connect(self._sync_clients)
         reload_btn.clicked.connect(self._reload_config)
         settings_btn.clicked.connect(self._open_settings)
-        layout.addWidget(import_btn)
-        layout.addWidget(apply_btn)
-        layout.addWidget(reload_btn)
-        layout.addWidget(settings_btn)
+        # One row, not five full-width buttons stacked: those took ~150 px and squeezed the
+        # server table (the thing people look at) down to a row or two.
+        buttons_row = QHBoxLayout()
+        for button in (add_btn, import_btn, apply_btn, reload_btn, settings_btn):
+            buttons_row.addWidget(button)
+        layout.addLayout(buttons_row)
 
         self.setCentralWidget(central)
 
+        from mcp_hub.gui.detail_pane import DetailPane
         from mcp_hub.gui.log_panel import LogPanel
+        self.detail_pane = DetailPane()
         self.log_panel = LogPanel()
         self.table.itemSelectionChanged.connect(self._on_row_selected)
-        layout.addWidget(self.log_panel, 1)
+        # Under the table: the selected server's dashboard detail and its log, as tabs so
+        # neither squeezes the table (it is the thing people look at).
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.addTab(self.detail_pane, "Dettaglio")
+        self.bottom_tabs.addTab(self.log_panel, "Log")
+        from mcp_hub.gui.tools_panel import ToolsPanel
+        self.tools_panel = ToolsPanel(self.client)
+        self.bottom_tabs.addTab(self.tools_panel, "Tool")
+        self.bottom_tabs.currentChanged.connect(lambda _i: self._sync_tools_panel())
+        layout.addWidget(self.bottom_tabs, 1)
 
         version_label = QLabel(f"mcp-hub v{mcp_hub.__version__}")
         version_label.setStyleSheet("color: #888; padding: 2px 4px;")
@@ -231,6 +289,7 @@ class MainWindow(QMainWindow):
             lambda i: self.rizzo_panel.refresh_detection() if i == 1 else None)
 
         self._init_tray()
+        self._reload_groups()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -410,7 +469,7 @@ class MainWindow(QMainWindow):
 
     def _fit_actions_column(self) -> None:
         if self._actions_width:
-            self.table.setColumnWidth(4, self._actions_width)
+            self.table.setColumnWidth(ACTIONS_COL, self._actions_width)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -421,7 +480,7 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, 0) if row >= 0 else None
         return item.text() if item is not None else None
 
-    def _on_status_result(self, ok: bool, statuses: dict | None, logs: object = None) -> None:
+    def _on_status_result(self, ok: bool, statuses: dict | None, logs: object = None, metrics: object = None) -> None:
         if not ok:
             # Hub unreachable -- could be the first-run wizard's freshly
             # spawned hub still starting up, or a transient blip on an
@@ -444,6 +503,9 @@ class MainWindow(QMainWindow):
         builtin = {n: i for n, i in statuses.items() if i.get("builtin")}
         self.rizzo_panel.on_hub_status(next(iter(builtin.values()), None), reachable=True)
         statuses = {n: i for n, i in statuses.items() if n not in builtin}
+        group = self.group_combo.currentData()
+        if group is not None:  # a group narrows the list to its members
+            statuses = {n: i for n, i in statuses.items() if n in self._groups.get(group, [])}
         selected = self._selected_name()
         self.table.setRowCount(len(statuses))
         for row, (name, info) in enumerate(sorted(statuses.items())):
@@ -463,9 +525,13 @@ class MainWindow(QMainWindow):
                 details = f"HTTP :{port}" if port is not None else "process"
             else:
                 details = info["concurrency"]
-                if info.get("sessions") is not None:  # an isolated server: one process per session
+                if details == "isolated" and info.get("sessions") is not None:  # one process per session
                     details = f"{details} ({info['sessions']})"
             self.table.setItem(row, 3, QTableWidgetItem(details))
+            for col, text in zip((COL_CALLS, COL_P95, COL_SESSIONS), dashboard_cells(info, is_service)):
+                cell = QTableWidgetItem(text)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(row, col, cell)
 
             actions = QWidget()
             actions_layout = QHBoxLayout(actions)
@@ -489,7 +555,7 @@ class MainWindow(QMainWindow):
             actions_layout.addWidget(stop_btn)
             actions_layout.addWidget(edit_btn)
             actions_layout.addWidget(remove_btn)
-            self.table.setCellWidget(row, 4, actions)
+            self.table.setCellWidget(row, ACTIONS_COL, actions)
             buttons = (start_btn, stop_btn, edit_btn, remove_btn)
             self._actions_width = max(
                 self._actions_width,
@@ -514,6 +580,12 @@ class MainWindow(QMainWindow):
             name, lines = logs
             if name == self._selected_name():
                 self.log_panel.show_logs(name, lines)
+        if metrics is not None:
+            name, data = metrics
+            if name == self._selected_name():
+                self.detail_pane.show_metrics(name, data)
+        elif selected is None:
+            self.detail_pane.clear()
 
     def _maybe_launch_hub(self) -> None:
         """Best-effort attempt to start the hub ourselves when it's never
@@ -562,7 +634,12 @@ class MainWindow(QMainWindow):
     def _add_server(self) -> None:
         from mcp_hub.gui.server_dialog import ServerDialog
         from PySide6.QtWidgets import QMessageBox
-        dialog = ServerDialog(parent=self)
+        from mcp_hub.config import load_config
+        try:
+            registry_enabled = load_config().hub.registrySearch
+        except (OSError, ValueError, TypeError):
+            registry_enabled = False
+        dialog = ServerDialog(parent=self, registry_enabled=registry_enabled)
         if dialog.exec():
             name = dialog.result_name()
             if not name:
@@ -605,7 +682,62 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             dialog.apply()
 
+    def _reload_groups(self, groups: dict[str, list[str]] | None = None) -> None:
+        """Re-reads the groups (config.json, which the hub keeps up to date) into the
+        selector, keeping the current choice if it still exists."""
+        if groups is None:
+            from mcp_hub.config import load_config
+            try:
+                groups = load_config().groups
+            except (OSError, ValueError, TypeError):
+                groups = self._groups
+        self._groups = groups
+        current = self.group_combo.currentData()
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("Tutti i server", None)
+        for name in groups:
+            self.group_combo.addItem(name, name)
+        index = self.group_combo.findData(current)
+        self.group_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.group_combo.blockSignals(False)
+        self._update_group_buttons()
+
+    def _update_group_buttons(self) -> None:
+        has_group = self.group_combo.currentData() is not None
+        self.group_start_btn.setEnabled(has_group)
+        self.group_stop_btn.setEnabled(has_group)
+
+    def _group_changed(self, _index: int) -> None:
+        self._update_group_buttons()
+        self.refresh()
+
+    def _group_action(self, action: str) -> None:
+        group = self.group_combo.currentData()
+        if group is not None:
+            self._run_action(lambda g, a=action: self.client.group_action(g, a), group)
+
+    def _manage_groups(self) -> None:
+        from mcp_hub.config import BUILTIN_RIZZO, load_config
+        from mcp_hub.gui.groups_dialog import GroupsDialog
+        servers = [n for n in load_config().servers if n != BUILTIN_RIZZO]
+        dialog = GroupsDialog(self.client, servers, self._groups, parent=self)
+        dialog.exec()
+        if dialog.changed:
+            self._reload_groups()
+            self.refresh()
+
+    def _sync_tools_panel(self) -> None:
+        """Points the Tool tab at the selected row. Its list is only FETCHED while the
+        tab is showing: reading it starts a lazy or idle server."""
+        name = self._selected_name()
+        row = self.table.currentRow()
+        is_service = row >= 0 and self.table.item(row, 1) is not None and self.table.item(row, 1).text() == "Service"
+        self.tools_panel.set_server(
+            name, load=self.bottom_tabs.currentWidget() is self.tools_panel, supported=not is_service)
+
     def _on_row_selected(self) -> None:
+        self._sync_tools_panel()
         row = self.table.currentRow()
         if row < 0:
             return
@@ -643,27 +775,11 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Import", f"Imported (disabled): {', '.join(imported) or '(none)'}")
         self.refresh()
 
-    def _apply_to_claude(self) -> None:
-        from pathlib import Path
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
-        if not path:
-            return
-        from mcp_hub.config import load_config
-        from mcp_hub.claude_config import apply_servers
-        config = load_config()
-        # Services are not MCP servers: `apply` never touches them.
-        enabled_names = [n for n, s in config.servers.items() if s.enabled and not s.is_service]
-        confirm = QMessageBox.question(
-            self, "Apply",
-            f"This will back up {path} and rewrite these servers to point at the hub:\n"
-            + "\n".join(enabled_names)
-            + "\n\nContinue?",
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        migrated = apply_servers(Path(path), config)
-        QMessageBox.information(self, "Apply", f"Migrated: {', '.join(migrated) or '(none)'}")
+    def _sync_clients(self) -> None:
+        """Writes the hub's endpoints into the clients' config files, with a diff
+        preview, a backup and a restore (see client_sync_dialog)."""
+        from mcp_hub.gui.client_sync_dialog import ClientSyncDialog
+        ClientSyncDialog(parent=self).exec()
 
     def _reload_config(self) -> None:
         """Picks up config.json changes the running hub never saw happen --

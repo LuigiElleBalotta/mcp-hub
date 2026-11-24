@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
+from fnmatch import fnmatchcase
 from typing import Callable
 
 from starlette.requests import Request
@@ -11,8 +13,8 @@ from starlette.routing import Route
 
 from dataclasses import asdict
 
-from mcp_hub.config import BUILTIN_RIZZO, CONCURRENCY_MODES, CONFIG_PATH, ServerConfig, rizzo_settings_from_dict, save_config
-from mcp_hub.filters import PREFIX_RE
+from mcp_hub.config import BUILTIN_RIZZO, CONCURRENCY_MODES, CONFIG_PATH, ServerConfig, valid_group_name, rizzo_settings_from_dict, save_config
+from mcp_hub.filters import PREFIX_RE, is_glob, tool_visible
 from mcp_hub.manager import HubManager
 
 
@@ -149,6 +151,194 @@ def management_routes(
             return _unknown(name)
         return JSONResponse({"lines": list(server.logs)})
 
+    async def server_metrics(request: Request) -> JSONResponse:
+        """Dashboard detail of one server: counters, latency, recent calls.
+        Method names and durations only, never arguments or results."""
+        name = request.path_params["name"]
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        return JSONResponse({
+            **server.metrics_detail(),
+            "enabled": server.metrics.enabled,
+            "recent": server.metrics.recent(),
+        })
+
+    async def server_tools(request: Request) -> JSONResponse:
+        """The server's RAW tools with what the client-facing filters make of each
+        (`visible`, and the `clientName` a client would call it by)."""
+        name = request.path_params["name"]
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        try:
+            tools, source = await server.fetch_tools()
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except (ConnectionError, asyncio.TimeoutError, OSError) as exc:
+            return JSONResponse({"error": str(exc) or "the server did not answer"}, status_code=502)
+        cfg = server.config
+        shaped = []
+        for tool in tools:
+            tool_name = tool.get("name") if isinstance(tool, dict) else None
+            if not isinstance(tool_name, str):
+                continue
+            visible = tool_visible(tool_name, cfg.toolsAllow, cfg.toolsDeny)
+            shaped.append({
+                "name": tool_name,
+                "clientName": f"{cfg.toolPrefix}{tool_name}",
+                "description": tool.get("description") or "",
+                "inputSchema": tool.get("inputSchema") or {},
+                "readOnly": bool((tool.get("annotations") or {}).get("readOnlyHint")),
+                "visible": visible,
+                # hidden by a deny GLOB: deny wins, so an exact-name edit cannot undo it
+                # (an exact name in toolsDeny, by contrast, is simply removed).
+                "lockedByPattern": not visible and any(is_glob(p) and fnmatchcase(tool_name, p) for p in cfg.toolsDeny),
+            })
+        return JSONResponse({
+            "tools": shaped, "source": source, "filtered": cfg.has_tool_filter,
+            "toolsAllow": list(cfg.toolsAllow), "toolsDeny": list(cfg.toolsDeny), "toolPrefix": cfg.toolPrefix,
+        })
+
+    async def set_filters(request: Request) -> JSONResponse:
+        """Changes a server's tool filters in place: no restart, so connected
+        sessions are kept; clients are told the tool list changed."""
+        name = request.path_params["name"]
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        if name == BUILTIN_RIZZO or server.config.is_service:
+            return JSONResponse({"error": "only MCP servers have tool filters"}, status_code=409)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+        new = {}
+        for key in ("toolsAllow", "toolsDeny"):
+            value = body.get(key, getattr(server.config, key))
+            if not isinstance(value, list) or not all(isinstance(p, str) and p for p in value):
+                return JSONResponse({"error": f"{key} must be a list of non-empty strings"}, status_code=400)
+            new[key] = list(value)
+        prefix = body.get("toolPrefix", server.config.toolPrefix)
+        if not isinstance(prefix, str) or not PREFIX_RE.fullmatch(prefix):
+            return JSONResponse({"error": "invalid toolPrefix"}, status_code=400)
+        server.config.toolsAllow, server.config.toolsDeny, server.config.toolPrefix = (
+            new["toolsAllow"], new["toolsDeny"], prefix)
+        save_config(manager.config)
+        await server.notify_tools_changed()
+        for child in list(server.children):  # an isolated session's process holds a copy of the config
+            child.config.toolsAllow, child.config.toolsDeny, child.config.toolPrefix = (
+                new["toolsAllow"], new["toolsDeny"], prefix)
+            await child.notify_tools_changed()
+        return JSONResponse({"toolsAllow": new["toolsAllow"], "toolsDeny": new["toolsDeny"], "toolPrefix": prefix})
+
+    async def call_tool(request: Request) -> JSONResponse:
+        """Calls a tool from the GUI's tester. Goes through the server's guard and
+        metrics like a client call. A tool that is not declared read-only needs
+        `confirm: true`, so a stray request cannot run something with side effects."""
+        name = request.path_params["name"]
+        try:
+            server = manager.get(name)
+        except KeyError:
+            return _unknown(name)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+        tool = body.get("tool") if isinstance(body, dict) else None
+        arguments = body.get("arguments", {}) if isinstance(body, dict) else None
+        if not isinstance(tool, str) or not tool or not isinstance(arguments, dict):
+            return JSONResponse({"error": "expected {tool: str, arguments?: object, confirm?: bool}"}, status_code=400)
+        try:
+            tools, _source = await server.fetch_tools()
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except (ConnectionError, asyncio.TimeoutError, OSError) as exc:
+            return JSONResponse({"error": str(exc) or "the server did not answer"}, status_code=502)
+        declared = next((t for t in tools if isinstance(t, dict) and t.get("name") == tool), None)
+        if declared is None:
+            return JSONResponse({"error": f"unknown tool: {tool}"}, status_code=404)
+        read_only = bool((declared.get("annotations") or {}).get("readOnlyHint"))
+        if not read_only and body.get("confirm") is not True:
+            return JSONResponse(
+                {"error": "this tool is not declared read-only: send confirm=true to run it", "readOnly": False},
+                status_code=409,
+            )
+        started = time.monotonic()
+        try:
+            response = await server.call_tool(tool, arguments)
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": "the tool did not answer in time"}, status_code=504)
+        except (ConnectionError, OSError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        return JSONResponse({
+            "result": response.get("result"), "error": response.get("error"),
+            "ms": round((time.monotonic() - started) * 1000, 1), "readOnly": read_only,
+        })
+
+    async def groups_list(request: Request) -> JSONResponse:
+        return JSONResponse({"groups": {n: list(m) for n, m in manager.config.groups.items()}})
+
+    async def group_put(request: Request) -> JSONResponse:
+        """Creates or replaces a group. Members must be existing servers (the built-in
+        Rizzo service is managed on its own tab and cannot be grouped)."""
+        name = request.path_params["name"]
+        if not valid_group_name(name):
+            return JSONResponse({"error": "group name: 1-40 characters of letters, digits, space . _ -"}, status_code=400)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+        members = body.get("servers") if isinstance(body, dict) else None
+        if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+            return JSONResponse({"error": "expected {servers: [name, ...]}"}, status_code=400)
+        unknown = [m for m in members if m not in manager.config.servers]
+        if unknown:
+            return JSONResponse({"error": f"unknown server(s): {', '.join(unknown)}"}, status_code=400)
+        manager.config.groups[name] = list(dict.fromkeys(members))  # no duplicates, order kept
+        save_config(manager.config)
+        return JSONResponse({"group": name, "servers": manager.config.groups[name]})
+
+    async def group_delete(request: Request) -> JSONResponse:
+        name = request.path_params["name"]
+        if name not in manager.config.groups:
+            return JSONResponse({"error": f"unknown group: {name}"}, status_code=404)
+        del manager.config.groups[name]
+        save_config(manager.config)
+        return JSONResponse({"status": "removed"})
+
+    async def group_action(request: Request) -> JSONResponse:
+        """Starts or stops every server of a group, one after the other."""
+        name = request.path_params["name"]
+        action = request.path_params["action"]
+        if name not in manager.config.groups:
+            return JSONResponse({"error": f"unknown group: {name}"}, status_code=404)
+        results: dict[str, str] = {}
+        for member in manager.config.groups[name]:
+            try:
+                server = manager.get(member)
+            except KeyError:
+                results[member] = "missing"  # a server removed after it was grouped
+                continue
+            if action == "start":
+                if not server.config.enabled:
+                    results[member] = "disabled"
+                    continue
+                try:
+                    await server.start()
+                except OSError as exc:
+                    results[member] = f"error: {exc}"
+                    continue
+            else:
+                await server.stop()
+            results[member] = server.status
+        return JSONResponse({"results": results})
+
     def _rizzo_state() -> dict:
         snapshot = manager.status_snapshot().get(BUILTIN_RIZZO)
         return {"settings": asdict(manager.config.rizzo), "status": snapshot["status"] if snapshot else None}
@@ -259,6 +449,14 @@ def management_routes(
         Route("/api/servers/{name}/start", start, methods=["POST"]),
         Route("/api/servers/{name}/stop", stop, methods=["POST"]),
         Route("/api/servers/{name}/logs", logs, methods=["GET"]),
+        Route("/api/servers/{name}/metrics", server_metrics, methods=["GET"]),
+        Route("/api/servers/{name}/tools", server_tools, methods=["GET"]),
+        Route("/api/servers/{name}/call", call_tool, methods=["POST"]),
+        Route("/api/groups", groups_list, methods=["GET"]),
+        Route("/api/groups/{name}", group_put, methods=["PUT"]),
+        Route("/api/groups/{name}", group_delete, methods=["DELETE"]),
+        Route("/api/groups/{name}/{action}", group_action, methods=["POST"]),
+        Route("/api/servers/{name}/filters", set_filters, methods=["PUT"]),
         Route("/api/servers/{name}", upsert, methods=["POST"]),
         Route("/api/servers/{name}", remove, methods=["DELETE"]),
     ]
