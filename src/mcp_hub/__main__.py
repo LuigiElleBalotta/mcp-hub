@@ -93,8 +93,67 @@ def cmd_import(args: argparse.Namespace) -> None:
         print("Nothing new to import.")
 
 
+def _client_path(adapter, args: argparse.Namespace) -> Path:
+    """The file to sync: --to wins, else the client's user-level file or (with
+    --scope project) the one inside --project-dir."""
+    if args.to_path:
+        return Path(args.to_path)
+    if args.scope == "project":
+        return adapter.project_path(Path(args.project_dir or "."))
+    path = adapter.user_path()
+    if path is None:
+        sys.exit(f"{adapter.label}: the user-level config path is not confirmed on this system; pass --to <file>.")
+    return path
+
+
+def cmd_apply_client(args: argparse.Namespace, config) -> None:
+    """`apply --client X`: plan, show the diff, then (unless --dry-run) back up and write."""
+    from mcp_hub.client_sync import ADAPTERS, apply_plan, plan_sync, sync_names
+
+    adapter = ADAPTERS[args.client or "claude"]
+    if args.project:
+        sys.exit("--project (Claude Code's per-project section) belongs to the legacy form `apply --to`; "
+                 "use --scope project --project-dir <dir> for a project file.")
+    only = [n for n in args.only.split(",") if n] if args.only else None
+    path = _client_path(adapter, args)
+    plan = plan_sync(adapter, path, config, sync_names(config, only))
+    print(plan.summary())
+    print(f"File: {path}")
+    if plan.error:
+        sys.exit(1)
+    if not plan.changed:
+        print("Nothing to change.")
+        return
+    print(plan.diff())
+    if args.dry_run:
+        print("(dry run: nothing was written)")
+        return
+    if not args.yes and input("Write these changes? [y/N] ").strip().lower() != "y":
+        print("Cancelled.")
+        return
+    backup = apply_plan(plan)
+    print(f"Written. Backup: {backup}" if backup else "Written (new file).")
+
+
+def cmd_rollback(args: argparse.Namespace) -> None:
+    from mcp_hub.client_sync import ADAPTERS, rollback
+
+    adapter = ADAPTERS[args.client]
+    path = _client_path(adapter, args)
+    try:
+        restored = rollback(path)
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(str(exc))
+    print(f"Restored {path} from {restored}")
+
+
 def cmd_apply(args: argparse.Namespace) -> None:
     config = load_config()
+    if args.client or args.dry_run:
+        cmd_apply_client(args, config)
+        return
+    if not args.to_path:
+        sys.exit("apply: pass --to <file> (Claude Code) or --client claude|cursor|vscode.")
     migrated = apply_servers(Path(args.to_path), config, project_scope=args.project)
     print(f"Applied {len(migrated)} server(s) to {args.to_path}: {', '.join(migrated) or '(none)'}")
 
@@ -129,11 +188,24 @@ def main() -> None:
     import_parser.set_defaults(func=cmd_import)
 
     apply_parser = sub.add_parser("apply")
-    apply_parser.add_argument("--to", dest="to_path", required=True)
+    apply_parser.add_argument("--to", dest="to_path", default=None)
     apply_parser.add_argument("--project", default=None)
+    apply_parser.add_argument("--client", choices=["claude", "cursor", "vscode"], default=None,
+                              help="write the hub's endpoints into this client's config (with a diff preview)")
+    apply_parser.add_argument("--scope", choices=["user", "project"], default="user")
+    apply_parser.add_argument("--project-dir", default=None, help="folder of the project file (--scope project)")
+    apply_parser.add_argument("--only", default=None, help="comma-separated server names")
+    apply_parser.add_argument("--dry-run", action="store_true", help="show the diff, write nothing")
     apply_parser.add_argument("--cleanup", action="store_true")
     apply_parser.add_argument("--yes", action="store_true")
     apply_parser.set_defaults(func=cmd_apply)
+
+    rollback_parser = sub.add_parser("rollback", help="restore the newest backup of a client's config")
+    rollback_parser.add_argument("--client", choices=["claude", "cursor", "vscode"], required=True)
+    rollback_parser.add_argument("--scope", choices=["user", "project"], default="user")
+    rollback_parser.add_argument("--project-dir", default=None)
+    rollback_parser.add_argument("--to", dest="to_path", default=None)
+    rollback_parser.set_defaults(func=cmd_rollback)
 
     args = parser.parse_args()
     args.func(args)

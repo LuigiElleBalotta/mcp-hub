@@ -227,11 +227,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(add_btn)
 
         import_btn = QPushButton("Import from Claude Code config")
-        apply_btn = QPushButton("Apply to Claude Code config")
+        apply_btn = QPushButton("Sync clients (Claude Code, Cursor, VS Code)")
         reload_btn = QPushButton("Reload config.json")
         settings_btn = QPushButton("Settings")
         import_btn.clicked.connect(self._import_from_claude)
-        apply_btn.clicked.connect(self._apply_to_claude)
+        apply_btn.clicked.connect(self._sync_clients)
         reload_btn.clicked.connect(self._reload_config)
         settings_btn.clicked.connect(self._open_settings)
         layout.addWidget(import_btn)
@@ -702,27 +702,11 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Import", f"Imported (disabled): {', '.join(imported) or '(none)'}")
         self.refresh()
 
-    def _apply_to_claude(self) -> None:
-        from pathlib import Path
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        path, _ = QFileDialog.getOpenFileName(self, "Select .claude.json", filter="*.json")
-        if not path:
-            return
-        from mcp_hub.config import load_config
-        from mcp_hub.claude_config import apply_servers
-        config = load_config()
-        # Services are not MCP servers: `apply` never touches them.
-        enabled_names = [n for n, s in config.servers.items() if s.enabled and not s.is_service]
-        confirm = QMessageBox.question(
-            self, "Apply",
-            f"This will back up {path} and rewrite these servers to point at the hub:\n"
-            + "\n".join(enabled_names)
-            + "\n\nContinue?",
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        migrated = apply_servers(Path(path), config)
-        QMessageBox.information(self, "Apply", f"Migrated: {', '.join(migrated) or '(none)'}")
+    def _sync_clients(self) -> None:
+        """Writes the hub's endpoints into the clients' config files, with a diff
+        preview, a backup and a restore (see client_sync_dialog)."""
+        from mcp_hub.gui.client_sync_dialog import ClientSyncDialog
+        ClientSyncDialog(parent=self).exec()
 
     def _reload_config(self) -> None:
         """Picks up config.json changes the running hub never saw happen --
