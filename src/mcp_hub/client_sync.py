@@ -186,7 +186,9 @@ def plan_sync(adapter: ClientAdapter, path: Path, hub_config: Config, names: lis
     hub = hub_config.hub
     plan = Plan(adapter, path, path.exists())
     if plan.exists:
-        plan.before = path.read_text(encoding="utf-8")
+        # bytes, not read_text: text mode folds CRLF into LF, and the write would then
+        # turn every LF file into CRLF on Windows (every line of the diff would differ)
+        plan.before = path.read_bytes().decode("utf-8")
     try:
         data = json.loads(plan.before) if plan.before.strip() else {}
     except ValueError as exc:
@@ -216,6 +218,8 @@ def plan_sync(adapter: ClientAdapter, path: Path, hub_config: Config, names: lis
         container[name] = new
     indent_text = json.dumps(data, indent=detect_indent(plan.before), ensure_ascii=False)
     plan.after = indent_text + ("\n" if plan.before.endswith("\n") else "")
+    if "\r\n" in plan.before:
+        plan.after = plan.after.replace("\n", "\r\n")  # the file's own line endings, kept
     if not (plan.added or plan.updated):
         plan.after = plan.before  # nothing to write: keep the file byte for byte
     return plan
@@ -225,8 +229,8 @@ def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     try:
-        tmp.write_text(text, encoding="utf-8")
-        json.loads(tmp.read_text(encoding="utf-8"))  # never replace a good file with a bad one
+        tmp.write_bytes(text.encode("utf-8"))  # bytes: no newline translation on Windows
+        json.loads(tmp.read_bytes().decode("utf-8"))  # never replace a good file with a bad one
     except Exception as exc:
         tmp.unlink(missing_ok=True)
         raise ValueError(f"refusing to update {path}: the staged file failed validation ({exc})") from exc
@@ -265,7 +269,7 @@ def rollback(path: Path) -> Path:
     if not available:
         raise FileNotFoundError(f"no backup of {path} to restore")
     chosen = available[0]
-    content = chosen.read_text(encoding="utf-8")
+    content = chosen.read_bytes().decode("utf-8")
     json.loads(content)  # a backup that is not valid JSON is not restored over a file
     if path.exists():
         backup_file(path)

@@ -248,7 +248,7 @@ def test_the_files_own_indentation_is_kept(tmp_path, indent):
     path = tmp_path / "mcp.json"
     original = json.dumps({"inputs": [{"id": "a"}], "servers": {"keep": {"command": "x", "args": ["1", "2"]}}},
                           indent=indent) + "\n"
-    path.write_text(original, encoding="utf-8")
+    path.write_bytes(original.encode("utf-8"))  # bytes: write_text would make it CRLF on Windows
     plan = plan_sync(ADAPTERS["vscode"], path, _cfg(), ["gitlab"])
     assert plan.after.startswith("{\n" + indent + '"inputs"') and plan.after.endswith("\n")
     assert json.loads(plan.after)["servers"]["keep"] == {"command": "x", "args": ["1", "2"]}
@@ -261,7 +261,28 @@ def test_a_tab_indented_file_yields_a_small_additive_diff(tmp_path):
     path = tmp_path / "mcp.json"
     big = {"inputs": [{"id": f"i{n}", "type": "promptString", "description": "d" * 40} for n in range(8)],
            "servers": {"a": {"type": "stdio", "command": "npx", "args": ["-y", "pkg"]}}}
-    path.write_text(json.dumps(big, indent="\t") + "\n", encoding="utf-8")
+    path.write_bytes((json.dumps(big, indent="\t") + "\n").encode("utf-8"))
     plan = plan_sync(ADAPTERS["vscode"], path, _cfg(), ["gitlab"])
     changed = [ln for ln in plan.diff().splitlines() if ln[:1] in "+-" and ln[:3] not in ("+++", "---")]
     assert len(changed) < 15, f"a one-server insertion touched {len(changed)} lines"
+
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n"])
+def test_the_files_own_line_endings_survive_a_write_and_a_rollback(tmp_path, eol):
+    """Found on a real ~/.claude.json: text-mode I/O turned an LF file into CRLF on
+    Windows, so every line of the file changed. Compare BYTES, not decoded text."""
+    path = tmp_path / "mcp.json"
+    original = eol.join([b"{", b'  "mcpServers": {', b'    "other": {"command": "x"}', b"  }", b"}"]) + eol
+    path.write_bytes(original)
+
+    backup = apply_plan(plan_sync(ADAPTERS["claude"], path, _cfg(), NAMES))
+    written = path.read_bytes()
+    assert backup.read_bytes() == original
+    if eol == b"\n":
+        assert b"\r" not in written, "an LF file must stay LF"
+    else:
+        assert written.count(b"\r\n") == written.count(b"\n"), "a CRLF file must stay CRLF, with no bare LF"
+    assert json.loads(written)["mcpServers"]["gitlab"]["url"].endswith("/sse")
+
+    rollback(path)
+    assert path.read_bytes() == original, "the restored file is byte for byte the backup"
