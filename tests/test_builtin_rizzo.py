@@ -20,7 +20,7 @@ def _config(**rizzo) -> Config:
 
 
 async def _client(manager):
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=build_app(manager)), base_url="http://test")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=build_app(manager)), base_url="http://127.0.0.1:37450")
 
 
 # ------------------------------------------------------------------ config

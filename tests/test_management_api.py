@@ -44,7 +44,7 @@ async def _client_for(manager: HubManager) -> httpx.AsyncClient:
 
 async def _client_for_app(app) -> httpx.AsyncClient:
     transport = httpx.ASGITransport(app=app)
-    return httpx.AsyncClient(transport=transport, base_url="http://test")
+    return httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:37450")
 
 
 @pytest.mark.asyncio

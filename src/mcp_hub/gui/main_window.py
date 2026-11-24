@@ -136,7 +136,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         import mcp_hub
         self.setWindowTitle(f"mcp-hub v{mcp_hub.__version__}")
-        self.client = client or HubApiClient()
+        self.client = client or HubApiClient.from_config()
 
         self.setMinimumSize(480, 320)
 

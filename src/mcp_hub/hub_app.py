@@ -8,11 +8,13 @@ from mcp.server.sse import SseServerTransport
 from mcp.shared.message import SessionMessage
 from mcp_types import jsonrpc_message_adapter
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.responses import Response
 from starlette.routing import Mount, Route
 
 from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
+from mcp_hub.security import HubSecurityMiddleware
 
 
 def _mount_for(name: str, manager: HubManager) -> Mount:
@@ -263,7 +265,10 @@ def build_app(manager: HubManager, shutdown_event: asyncio.Event | None = None) 
     # is what actually closes the gap for the two ways servers change
     # (GUI Add/Edit/Remove, and `HubManager.reload_from_disk` for a
     # hand-edited config.json -- see `manager.py`).
-    app = Starlette(routes=[])
+    app = Starlette(
+        routes=[],
+        middleware=[Middleware(HubSecurityMiddleware, hub=manager.config.hub)],
+    )
 
     def rebuild_routes() -> None:
         app.router.routes = _server_mounts(manager) + mgmt_routes
