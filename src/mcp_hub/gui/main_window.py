@@ -251,6 +251,10 @@ class MainWindow(QMainWindow):
         self.bottom_tabs = QTabWidget()
         self.bottom_tabs.addTab(self.detail_pane, "Dettaglio")
         self.bottom_tabs.addTab(self.log_panel, "Log")
+        from mcp_hub.gui.tools_panel import ToolsPanel
+        self.tools_panel = ToolsPanel(self.client)
+        self.bottom_tabs.addTab(self.tools_panel, "Tool")
+        self.bottom_tabs.currentChanged.connect(lambda _i: self._sync_tools_panel())
         layout.addWidget(self.bottom_tabs, 1)
 
         version_label = QLabel(f"mcp-hub v{mcp_hub.__version__}")
@@ -650,7 +654,17 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             dialog.apply()
 
+    def _sync_tools_panel(self) -> None:
+        """Points the Tool tab at the selected row. Its list is only FETCHED while the
+        tab is showing: reading it starts a lazy or idle server."""
+        name = self._selected_name()
+        row = self.table.currentRow()
+        is_service = row >= 0 and self.table.item(row, 1) is not None and self.table.item(row, 1).text() == "Service"
+        self.tools_panel.set_server(
+            name, load=self.bottom_tabs.currentWidget() is self.tools_panel, supported=not is_service)
+
     def _on_row_selected(self) -> None:
+        self._sync_tools_panel()
         row = self.table.currentRow()
         if row < 0:
             return

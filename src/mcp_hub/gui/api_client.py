@@ -6,6 +6,7 @@ import httpx
 
 
 _SLOW_TIMEOUT = 60.0
+_CALL_TIMEOUT = 130.0  # a tool may run long; the hub itself gives up on it after 120 s
 
 OLD_HUB_MESSAGE = (
     "L'hub in esecuzione e' una versione precedente e non gestisce Rizzo Flow. "
@@ -138,6 +139,30 @@ class HubApiClient:
         if resp.status_code != 200 or "json" not in resp.headers.get("content-type", ""):
             return None
         return resp.json()
+
+    def _json_or_raise(self, resp: httpx.Response) -> dict:
+        try:
+            body = resp.json()
+        except ValueError:
+            raise RuntimeError(OLD_HUB_MESSAGE) from None  # an older hub: plain-text 404
+        if resp.status_code != 200:
+            raise RuntimeError(body.get("error", f"HTTP {resp.status_code}") if isinstance(body, dict) else str(body))
+        return body
+
+    def tools(self, name: str) -> dict:
+        """The server's raw tools with filter state (starts a lazy/idle server)."""
+        return self._json_or_raise(self._client.get(f"/api/servers/{name}/tools", timeout=_SLOW_TIMEOUT))
+
+    def call_tool(self, name: str, tool: str, arguments: dict, confirm: bool = False) -> dict:
+        return self._json_or_raise(self._client.post(
+            f"/api/servers/{name}/call", json={"tool": tool, "arguments": arguments, "confirm": confirm},
+            timeout=_CALL_TIMEOUT))
+
+    def set_filters(self, name: str, allow: list[str], deny: list[str], prefix: str | None = None) -> dict:
+        body: dict = {"toolsAllow": allow, "toolsDeny": deny}
+        if prefix is not None:
+            body["toolPrefix"] = prefix
+        return self._json_or_raise(self._client.put(f"/api/servers/{name}/filters", json=body))
 
     def pid(self) -> int:
         return self._client.get("/api/pid").json()["pid"]
