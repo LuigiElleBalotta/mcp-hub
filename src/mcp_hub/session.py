@@ -28,7 +28,11 @@ def _is_key(value: Any) -> bool:
 class HubSession:
     """One connected client (one SSE connection)."""
 
-    deliver: Callable[[dict], Awaitable[None]]
+    # `deliver(obj, related_request_id=None)`: hand a JSON-RPC object to this
+    # client. `related_request_id` is the client's own id of the request the
+    # message belongs to; Streamable HTTP uses it to pick the right response
+    # stream (SSE ignores it).
+    deliver: Callable[..., Awaitable[None]]
     # client-chosen request id -> hub id, for requests currently in flight.
     inflight: dict[Any, str] = field(default_factory=dict)
 
@@ -45,7 +49,7 @@ class RequestTable:
         self._name = server_name
         self._tokens = itertools.count(1)
         self._requests: dict[str, _Entry] = {}  # insertion order: oldest first
-        self._progress: dict[str, tuple[HubSession, Any]] = {}
+        self._progress: dict[str, tuple[HubSession, Any, Any]] = {}
 
     def register(self, session: HubSession, client_id: Any, hub_id: str, progress_token: Any) -> str | None:
         """Records an in-flight request. Returns the hub progress token that
@@ -54,7 +58,7 @@ class RequestTable:
         hub_progress: str | None = None
         if _is_key(progress_token):
             hub_progress = f"hubp:{self._name}:{next(self._tokens)}"
-            self._progress[hub_progress] = (session, progress_token)
+            self._progress[hub_progress] = (session, progress_token, client_id)
         self._requests[hub_id] = _Entry(session, client_id, hub_progress)
         if _is_key(client_id):
             session.inflight[client_id] = hub_id
@@ -69,18 +73,19 @@ class RequestTable:
         if _is_key(entry.client_id) and entry.session.inflight.get(entry.client_id) == hub_id:
             del entry.session.inflight[entry.client_id]
 
-    def progress_owner(self, hub_token: Any) -> tuple[HubSession, Any] | None:
-        """(session, the client's original token) for a hub progress token, or
-        None when the request already finished (a late/stale notification)."""
+    def progress_owner(self, hub_token: Any) -> tuple[HubSession, Any, Any] | None:
+        """(session, the client's original token, the client's request id) for
+        a hub progress token, or None when the request already finished (a
+        late/stale notification)."""
         if not isinstance(hub_token, str):
             return None
         return self._progress.get(hub_token)
 
-    def oldest_session(self) -> HubSession | None:
-        """Session owning the oldest in-flight request: the one a
-        server-initiated request (roots/sampling) most plausibly belongs to."""
+    def oldest_request(self) -> tuple[HubSession, Any] | None:
+        """(session, client request id) of the oldest in-flight request: the one
+        a server-initiated request (roots/sampling) most plausibly belongs to."""
         for entry in self._requests.values():
-            return entry.session
+            return entry.session, entry.client_id
         return None
 
     def translate_cancel(self, session: HubSession, client_id: Any) -> str | None:

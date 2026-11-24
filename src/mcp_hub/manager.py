@@ -336,9 +336,12 @@ class ManagedServer:
         owner = self.table.progress_owner(params.get("progressToken"))
         if owner is None:
             return
-        session, original_token = owner
+        session, original_token, client_request_id = owner
         try:
-            await session.deliver({**obj, "params": {**params, "progressToken": original_token}})
+            await session.deliver(
+                {**obj, "params": {**params, "progressToken": original_token}},
+                related_request_id=client_request_id,
+            )
         except Exception:
             pass  # that session is mid-teardown; nobody else may see its progress
 
@@ -353,10 +356,11 @@ class ManagedServer:
         if obj.get("method") == "ping":
             await self._write_to_upstream({"jsonrpc": "2.0", "id": req_id, "result": {}})
             return
-        session = self.table.oldest_session()
-        if session is not None:
+        oldest = self.table.oldest_request()
+        if oldest is not None:
+            session, client_request_id = oldest
             try:
-                await session.deliver(obj)
+                await session.deliver(obj, related_request_id=client_request_id)
                 return
             except Exception:
                 pass  # fall through: refuse it rather than leave the server waiting

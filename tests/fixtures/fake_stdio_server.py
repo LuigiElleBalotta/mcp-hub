@@ -34,6 +34,12 @@ Supported methods:
   - "ping": counted and answered {} -- unless env FAKE_IGNORE_PING is set, in
     which case it is swallowed (an alive-but-hung server).
   - "test/ping_count" -> {"pings": n}.
+  - "tools/list", "prompts/list", "resources/list", "resources/templates/list":
+    counted per method; tools are named "t<version>" and the version bumps on
+    "test/emit_list_changed". With env FAKE_PAGINATE the first page (no cursor)
+    carries nextCursor "p2" and a cursor request returns page 2.
+  - "test/list_calls" -> {"calls": {method: n}}; "test/emit_list_changed" ->
+    emits notifications/tools/list_changed (bumping the version), then answers {}.
   - "test/handshake_stats" -> {"initializes": n, "initializeds": m,
     "protocolVersion": <version the initialize asked for>}.
 """
@@ -43,9 +49,14 @@ import sys
 import threading
 import time
 
+_LIST_KEYS = {
+    "tools/list": "tools", "prompts/list": "prompts",
+    "resources/list": "resources", "resources/templates/list": "resourceTemplates",
+}
 _out_lock = threading.Lock()
 _state = {"last_cancel": None, "last_srv_reply": None, "initializes": 0, "initializeds": 0,
-          "protocolVersion": None, "pings": 0}
+          "protocolVersion": None, "pings": 0,
+          "list_calls": {}, "list_version": 0}
 
 
 def _write(obj: dict) -> None:
@@ -113,6 +124,26 @@ def _dispatch(req: dict) -> None:
         return
     if method == "test/ping_count":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {"pings": _state["pings"]}})
+        return
+    if method in _LIST_KEYS:
+        _state["list_calls"][method] = _state["list_calls"].get(method, 0) + 1
+        key = _LIST_KEYS[method]
+        if method == "tools/list":
+            items = [{"name": f"t{_state['list_version']}", "inputSchema": {"type": "object"}}]
+        else:
+            items = []
+        result = {key: items}
+        if os.environ.get("FAKE_PAGINATE") and not params.get("cursor"):
+            result["nextCursor"] = "p2"
+        _write({"jsonrpc": "2.0", "id": req_id, "result": result})
+        return
+    if method == "test/list_calls":
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"calls": _state["list_calls"]}})
+        return
+    if method == "test/emit_list_changed":
+        _state["list_version"] += 1
+        _write({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {}})
         return
     if method == "test/handshake_stats":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {

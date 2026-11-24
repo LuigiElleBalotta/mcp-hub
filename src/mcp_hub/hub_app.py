@@ -5,7 +5,7 @@ import json
 import time
 
 from mcp.server.sse import SseServerTransport
-from mcp.shared.message import SessionMessage
+from mcp.shared.message import ServerMessageMetadata, SessionMessage
 from mcp_types import jsonrpc_message_adapter
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -89,9 +89,15 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
     """
     import anyio
 
-    async def deliver(obj: dict) -> None:
+    async def deliver(obj: dict, related_request_id=None) -> None:
         message = jsonrpc_message_adapter.validate_python(obj)
-        await write.send(SessionMessage(message))
+        metadata = None
+        if related_request_id is not None:
+            # Streamable HTTP puts a server message on the response stream of
+            # the request it belongs to; without this it would land on the
+            # standalone GET stream. The SSE transport ignores the metadata.
+            metadata = ServerMessageMetadata(related_request_id=related_request_id)
+        await write.send(SessionMessage(message, metadata=metadata))
 
     session = HubSession(deliver)
 

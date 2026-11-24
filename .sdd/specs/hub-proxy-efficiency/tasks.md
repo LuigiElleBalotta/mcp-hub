@@ -2,8 +2,12 @@
 
 ## Tasks
 
-- [ ] 1. Spike: feed the SDK `StreamableHTTPServerTransport` to a transport-independent pump; confirm Claude Code connects with `type: http` and a bearer header. Record the result here; choose SDK transport or hand-written handler.
-- [ ] 2. Refactor `_proxy` into `SessionPump` + SSE transport with no behaviour change (existing tests stay green)
+- [x] 1. Spike: feed the SDK `StreamableHTTPServerTransport` to a transport-independent pump; confirm Claude Code connects with `type: http` and a bearer header. Record the result here; choose SDK transport or hand-written handler.
+  - Result (read from mcp 2.2.0 source, not yet run): `StreamableHTTPServerTransport.connect()` yields the same `(read, write)` `SessionMessage` streams as `connect_sse`, so `_proxy` runs on it unchanged. The SDK's `StreamableHTTPSessionManager` requires an `mcp.server.Server` to drive, which the hub does not have, so the hub gets its own small session registry that mirrors `_handle_stateful_request` (new session on a request without `Mcp-Session-Id`, route by id, 404 on unknown, discard on DELETE/idle). Decision: use the SDK transport + own registry, no hand-written protocol code.
+  - A server message needs `ServerMessageMetadata(related_request_id=...)` to land on the right POST response stream instead of the standalone GET stream (done in task 2).
+  - Observation: `apply` today writes `type: "http"` with the `/sse` URL, which works only because Claude Code evidently falls back; once `/mcp` exists the matching pair is `http` + `/mcp` (task 6). Whether Claude Code accepts the bearer header on `http` is checked in task 10 with a real run.
+- [x] 2. Refactor `_proxy` into `SessionPump` + SSE transport with no behaviour change (existing tests stay green)
+  - No structural refactor needed: `_proxy(read, write, managed)` already only sees SDK streams, so it IS the transport-independent pump. What was missing: `deliver(obj, related_request_id)` (progress and server requests carry the client's request id so Streamable HTTP can route them); `RequestTable` now returns the client id with a progress owner and `oldest_request()`.
 - [ ] 3. List cache (memory) with invalidation, then disk cache
 - [ ] 4. Lazy start, `ensure_running`, idle watcher, `persistent`, `idle` status
 - [ ] 5. Session modes: `isolated` pool and `session-aware` `_meta` injection
