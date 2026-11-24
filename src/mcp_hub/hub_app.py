@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 
@@ -17,21 +18,39 @@ from mcp_hub.management_api import management_routes
 from mcp_hub.manager import HubManager, ManagedServer
 from mcp_hub.security import HubSecurityMiddleware
 from mcp_hub.session import SESSION_META_KEY, HubSession
+from mcp_hub.streamable import StreamableSessions
 
 
 # JSON-RPC "server error" range (-32000..-32099): the managed server is down.
 SERVER_UNAVAILABLE_CODE = -32000
 
 
-def _mount_for(name: str, manager: HubManager) -> Mount:
-    managed = manager.get(name)
-    # Endpoint is relative to THIS mount's root_path (Starlette sets it from
-    # the outer Mount(f"/{name}", ...) below) — do NOT repeat the server name
-    # here. Confirmed in Task 2's spike (scripts/spike_multi_mount.py):
-    # f"/{name}/messages" doubles the prefix into "/{name}/{name}/messages"
-    # and breaks every client POST. Trailing slash matches Mount("/messages/", ...)
-    # below and avoids an extra 307 redirect.
-    transport = SseServerTransport("/messages/")
+class _Endpoints:
+    """The long-lived transports of one managed server.
+
+    They hold the connected sessions (an SSE session is registered in its
+    `SseServerTransport`, a Streamable one in `StreamableSessions`), so they must
+    outlive route rebuilds: `build_app` keeps one per server and only replaces it
+    when the server entry itself is replaced. Rebuilding them on every config
+    change used to leave every already-connected client without a session (its
+    next POST hit a transport that had never heard of it) and hung it forever.
+    """
+
+    def __init__(self, managed: ManagedServer) -> None:
+        self.managed = managed
+        # Endpoint is relative to THIS mount's root_path (Starlette sets it from
+        # the outer Mount(f"/{name}", ...)) — do NOT repeat the server name
+        # here. Confirmed in Task 2's spike (scripts/spike_multi_mount.py):
+        # f"/{name}/messages" doubles the prefix into "/{name}/{name}/messages"
+        # and breaks every client POST. Trailing slash matches Mount("/messages/", ...)
+        # and avoids an extra 307 redirect.
+        self.sse = SseServerTransport("/messages/")
+        self.streamable = StreamableSessions(managed)
+
+
+def _mount_for(name: str, endpoints: _Endpoints) -> Mount:
+    managed = endpoints.managed
+    transport = endpoints.sse
 
     async def handle_sse(request):
         # No `process` assertion: a lazy or idle server has none until a request
@@ -55,6 +74,8 @@ def _mount_for(name: str, manager: HubManager) -> Mount:
     return Mount(f"/{name}", routes=[
         Route("/sse", endpoint=handle_sse, methods=["GET"]),
         Mount("/messages/", app=transport.handle_post_message),
+        # Streamable HTTP, the transport that replaces SSE in the MCP spec.
+        Route("/mcp", endpoint=endpoints.streamable, methods=["GET", "POST", "DELETE"]),
     ])
 
 
@@ -374,8 +395,31 @@ async def _proxy(read, write, managed: ManagedServer) -> None:
         managed.subscribers.discard(deliver)
 
 
-def _server_mounts(manager: HubManager) -> list[Mount]:
-    return [_mount_for(name, manager) for name, sc in manager.config.servers.items() if sc.enabled and not sc.is_service]
+def _shutdown_later(endpoints: "_Endpoints") -> None:
+    """Ends a replaced/removed server's Streamable sessions in the background
+    (route rebuilds are synchronous). Without a running loop nothing can be
+    connected, so there is nothing to end."""
+    try:
+        asyncio.get_running_loop().create_task(endpoints.streamable.shutdown())
+    except RuntimeError:
+        pass
+
+
+def _server_mounts(manager: HubManager, registry: dict[str, _Endpoints]) -> list[Mount]:
+    mounts: list[Mount] = []
+    for name, sc in manager.config.servers.items():
+        if not sc.enabled or sc.is_service:
+            continue
+        managed = manager.get(name)
+        endpoints = registry.get(name)
+        if endpoints is None or endpoints.managed is not managed:
+            if endpoints is not None:  # the entry was replaced: its sessions are gone with it
+                _shutdown_later(endpoints)
+            endpoints = registry[name] = _Endpoints(managed)
+        mounts.append(_mount_for(name, endpoints))
+    for name in [n for n in registry if n not in {m.path[1:] for m in mounts}]:
+        _shutdown_later(registry.pop(name))
+    return mounts
 
 
 def build_app(manager: HubManager, shutdown_event: asyncio.Event | None = None) -> Starlette:
@@ -393,14 +437,24 @@ def build_app(manager: HubManager, shutdown_event: asyncio.Event | None = None) 
     # is what actually closes the gap for the two ways servers change
     # (GUI Add/Edit/Remove, and `HubManager.reload_from_disk` for a
     # hand-edited config.json -- see `manager.py`).
+    registry: dict[str, _Endpoints] = {}
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        yield
+        # Hub stopping: end every Streamable session (their pump tasks).
+        await asyncio.gather(*(e.streamable.shutdown() for e in registry.values()), return_exceptions=True)
+
     app = Starlette(
         routes=[],
         middleware=[Middleware(HubSecurityMiddleware, hub=manager.config.hub)],
+        lifespan=lifespan,
     )
 
     def rebuild_routes() -> None:
-        app.router.routes = _server_mounts(manager) + mgmt_routes
+        app.router.routes = _server_mounts(manager, registry) + mgmt_routes
 
+    app.state.endpoints = registry  # name -> _Endpoints (diagnostics, tests)
     mgmt_routes = management_routes(manager, shutdown_event, on_change=rebuild_routes)
     rebuild_routes()  # populates the initial route list (see docstring above)
     return app

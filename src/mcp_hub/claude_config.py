@@ -64,9 +64,13 @@ def apply_servers(
             continue  # services are not MCP servers: nothing to point Claude Code at
         if only is not None and name not in only:
             continue
+        # "sse" keeps what apply always wrote (type "http" + the /sse URL, which clients
+        # reach through the spec's fallback to the legacy SSE transport); "http" writes
+        # the Streamable HTTP endpoint those clients actually speak.
+        path = "mcp" if hub_config.hub.preferredTransport == "http" else "sse"
         remote_entry = {
             "type": "http",
-            "url": f"http://{hub_config.hub.host}:{hub_config.hub.port}/{name}/sse",
+            "url": f"http://{hub_config.hub.host}:{hub_config.hub.port}/{name}/{path}",
         }
         if hub_config.hub.authToken:
             remote_entry["headers"] = {"Authorization": f"Bearer {hub_config.hub.authToken}"}

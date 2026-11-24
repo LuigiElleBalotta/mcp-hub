@@ -132,6 +132,9 @@ class HubConfig:
     # (see security.py). Empty = defaults only; omitted from config.json then.
     allowedHosts: list[str] = field(default_factory=list)
     allowedOrigins: list[str] = field(default_factory=list)
+    # Which endpoint `apply` writes into client configs: "sse" (`/<name>/sse`, what it always
+    # wrote) or "http" (Streamable HTTP, `/<name>/mcp`, the transport that replaces SSE).
+    preferredTransport: Literal["sse", "http"] = "sse"
 
 
 _HUB_OPTIONAL_LISTS = ("allowedHosts", "allowedOrigins")
@@ -145,6 +148,8 @@ def hub_to_dict(hub: HubConfig) -> dict:
     for key in _HUB_OPTIONAL_LISTS:
         if not data[key]:
             del data[key]
+    if data["preferredTransport"] == "sse":
+        del data["preferredTransport"]  # the default: keep the file as it was
     return data
 
 
@@ -239,6 +244,8 @@ def load_config(path: Path | None = None) -> Config:
     raw = json.loads(path.read_text(encoding="utf-8"))
     hub_known = set(HubConfig.__dataclass_fields__)
     hub = HubConfig(**{k: v for k, v in raw.get("hub", {}).items() if k in hub_known})
+    if hub.preferredTransport not in ("sse", "http"):
+        hub.preferredTransport = "sse"  # a typo must not make `apply` write a dead URL
     servers = {name: ServerConfig(**sc) for name, sc in raw.get("servers", {}).items()}
     known = set(RizzoSettings.__dataclass_fields__)
     rizzo = RizzoSettings(**{k: v for k, v in raw.get("rizzo", {}).items() if k in known})

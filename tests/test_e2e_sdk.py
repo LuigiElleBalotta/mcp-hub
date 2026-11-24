@@ -24,50 +24,7 @@ from mcp_hub.config import Config, HubConfig, ServerConfig
 from mcp_hub.hub_app import build_app
 from mcp_hub.manager import HubManager
 
-REAL_SERVER = str(Path(__file__).parent / "fixtures" / "real_mcp_server.py")
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@asynccontextmanager
-async def running_hub(hub: HubConfig | None = None, **server_kw):
-    # sse-starlette keeps a PROCESS-global "the server is shutting down" flag
-    # that it sets when any uvicorn server stops and never clears. One hub per
-    # process (production) never notices; several hubs in one test process
-    # would see every later SSE stream end at once.
-    from sse_starlette.sse import AppStatus
-
-    AppStatus.should_exit = False
-    port = _free_port()
-    hub = hub or HubConfig()
-    hub.port = port
-    server_kw.setdefault("concurrency", "parallel")
-    cfg = ServerConfig(enabled=True, command=sys.executable, args=[REAL_SERVER], env={}, **server_kw)
-    manager = HubManager(Config(hub=hub, servers={"real": cfg}))
-    await manager.start_all()
-    http = uvicorn.Server(uvicorn.Config(build_app(manager), host="127.0.0.1", port=port, log_level="warning",
-                                            timeout_graceful_shutdown=3))
-    task = asyncio.create_task(http.serve())
-    while not http.started:
-        await asyncio.sleep(0.02)
-    try:
-        yield manager, f"http://127.0.0.1:{port}"
-    finally:
-        http.should_exit = True
-        await task
-        await manager.stop_all()
-
-
-@asynccontextmanager
-async def client(base: str, headers: dict | None = None):
-    async with sse_client(f"{base}/real/sse", headers=headers) as streams:
-        async with ClientSession(*streams[:2]) as session:
-            await session.initialize()
-            yield session
+from hub_harness import client, running_hub  # noqa: E402
 
 
 def _text(result) -> str:
@@ -171,3 +128,18 @@ async def test_isolated_mode_gives_each_real_client_its_own_upstream_and_cleans_
             await asyncio.sleep(0.05)
         assert server.children == set()
         assert all(p.returncode is not None for p in procs)
+
+
+@pytest.mark.asyncio
+async def test_connected_sessions_survive_a_config_change_to_another_server():
+    """Adding/changing ANOTHER server rebuilds the hub's routes. An already
+    connected client must keep working: its session lives in the server's SSE
+    transport, which a rebuild must not replace."""
+    async with running_hub() as (manager, base):
+        async with client(base) as session:
+            assert _text(await session.call_tool("add", {"a": 1, "b": 1})) == "2"
+            async with httpx.AsyncClient() as http:
+                r = await http.post(f"{base}/api/servers/other",
+                                    json={"enabled": False, "command": "x", "args": []})
+                assert r.status_code == 200
+            assert _text(await session.call_tool("add", {"a": 2, "b": 2})) == "4"

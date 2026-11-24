@@ -15,7 +15,10 @@
   - Fixed on the way: `handle_sse`/`handle_message` asserted a process exists; `_spawn` now stops the previous process's stdout reader and rejects its pending requests first, so a late EOF cannot reject the new process's requests.
 - [x] 5. Session modes: `isolated` pool and `session-aware` `_meta` injection
   - `concurrency` accepts exclusive | parallel | session-aware | isolated (validated on load via API and in the GUI later). session-aware injects `params._meta["io.github.mcp-hub/sessionId"]` into every forwarded request, merged with the client's own `_meta` and the remapped progress token. isolated: the server entry has no process; `ManagedServer.session_upstream()` creates a private lazy child per SSE connection and `release_session_upstream()` stops it on disconnect; children share no cache, handshake or request ids, their logs show on the parent, status shows `running`/`idle` with a `sessions` count. `ManagedServer` is now `eq=False` (identity hash). Proven end to end with two real SDK clients.
-- [ ] 6. Streamable HTTP endpoint and `preferredTransport` in `apply`
+- [x] 6. Streamable HTTP endpoint and `preferredTransport` in `apply`
+  - `streamable.py`: `StreamableSessions` (own registry around the SDK `StreamableHTTPServerTransport`, pump = `_proxy`), mounted at `/<name>/mcp`; unknown/expired session id -> 404 so the client re-initialises; sessions in memory, idle timeout 30 min, ended when the server entry is replaced or the hub stops. Proven with the real SDK client: tools, two clients with separate progress, SSE + Streamable on one upstream, token/Origin, crash recovery on the same session, isolated mode cleanup.
+  - Fixed on the way (pre-existing bug): `build_app` rebuilt every server's `SseServerTransport` on each route rebuild, so ANY upsert/remove/reload of one server left every connected SSE client of every other server without a session and hung it (reproduced first: the new regression test timed out). Transports now live in a per-server registry that survives rebuilds.
+  - `apply`: `hub.preferredTransport` "sse" (default, writes exactly what it always wrote) or "http" (`/mcp`). Not yet verified: Claude Code against `/mcp` with a bearer header (task 10).
 - [ ] 7. Graceful drain, shutdown/self-update integration
 - [ ] 8. Tool filters and prefix
 - [ ] 9. GUI: server dialog and settings dialog fields, `idle` status
