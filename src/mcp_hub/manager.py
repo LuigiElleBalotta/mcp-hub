@@ -203,6 +203,65 @@ class ManagedServer:
             **self.metrics.summary(),
         }
 
+    async def fetch_tools(self) -> tuple[list[dict], str]:
+        """The upstream's RAW tool list (every page), from the shared list cache
+        when it has it, else asked live through the hub's own channel (and cached).
+        Returns (tools, "cache" | "live"). An isolated server has no shared
+        process to ask: its tools exist per session."""
+        if self.is_isolated:
+            raise ValueError("isolated server: its tools exist per session, there is no shared process to ask")
+        cached = self.cache.get("tools/list")
+        if cached is not None:
+            return list(cached.get("tools", [])), "cache"
+        await self.ensure_running()
+        await self.ensure_ready()
+        generation = self.cache.generation("tools/list")
+        tools: list[dict] = []
+        cursor = None
+        for _ in range(50):  # a hard stop against a server that never ends its pages
+            response = await self.hub_request("tools/list", {"cursor": cursor} if cursor else {}, timeout=30.0)
+            if "result" not in response:
+                message = (response.get("error") or {}).get("message", "unknown error")
+                raise ConnectionError(f"managed server {self.name!r} refused tools/list: {message}")
+            result = response["result"]
+            tools.extend(result.get("tools", []))
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        if self.cache.put("tools/list", {"tools": tools}, generation):
+            self.persist_cache()
+        return tools, "live"
+
+    async def notify_tools_changed(self) -> None:
+        """Tells every connected client its tool list changed (a filter was edited),
+        so it asks again instead of keeping the old one."""
+        for subscriber in list(self.subscribers):
+            try:
+                await subscriber({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            except Exception:
+                pass  # a session mid-teardown
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 120.0) -> dict:
+        """Calls one tool on behalf of the hub itself (the GUI's tester): behind
+        the server's concurrency guard like any client request, and counted in
+        its metrics. Returns the JSON-RPC response object (`result` or `error`)."""
+        await self.ensure_running()
+        await self.ensure_ready()
+        started = time.monotonic()
+
+        async def ask() -> dict:
+            return await self.hub_request("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
+
+        try:
+            response = await self.guard.run(ask)
+        except (ConnectionError, asyncio.TimeoutError) as exc:
+            self.record_call(f"tools/call {name}"[:80], time.monotonic() - started, False, error=str(exc) or "timeout")
+            raise
+        failed = "error" in response
+        self.record_call(f"tools/call {name}"[:80], time.monotonic() - started, not failed,
+                         error=(response.get("error") or {}).get("message") if failed else None)
+        return response
+
     def touch(self) -> None:
         """Records client activity for the idle watcher."""
         self._last_activity = time.monotonic()

@@ -38,7 +38,8 @@ Supported methods:
     counted per method; tools are named "t<version>" and the version bumps on
     "test/emit_list_changed". With env FAKE_PAGINATE the first page (no cursor)
     carries nextCursor "p2" and a cursor request returns page 2.
-  - env FAKE_TOOLS="a,b,c": tools/list returns those tool names instead of "t<version>".
+  - env FAKE_TOOLS="a,b,c": tools/list returns those tool names instead of "t<version>";
+    env FAKE_READONLY="a,b" marks those with annotations.readOnlyHint = true.
   - "tools/call": records the tool name and answers {"called": <name>};
     "test/tool_calls" -> {"names": [every tool name called so far]}.
   - "test/list_calls" -> {"calls": {method: n}}; "test/emit_list_changed" ->
@@ -135,7 +136,9 @@ def _dispatch(req: dict) -> None:
         key = _LIST_KEYS[method]
         if method == "tools/list":
             names = [n for n in os.environ.get("FAKE_TOOLS", "").split(",") if n] or [f"t{_state['list_version']}"]
-            items = [{"name": n, "description": f"tool {n}", "inputSchema": {"type": "object"}} for n in names]
+            readonly = {n for n in os.environ.get("FAKE_READONLY", "").split(",") if n}
+            items = [{"name": n, "description": f"tool {n}", "inputSchema": {"type": "object"},
+                      **({"annotations": {"readOnlyHint": True}} if n in readonly else {})} for n in names]
         else:
             items = []
         result = {key: items}
@@ -151,7 +154,8 @@ def _dispatch(req: dict) -> None:
         return
     if method == "tools/call":
         _state["tool_calls"].append(params.get("name"))
-        _write({"jsonrpc": "2.0", "id": req_id, "result": {"called": params.get("name")}})
+        _write({"jsonrpc": "2.0", "id": req_id, "result": {"called": params.get("name"),
+                                                           "arguments": params.get("arguments")}})
         return
     if method == "test/tool_calls":
         _write({"jsonrpc": "2.0", "id": req_id, "result": {"names": list(_state["tool_calls"])}})

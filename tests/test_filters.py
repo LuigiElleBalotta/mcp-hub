@@ -119,7 +119,7 @@ async def test_without_filters_nothing_changes():
     c = Conn(server)
     try:
         assert _names(await c.call(1, "tools/list")) == ["read_a", "read_secret", "write_b"]
-        assert (await c.call(2, "tools/call", {"name": "write_b"}))["result"] == {"called": "write_b"}
+        assert (await c.call(2, "tools/call", {"name": "write_b"}))["result"]["called"] == "write_b"
         await c.close()
     finally:
         await server.stop()
@@ -138,7 +138,7 @@ async def test_allow_deny_and_prefix_shape_the_list_and_calls():
         assert [t["name"] for t in server.cache.get("tools/list")["tools"]] == ["read_a", "read_secret", "write_b"]
 
         ok = await c.call(3, "tools/call", {"name": "gl_read_a", "arguments": {}})
-        assert ok["result"] == {"called": "read_a"}, "the upstream sees its own, unprefixed name"
+        assert ok["result"]["called"] == "read_a", "the upstream sees its own, unprefixed name"
         for rid, name in ((4, "gl_write_b"), (5, "gl_read_secret"), (6, "read_a"), (7, "nope")):
             bad = await c.call(rid, "tools/call", {"name": name})
             assert bad["error"]["code"] == -32602 and name in bad["error"]["message"], name
@@ -169,7 +169,7 @@ async def test_prefix_only_and_deny_only():
     c = Conn(server)
     try:
         assert _names(await c.call(1, "tools/list")) == ["x.read_a", "x.read_secret", "x.write_b"]
-        assert (await c.call(2, "tools/call", {"name": "x.write_b"}))["result"] == {"called": "write_b"}
+        assert (await c.call(2, "tools/call", {"name": "x.write_b"}))["result"]["called"] == "write_b"
         await c.close()
     finally:
         await server.stop()
