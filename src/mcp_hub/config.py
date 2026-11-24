@@ -43,6 +43,12 @@ class ServerConfig:
     healthTimeout: float = 120.0
     # With `enabled`, start the service when the hub starts (default: manual).
     autostart: bool = False
+    # MCP servers only (hub-proxy-hardening R5): what to do when the process
+    # exits without the hub asking it to. At most `restartMaxAttempts`
+    # restarts inside `restartWindow` seconds, then it stays `crashed`.
+    restart: Literal["never", "on-failure"] = "on-failure"
+    restartMaxAttempts: int = 5
+    restartWindow: float = 300.0
 
     @property
     def is_service(self) -> bool:
@@ -68,6 +74,9 @@ class ServerConfig:
 
 
 _SERVICE_ONLY_FIELDS = ("cwd", "healthUrl", "port", "healthTimeout", "autostart")
+# MCP-only fields and their defaults: omitted from config.json while default,
+# so an untouched entry keeps its original on-disk shape.
+_MCP_ONLY_DEFAULTS = {"restart": "on-failure", "restartMaxAttempts": 5, "restartWindow": 300.0}
 
 
 def server_to_dict(sc: ServerConfig) -> dict:
@@ -77,6 +86,12 @@ def server_to_dict(sc: ServerConfig) -> dict:
     if not sc.is_service:
         data.pop("type")
         for key in _SERVICE_ONLY_FIELDS:
+            data.pop(key, None)
+        for key, default in _MCP_ONLY_DEFAULTS.items():
+            if data.get(key) == default:
+                data.pop(key, None)
+    else:
+        for key in _MCP_ONLY_DEFAULTS:
             data.pop(key, None)
     return data
 

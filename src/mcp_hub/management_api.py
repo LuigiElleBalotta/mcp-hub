@@ -129,6 +129,14 @@ def management_routes(
             return JSONResponse({"error": "type must be 'mcp' or 'service'"}, status_code=400)
         if server_config.is_service and not server_config.command:
             return JSONResponse({"error": "a service needs a command"}, status_code=400)
+        if server_config.restart not in ("never", "on-failure"):
+            return JSONResponse({"error": "restart must be 'never' or 'on-failure'"}, status_code=400)
+        attempts = server_config.restartMaxAttempts
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+            return JSONResponse({"error": "restartMaxAttempts must be an integer >= 1"}, status_code=400)
+        window = server_config.restartWindow
+        if not isinstance(window, (int, float)) or isinstance(window, bool) or window <= 0:
+            return JSONResponse({"error": "restartWindow must be a number > 0"}, status_code=400)
         # HubManager.upsert stops any previously-running process for `name`
         # itself before replacing the entry (round-2 review fix), so the
         # freshly-returned `managed` here is a brand-new ManagedServer with

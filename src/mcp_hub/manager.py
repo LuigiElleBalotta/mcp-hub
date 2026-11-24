@@ -5,9 +5,11 @@ import collections
 import itertools
 import json
 import os
+import random
 import re
 import shutil
 import socket
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
@@ -23,7 +25,7 @@ from mcp_hub.session import RequestTable
 _KV_SECRET_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<val>\S+)")
 _SECRET_KEY_RE = re.compile(r"TOKEN|SECRET|PASS|KEY|AUTH", re.IGNORECASE)
 
-Status = Literal["stopped", "starting", "running", "crashed"]
+Status = Literal["stopped", "starting", "running", "restarting", "crashed"]
 
 # Default asyncio.StreamReader line-length limit is 64 KiB (65536), which
 # raises ValueError out of readline()/`async for` iteration on any single
@@ -36,6 +38,12 @@ _STDOUT_LIMIT = 10 * 1024 * 1024
 # How long the hub waits for an upstream's answer to its own `initialize`.
 # Generous on purpose: `npx`/`uvx` servers may download packages on first run.
 HANDSHAKE_TIMEOUT = 120.0
+
+# Automatic restart backoff (hub-proxy-hardening R5): the n-th consecutive
+# attempt waits BASE * 2**n seconds, capped, with +/-20% jitter so several
+# servers that died together do not all respawn in the same instant.
+RESTART_BASE_DELAY = 1.0
+RESTART_MAX_DELAY = 60.0
 
 
 def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -103,6 +111,12 @@ class ManagedServer:
     _ready_process: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
     _handshake_task: asyncio.Task | None = field(default=None, init=False, repr=False)
     _handshake_for: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
+    # Auto-restart supervision (see `_schedule_restart`): monotonic times of
+    # the restarts inside the current window, the pending backoff task, and
+    # the running total shown by the status snapshot.
+    _restart_times: collections.deque = field(default_factory=collections.deque, init=False, repr=False)
+    _restart_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    restart_count: int = field(default=0, init=False)
 
     def __post_init__(self):
         self.guard = ConcurrencyGuard(self.config.concurrency)
@@ -366,7 +380,15 @@ class ManagedServer:
         if self.config.is_service:
             await self._start_service()
             return
+        # A manual start overrides any pending automatic restart and re-arms
+        # the circuit breaker (the operator is deliberately trying again).
+        self._cancel_restart()
+        self._restart_times.clear()
         self._stopping = False
+        await self._spawn()
+
+    async def _spawn(self) -> None:
+        """Spawns the MCP subprocess: a manual start or an automatic restart."""
         self.initialize_result = None
         self._ready_process = None
         self.status = "starting"
@@ -396,25 +418,78 @@ class ManagedServer:
         # back to the original string if not found, so a genuinely bad
         # command still fails the same way it did before.
         resolved_command = shutil.which(self.config.command) or self.config.command
-        self.process = await asyncio.create_subprocess_exec(
-            resolved_command, *self.config.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            limit=_STDOUT_LIMIT,
-        )
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                resolved_command, *self.config.args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                limit=_STDOUT_LIMIT,
+            )
+        except OSError as exc:
+            self.status = "crashed"
+            self.append_log(f"[hub] failed to start {self.name}: {exc}")
+            raise
         self.status = "running"
-        asyncio.create_task(self._watch())
+        asyncio.create_task(self._watch(self.process))
 
-    async def _watch(self) -> None:
-        assert self.process is not None
-        if self.process.stderr is not None:
-            async for raw in self.process.stderr:
+    async def _watch(self, process: asyncio.subprocess.Process) -> None:
+        if process.stderr is not None:
+            async for raw in process.stderr:
                 self.append_log(raw.decode(errors="replace").rstrip())
-        code = await self.process.wait()
-        if self.status != "stopped" and not self._stopping:
+        code = await process.wait()
+        if process is not self.process or self._stopping:
+            return  # superseded by a newer spawn, or a deliberate stop
+        self.append_log(f"[hub] {self.name} exited with code {code}")
+        if self.config.restart == "on-failure":
+            self._schedule_restart()
+        elif self.status != "stopped":
             self.status = "crashed" if code != 0 else "stopped"
+
+    def _restart_delay(self, attempt: int) -> float:
+        """Backoff before the `attempt`-th (0-based) restart in the window."""
+        return min(RESTART_MAX_DELAY, RESTART_BASE_DELAY * (2 ** attempt)) * random.uniform(0.8, 1.2)
+
+    def _schedule_restart(self) -> None:
+        """An upstream exited without being asked to: respawn it after a
+        backoff, unless it has already been restarted `restartMaxAttempts`
+        times inside `restartWindow` (circuit open: stays `crashed` until a
+        manual start). Attempts older than the window are forgotten, so a
+        server that then ran stably gets a fresh budget."""
+        now = time.monotonic()
+        while self._restart_times and now - self._restart_times[0] > self.config.restartWindow:
+            self._restart_times.popleft()
+        max_attempts = self.config.restartMaxAttempts
+        if len(self._restart_times) >= max_attempts:
+            self.status = "crashed"
+            self.append_log(
+                f"[hub] {self.name} keeps failing ({max_attempts} restarts in "
+                f"{self.config.restartWindow:g}s): giving up until started manually"
+            )
+            return
+        attempt = len(self._restart_times)
+        delay = self._restart_delay(attempt)
+        self._restart_times.append(now)
+        self.restart_count += 1
+        self.status = "restarting"
+        self.append_log(f"[hub] restarting {self.name} in {delay:.1f}s (attempt {attempt + 1}/{max_attempts})")
+        self._restart_task = asyncio.create_task(self._restart_after(delay))
+
+    async def _restart_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self._stopping:
+            return
+        try:
+            await self._spawn()
+        except Exception as exc:  # noqa: BLE001 - a failed respawn counts as one more failed attempt
+            self.append_log(f"[hub] restart of {self.name} failed: {exc}")
+            self._schedule_restart()
+
+    def _cancel_restart(self) -> None:
+        task, self._restart_task = self._restart_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     # -- services (non-MCP long-running processes) -------------------------
 
@@ -533,6 +608,7 @@ class ManagedServer:
         stop() in a sequential `stop_all()`).
         """
         self._stopping = True
+        self._cancel_restart()
         if self._health_task is not None:
             self._health_task.cancel()
             self._health_task = None
@@ -632,6 +708,8 @@ class HubManager:
                 entry["builtin"] = True  # owned by the GUI's Rizzo Flow tab
             if s.config.is_service and s.config.effective_port is not None:
                 entry["port"] = s.config.effective_port
+            if s.restart_count:
+                entry["restarts"] = s.restart_count
             snapshot[name] = entry
         return snapshot
 

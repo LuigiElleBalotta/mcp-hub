@@ -55,6 +55,7 @@ def _server_config(concurrency: str) -> ServerConfig:
         args=[FAKE_SERVER],
         env={},
         concurrency=concurrency,
+        restart="never",  # these tests exercise the dead-upstream paths themselves
     )
 
 

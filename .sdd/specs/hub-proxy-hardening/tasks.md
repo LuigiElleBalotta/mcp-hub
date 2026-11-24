@@ -12,7 +12,7 @@
   - Done in `session.py` + `manager._route_progress/_route_server_request` + `hub_app.handle_message`. The hub answers a server `ping` itself. A cancel for an unknown/finished/foreign id is dropped. Limitation: a cancel for a request still queued behind an exclusive guard is dropped too (not yet dispatched, so not in the table); the request then runs.
   - Found while testing (pre-existing): on an `exclusive` server, notifications and the client's answers to server requests also went through the guard, so an answer to a roots/sampling question deadlocked behind the very call asking it. They now bypass the guard (they take no turn). Verified by disabling the fix: the test times out.
 - [x] 5. Hub-owned handshake and initialize cache
-- [ ] 6. Auto-restart supervisor with backoff, circuit breaker, `restarting` status
+- [x] 6. Auto-restart supervisor with backoff, circuit breaker, `restarting` status
 - [ ] 7. Health ping loop wired to the restart policy
 - [ ] 8. GUI: settings dialog (allow-lists, generate token), server dialog (restart/health fields), `restarting` status
 - [ ] 9. Docs: README (EN+IT) security section and restart/health settings, `config.example.json`

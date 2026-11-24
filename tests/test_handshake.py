@@ -17,7 +17,7 @@ FAKE_SERVER = str(Path(__file__).parent / "fixtures" / "fake_stdio_server.py")
 
 
 async def _start(env: dict | None = None, concurrency: str = "parallel") -> ManagedServer:
-    cfg = ServerConfig(enabled=True, command=sys.executable, args=[FAKE_SERVER], env=env or {}, concurrency=concurrency)
+    cfg = ServerConfig(enabled=True, command=sys.executable, args=[FAKE_SERVER], env=env or {}, concurrency=concurrency, restart="never")
     server = ManagedServer("fake", cfg)
     await server.start()
     return server
