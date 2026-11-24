@@ -124,3 +124,11 @@ def test_client_returns_metrics_or_none_for_an_old_hub():
     assert _client_answering(200, "application/json", b'{"pid": 1}').metrics("x") == {"pid": 1}
     assert _client_answering(404, "text/plain", b"Not Found").metrics("x") is None, "a hub without the route"
     assert _client_answering(404, "application/json", b'{"error": "unknown server: x"}').metrics("x") is None
+
+
+def test_only_an_isolated_server_shows_its_session_count_in_details(window):
+    statuses = {"shared": {**STATUSES["gitlab"], "sessions": 3},
+                "iso": {"status": "running", "concurrency": "isolated", "type": "mcp", "sessions": 2}}
+    window._on_status_result(True, statuses, None)
+    assert window.table.item(_row(window, "shared"), 3).text() == "parallel", "no '(3)': it has its own column"
+    assert window.table.item(_row(window, "iso"), 3).text() == "isolated (2)"

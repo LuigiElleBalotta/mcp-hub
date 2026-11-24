@@ -525,7 +525,7 @@ class MainWindow(QMainWindow):
                 details = f"HTTP :{port}" if port is not None else "process"
             else:
                 details = info["concurrency"]
-                if info.get("sessions") is not None:  # an isolated server: one process per session
+                if details == "isolated" and info.get("sessions") is not None:  # one process per session
                     details = f"{details} ({info['sessions']})"
             self.table.setItem(row, 3, QTableWidgetItem(details))
             for col, text in zip((COL_CALLS, COL_P95, COL_SESSIONS), dashboard_cells(info, is_service)):
