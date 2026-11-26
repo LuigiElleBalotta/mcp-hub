@@ -1,4 +1,6 @@
+import os
 import sys
+from pathlib import Path
 import pytest
 
 from mcp_hub import self_update
@@ -113,3 +115,48 @@ def test_download_into_fresh_dir_succeeds_while_an_old_exe_is_locked(tmp_path):
         assert running.exists()  # the locked one is left alone
     finally:
         k32.CloseHandle(ctypes.c_void_p(handle))
+
+
+# ------------------------------------------------- the REAL helper, a real PowerShell, on Windows
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the updater swaps exes with a PowerShell helper (Windows)")
+def test_the_real_helper_replaces_both_exes_and_relaunches_them(tmp_path, monkeypatch):
+    """Found live on 1.3.1 -> 1.3.2: the helper was launched DETACHED_PROCESS, PowerShell never ran
+    the script, and the update silently did nothing. This runs the actual helper: no mocks between
+    `apply_update` and the exes landing in the install folder."""
+    import shutil
+    import time
+
+    from mcp_hub import self_update
+    from mcp_hub.updater import UpdateInfo
+
+    whoami = Path(os.environ["SystemRoot"]) / "System32" / "whoami.exe"  # a harmless real exe
+    new_dir = tmp_path / "release"
+    new_dir.mkdir()
+    for name in (self_update.HUB_EXE_NAME, self_update.GUI_EXE_NAME):
+        shutil.copy2(whoami, new_dir / name)
+        with open(new_dir / name, "ab") as f:
+            f.write(b"NEWVERSION")  # trailing bytes: a different file that still runs
+    install = tmp_path / "install"
+    install.mkdir()
+    for name in (self_update.HUB_EXE_NAME, self_update.GUI_EXE_NAME):
+        (install / name).write_bytes(b"OLD")
+
+    monkeypatch.setattr(self_update, "download_asset",
+                        lambda url, dest, fetch=None: shutil.copy2(url, dest))  # `url` is a local path here
+    monkeypatch.setattr(self_update, "_current_pid", lambda: 0)  # no GUI process to wait for
+    info = UpdateInfo("9.9.9", "http://x", False, {
+        self_update.HUB_EXE_NAME: str(new_dir / self_update.HUB_EXE_NAME),
+        self_update.GUI_EXE_NAME: str(new_dir / self_update.GUI_EXE_NAME)})
+    work = tmp_path / "work"
+    self_update.apply_update(info, hub_pid=0, work_dir=work,
+                             hub_exe=install / self_update.HUB_EXE_NAME, gui_exe=install / self_update.GUI_EXE_NAME)
+
+    log = work / "apply_update.log"
+    deadline = time.time() + 30
+    while time.time() < deadline and not (log.exists() and "started gui" in log.read_text(encoding="utf-8")):
+        time.sleep(0.2)
+    text = log.read_text(encoding="utf-8") if log.exists() else "(the helper never wrote its log)"
+    assert "replace: hub=True gui=True" in text and "started hub" in text and "started gui" in text, text
+    for name in (self_update.HUB_EXE_NAME, self_update.GUI_EXE_NAME):
+        assert (install / name).read_bytes() == (new_dir / name).read_bytes()

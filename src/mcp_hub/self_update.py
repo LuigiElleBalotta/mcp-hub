@@ -32,6 +32,17 @@ GUI_EXE_NAME = "mcp-hub-gui.exe"
 # JOB_OBJECT_LIMIT_BREAKAWAY_OK to false).
 _DETACHED_FLAGS = 0x00000200 | 0x00000008 | 0x01000000
 
+# The update helper is a POWERSHELL script, and powershell.exe will not run one when it is
+# created DETACHED_PROCESS (no console at all): the process starts, exits, and the script
+# never executes its first line -- no log, no replace, no relaunch, no error. Found live on
+# 1.3.1 -> 1.3.2 ("Installa e riavvia": downloaded, both programs closed, nothing came back,
+# the install dir untouched, no apply_update.log), and reproduced by launching a probe script
+# with each flag combination: every one containing DETACHED_PROCESS fails, every one without
+# it runs. CREATE_NO_WINDOW gives PowerShell a console nobody sees, and together with
+# CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB the helper still outlives its parent,
+# also when the GUI was started by Task Scheduler (checked).
+_HELPER_FLAGS = 0x00000200 | 0x08000000 | 0x01000000
+
 _HELPER_SCRIPT = """\
 param(
     [int]$HubPid,
@@ -206,14 +217,14 @@ def fresh_staging_dir(root: Path, version: str) -> Path:
     return work
 
 
-def launch_detached(args: list[str]) -> subprocess.Popen:
+def launch_detached(args: list[str], flags: int | None = None) -> subprocess.Popen:
     """Starts `args` independent of this process's console/job, so it keeps
     running (or, for the update helper, keeps waiting) after this process
     exits. Shared by `apply_update`'s helper launch and the GUI's first-run
     wizard, which needs to start the hub the same detached way after
     writing a fresh config.json."""
     if sys.platform == "win32":
-        return subprocess.Popen(args, creationflags=_DETACHED_FLAGS, close_fds=True)
+        return subprocess.Popen(args, creationflags=_DETACHED_FLAGS if flags is None else flags, close_fds=True)
     return subprocess.Popen(args, start_new_session=True, close_fds=True,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -255,7 +266,7 @@ def apply_update(
         "-NewGuiExe", str(new_gui),
         "-TargetHubExe", str(hub_exe),
         "-TargetGuiExe", str(gui_exe),
-    ])
+    ], flags=_HELPER_FLAGS)
 
 
 def _current_pid() -> int:

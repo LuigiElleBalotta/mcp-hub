@@ -50,6 +50,13 @@ class _Endpoints:
         self.streamable = StreamableSessions(managed)
 
 
+class _ResponseAlreadySent(Response):
+    """A response whose bytes were already written elsewhere: sends nothing."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        return None
+
+
 def _mount_for(name: str, endpoints: _Endpoints) -> Mount:
     managed = endpoints.managed
     transport = endpoints.sse
@@ -71,7 +78,12 @@ def _mount_for(name: str, endpoints: _Endpoints) -> Mount:
                 await _proxy(read, write, upstream)
         finally:
             await managed.release_session_upstream(upstream)
-        return Response()  # avoids a TypeError on client disconnect (Task 2 spike finding)
+        # Starlette needs a callable to return (None raises a TypeError on client disconnect:
+        # Task 2 spike finding), but `connect_sse` already sent the WHOLE response through the
+        # raw ASGI send. A real Response() would send a second one, which uvicorn rejects
+        # ("Unexpected ASGI message 'http.response.start' ... after response already completed")
+        # whenever the hub ends the stream while the connection is still open, e.g. on shutdown.
+        return _ResponseAlreadySent()
 
     return Mount(f"/{name}", routes=[
         Route("/sse", endpoint=handle_sse, methods=["GET"]),
