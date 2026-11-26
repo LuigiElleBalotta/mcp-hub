@@ -1066,6 +1066,8 @@ class HubManager:
                 entry["port"] = s.config.effective_port
             if s.restart_count:
                 entry["restarts"] = s.restart_count
+            if not s.config.enabled:
+                entry["enabled"] = False  # only when off: an older GUI never sees the field
             if s.metrics.enabled and not s.config.is_service:
                 detail = s.metrics_detail()
                 entry.update({k: detail[k] for k in ("pid", "uptime", "sessions", "inFlight", "calls", "errors",

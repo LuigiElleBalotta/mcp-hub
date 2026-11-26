@@ -482,6 +482,8 @@ a cui instradare la prima volta.
   la GUI **chiede** anche con una finestra: *Installa e riavvia*, *Più tardi*
   o *Salta questa versione* (ricordata). Chiede una sola volta per versione
   e per avvio, ricontrolla ogni 6 ore e non installa mai senza risposta.
+  Il pulsante **Cerca aggiornamenti** (in basso, accanto alla versione) controlla subito,
+  anche con il controllo automatico spento, e dice se sei aggiornato o se il controllo è fallito.
 - **Installa e riavvia** (mostrato solo eseguendo l'`.exe` compilato, non
   `python -m mcp_hub.gui`, e solo quando la release ha entrambi gli asset
   exe): un click scarica `mcp-hub.exe`/`mcp-hub-gui.exe` per la nuova

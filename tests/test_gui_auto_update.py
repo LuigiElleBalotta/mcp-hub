@@ -132,3 +132,39 @@ def test_skip_helpers_create_the_folder_and_survive_an_unwritable_one(tmp_path, 
 
 def test_the_gui_rechecks_for_updates_periodically(window):
     assert window._update_timer.isActive() and window._update_timer.interval() == mw.UPDATE_RECHECK_MS
+
+
+# ------------------------------------------------------------------ the manual button
+
+def test_manual_check_says_up_to_date_failed_or_found(window, answer):
+    import mcp_hub
+    window._on_manual_update_result(None, "")
+    assert mcp_hub.__version__ in window.update_status.text() and "aggiornato" in window.update_status.text()
+    assert window.check_update_btn.isEnabled()
+
+    window._on_manual_update_result(None, "timed out")
+    assert "non riuscito" in window.update_status.text() and "timed out" in window.update_status.text(), \
+        "a failed check must not claim you are up to date"
+    assert answer["shown"] == 0
+
+
+def test_manual_check_asks_again_even_for_a_skipped_or_already_offered_version(window, answer):
+    skip_update_version("9.9.9")
+    window._offered_version = "9.9.9"
+    window._on_manual_update_result(UpdateInfo("9.9.9", "http://x/rel", False, dict(ASSETS)), "")
+    QCoreApplication.processEvents()
+    assert "9.9.9" in window.update_status.text()
+    assert answer["shown"] == 1, "the user asked: the dialog is shown despite the earlier 'skip'"
+
+
+def test_the_button_runs_the_check_off_the_gui_thread_and_reports(window, qapp, monkeypatch):
+    import time
+    monkeypatch.setattr(mw, "check_for_update_ex", lambda current, include_beta=False: (None, None))
+    window.check_update_btn.click()
+    assert not window.check_update_btn.isEnabled() and "in corso" in window.update_status.text()
+    for _ in range(200):
+        qapp.processEvents()
+        if window.check_update_btn.isEnabled():
+            break
+        time.sleep(0.01)
+    assert window.check_update_btn.isEnabled() and "aggiornato" in window.update_status.text()

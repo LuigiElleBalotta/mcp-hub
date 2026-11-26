@@ -131,6 +131,14 @@ def management_routes(
             server = manager.get(name)
         except KeyError:
             return _unknown(name)
+        if not server.config.enabled and not server.config.is_service:
+            # An MCP server's endpoints are only served while it is enabled, so a process
+            # started anyway would run but answer 404 to every client. (A group's start
+            # already refuses it the same way.)
+            return JSONResponse({
+                "error": f"server '{name}' is disabled: enable it first (its endpoints are not served while it is disabled)",
+                "status": server.status,
+            }, status_code=409)
         await server.start()
         return JSONResponse({"status": server.status})
 

@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from mcp_hub.gui.api_client import HubApiClient
-from mcp_hub.updater import UpdateInfo, check_for_update
+from mcp_hub.updater import UpdateInfo, check_for_update, check_for_update_ex
 
 COLUMNS = ["Server", "Type", "Status", "Details", "Chiamate/min", "p95", "Sessioni", "Actions"]
 COL_CALLS, COL_P95, COL_SESSIONS, ACTIONS_COL = 4, 5, 6, 7
@@ -71,6 +71,20 @@ class _UpdateCheckWorker(QThread):
     def run(self) -> None:
         import mcp_hub
         self.found.emit(check_for_update(mcp_hub.__version__, include_beta=self._include_beta))
+
+
+class _ManualUpdateCheckWorker(QThread):
+    """The button's check: unlike the automatic one it reports a failure instead of staying silent."""
+    done = Signal(object, str)  # (UpdateInfo | None, error text or "")
+
+    def __init__(self, include_beta: bool, parent=None):
+        super().__init__(parent)
+        self._include_beta = include_beta
+
+    def run(self) -> None:
+        import mcp_hub
+        info, error = check_for_update_ex(mcp_hub.__version__, include_beta=self._include_beta)
+        self.done.emit(info, error or "")
 
 
 class _QuitWorker(QThread):
@@ -301,7 +315,17 @@ class MainWindow(QMainWindow):
 
         version_label = QLabel(f"mcp-hub v{mcp_hub.__version__}")
         version_label.setStyleSheet("color: #888; padding: 2px 4px;")
-        layout.addWidget(version_label)
+        self.check_update_btn = QPushButton("Cerca aggiornamenti")
+        self.check_update_btn.setFlat(True)
+        self.check_update_btn.setToolTip("Controlla subito se c'e' una versione piu' recente su GitHub")
+        self.check_update_btn.clicked.connect(self._check_updates_now)
+        self.update_status = QLabel("")
+        self.update_status.setStyleSheet("color: #888;")
+        version_row = QHBoxLayout()
+        version_row.addWidget(version_label)
+        version_row.addWidget(self.check_update_btn)
+        version_row.addWidget(self.update_status, 1)
+        layout.addLayout(version_row)
 
         self.tabs.addTab(servers_page, "Server")
         from mcp_hub.gui.rizzo_panel import RizzoPanel
@@ -408,7 +432,33 @@ class MainWindow(QMainWindow):
         self._update_thread.found.connect(self._on_update_check_result)
         self._update_thread.start()
 
-    def _on_update_check_result(self, info: UpdateInfo | None) -> None:
+    def _check_updates_now(self) -> None:
+        """The "Cerca aggiornamenti" button: checks right away, whatever `checkForUpdates` says
+        (that switch is about the automatic check), and always answers on screen."""
+        from mcp_hub.config import load_config
+        try:
+            include_beta = load_config().hub.includeBetaUpdates
+        except (OSError, ValueError, TypeError):
+            include_beta = False
+        self.check_update_btn.setEnabled(False)
+        self.update_status.setText("Controllo in corso...")
+        self._manual_thread = _ManualUpdateCheckWorker(include_beta, self)
+        self._manual_thread.done.connect(self._on_manual_update_result)
+        self._manual_thread.start()
+
+    def _on_manual_update_result(self, info: UpdateInfo | None, error: str) -> None:
+        import mcp_hub
+        self.check_update_btn.setEnabled(True)
+        if error:
+            self.update_status.setText(f"Controllo non riuscito: {error}")
+        elif info is None:
+            self.update_status.setText(f"Sei aggiornato (v{mcp_hub.__version__}).")
+        else:
+            self.update_status.setText(f"Disponibile: {info.version}")
+            # Asked for explicitly: ask again even if this version was declined or skipped before.
+            self._on_update_check_result(info, force=True)
+
+    def _on_update_check_result(self, info: UpdateInfo | None, force: bool = False) -> None:
         if info is None:
             return
         self._pending_update = info
@@ -430,7 +480,8 @@ class MainWindow(QMainWindow):
 
         # Ask, once per version: the user answers "now", "later" or "skip this version".
         # Never installs by itself. A hidden (tray) window still shows the dialog.
-        if can_auto_install and info.version != self._offered_version and info.version != skipped_update_version():
+        if can_auto_install and (force or (
+                info.version != self._offered_version and info.version != skipped_update_version())):
             self._offered_version = info.version
             QTimer.singleShot(0, self._offer_update)
 
@@ -577,8 +628,13 @@ class MainWindow(QMainWindow):
             is_service = info.get("type", "mcp") == "service"
             self.table.setItem(row, 0, QTableWidgetItem(name))
             self.table.setItem(row, 1, QTableWidgetItem("Service" if is_service else "MCP"))
-            status_item = QTableWidgetItem(status)
+            disabled = info.get("enabled", True) is False and not is_service
+            # A disabled MCP server serves no endpoints (404) and does not start with the hub.
+            status_item = QTableWidgetItem(f"{status} · disabilitato" if disabled else status)
             status_item.setForeground(QColor(_STATUS_COLOR.get(status, "#000000")))
+            if disabled:
+                status_item.setToolTip("Disabilitato: non parte con l'hub e i suoi endpoint non rispondono. "
+                                       "Usa Abilita (o Edit) per riattivarlo.")
             if info.get("restarts"):
                 status_item.setToolTip(f"Riavviato automaticamente {info['restarts']} volte dall'avvio dell'hub")
             self.table.setItem(row, 2, status_item)
@@ -607,11 +663,16 @@ class MainWindow(QMainWindow):
             # up now. An isolated server has no shared process to start.
             isolated = info.get("concurrency") == "isolated" and not is_service
             start_btn.setEnabled(not busy and not isolated and status in ("stopped", "crashed", "idle"))
+            if disabled:  # starting it would run a process nobody can reach: enable it instead
+                start_btn.setText("Abilita")
+                start_btn.setToolTip("Abilita il server e lo avvia.")
+                start_btn.setEnabled(not busy)
             # "restarting": Stop cancels the pending automatic restart.
             stop_btn.setEnabled(not busy and status in ("starting", "running", "restarting"))
             edit_btn = QPushButton("Edit")
             remove_btn = QPushButton("Remove")
-            start_btn.clicked.connect(lambda _, n=name: self._start(n))
+            start_btn.clicked.connect(
+                (lambda _, n=name: self._enable(n)) if disabled else (lambda _, n=name: self._start(n)))
             stop_btn.clicked.connect(lambda _, n=name: self._stop(n))
             edit_btn.clicked.connect(lambda _, n=name: self._edit(n))
             remove_btn.clicked.connect(lambda _, n=name: self._remove(n))
@@ -676,6 +737,23 @@ class MainWindow(QMainWindow):
 
     def _stop(self, name: str) -> None:
         self._run_action(self.client.stop, name)
+
+    def _enable(self, name: str) -> None:
+        """Turns a disabled server on (the hub mounts its endpoints and starts it). The whole
+        stored config is sent back with only `enabled` changed, so nothing else is lost."""
+        from dataclasses import asdict
+        from mcp_hub.config import load_config
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            stored = load_config().servers.get(name)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, name, f"Non riesco a leggere la configurazione: {exc}")
+            return
+        if stored is None:
+            QMessageBox.warning(self, name, "Server non trovato nella configurazione.")
+            return
+        config = {**asdict(stored), "enabled": True}
+        self._run_action(lambda n: self.client.upsert(n, config), name)
 
     def _run_action(self, action, name: str) -> None:
         if name in self._busy:
