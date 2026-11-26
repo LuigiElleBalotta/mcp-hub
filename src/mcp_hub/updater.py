@@ -40,15 +40,27 @@ def check_for_update(
     include_beta: bool = False,
     fetch: Callable[[str], httpx.Response] = _default_fetch,
 ) -> UpdateInfo | None:
+    """The newest release above `current_version`, or None (up to date, or the check failed)."""
+    return check_for_update_ex(current_version, include_beta, fetch)[0]
+
+
+def check_for_update_ex(
+    current_version: str,
+    include_beta: bool = False,
+    fetch: Callable[[str], httpx.Response] = _default_fetch,
+) -> tuple[UpdateInfo | None, str | None]:
+    """Like `check_for_update`, but tells "up to date" (None, None) from "could not check"
+    (None, reason): a manual "check for updates" button must not say "you are up to date"
+    when GitHub was simply unreachable."""
     current_key = _version_key(current_version)
     if current_key is None:
-        return None
+        return None, f"versione corrente non riconosciuta: {current_version}"
     try:
         response = fetch(_RELEASES_URL)
         response.raise_for_status()
         releases = response.json()
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, str(exc) or exc.__class__.__name__
 
     best_key = None
     best_release = None
@@ -65,7 +77,7 @@ def check_for_update(
             best_release = release
 
     if best_release is None:
-        return None
+        return None, None
     assets = {
         a["name"]: a["browser_download_url"]
         for a in best_release.get("assets", [])
@@ -76,7 +88,7 @@ def check_for_update(
         url=best_release["html_url"],
         prerelease=bool(best_release["prerelease"]),
         assets=assets,
-    )
+    ), None
 
 
 def download_asset(

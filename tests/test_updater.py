@@ -94,3 +94,19 @@ def test_download_asset_writes_content_and_leaves_no_partial_file(tmp_path):
 
     assert dest.read_bytes() == b"exe-bytes"
     assert list(tmp_path.glob("*.part")) == []
+
+
+def test_check_for_update_ex_tells_up_to_date_from_could_not_check():
+    import httpx
+    from mcp_hub.updater import check_for_update_ex
+
+    def ok(url):
+        return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+
+    def boom(url):
+        raise httpx.ConnectError("no network")
+
+    assert check_for_update_ex("1.3.1", fetch=ok) == (None, None)
+    info, error = check_for_update_ex("1.3.1", fetch=boom)
+    assert info is None and "no network" in error
+    assert check_for_update_ex("garbage", fetch=ok)[1], "an unparseable current version is reported, not 'up to date'"

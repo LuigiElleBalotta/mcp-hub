@@ -496,6 +496,8 @@ the first time.
 - **Update prompt**: when the app can update itself (see below) the GUI also *asks*
   in a dialog: *Installa e riavvia*, *Più tardi* or *Salta questa versione* (remembered).
   It asks once per version per run, re-checks every 6 hours, and never installs without an answer.
+  The **Cerca aggiornamenti** button (bottom, next to the version) checks right away, even with
+  the automatic check off, and says whether you are up to date or the check failed.
 - **Update banner**: if a newer version is published on GitHub Releases
   (and `hub.checkForUpdates` is true), a banner appears with a link to
   download it.
