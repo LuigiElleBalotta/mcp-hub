@@ -32,6 +32,11 @@ class ServerDialog(QDialog):
         self._registry_enabled = registry_enabled and not existing
 
         self.name_edit = QLineEdit(name)
+        # A new server is enabled; an existing one keeps what it has. result_config() used to
+        # hard-code True, so saving a disabled server in this dialog silently re-enabled it
+        # and nothing in the GUI could disable one.
+        self.enabled_check = QCheckBox("Abilitato (parte con l'hub ed espone i suoi endpoint)")
+        self.enabled_check.setChecked(bool(existing.get("enabled", True)))
         self.command_edit = QLineEdit(existing.get("command", ""))
         self.args_edit = QLineEdit(" ".join(existing.get("args", [])))
         self.concurrency_combo = QComboBox()
@@ -128,6 +133,7 @@ class ServerDialog(QDialog):
         self._form = form
         form.addRow("Type", self.type_combo)
         form.addRow("Name", self.name_edit)
+        form.addRow("", self.enabled_check)
         form.addRow("Command", self.command_edit)
         form.addRow("Args (space-separated)", self.args_edit)
         form.addRow("Concurrency", self.concurrency_combo)
@@ -289,7 +295,7 @@ class ServerDialog(QDialog):
             "args": self.args_edit.text().split(),
             "env": env,
             "concurrency": self.concurrency_combo.currentText(),
-            "enabled": True,
+            "enabled": self.enabled_check.isChecked(),
         }
         if not self.is_service():
             config.update({

@@ -97,7 +97,11 @@ class HubApiClient:
         return self._client.get("/api/status").json()["servers"]
 
     def start(self, name: str) -> str:
-        return self._client.post(f"/api/servers/{name}/start", timeout=_SLOW_TIMEOUT).json()["status"]
+        response = self._client.post(f"/api/servers/{name}/start", timeout=_SLOW_TIMEOUT)
+        data = response.json()
+        if response.status_code >= 400:  # e.g. 409: the server is disabled
+            raise RuntimeError(data.get("error") or f"HTTP {response.status_code}")
+        return data["status"]
 
     def stop(self, name: str) -> str:
         # A service stop kills the process tree and then waits (up to ~10s)

@@ -577,8 +577,13 @@ class MainWindow(QMainWindow):
             is_service = info.get("type", "mcp") == "service"
             self.table.setItem(row, 0, QTableWidgetItem(name))
             self.table.setItem(row, 1, QTableWidgetItem("Service" if is_service else "MCP"))
-            status_item = QTableWidgetItem(status)
+            disabled = info.get("enabled", True) is False and not is_service
+            # A disabled MCP server serves no endpoints (404) and does not start with the hub.
+            status_item = QTableWidgetItem(f"{status} · disabilitato" if disabled else status)
             status_item.setForeground(QColor(_STATUS_COLOR.get(status, "#000000")))
+            if disabled:
+                status_item.setToolTip("Disabilitato: non parte con l'hub e i suoi endpoint non rispondono. "
+                                       "Usa Abilita (o Edit) per riattivarlo.")
             if info.get("restarts"):
                 status_item.setToolTip(f"Riavviato automaticamente {info['restarts']} volte dall'avvio dell'hub")
             self.table.setItem(row, 2, status_item)
@@ -607,11 +612,16 @@ class MainWindow(QMainWindow):
             # up now. An isolated server has no shared process to start.
             isolated = info.get("concurrency") == "isolated" and not is_service
             start_btn.setEnabled(not busy and not isolated and status in ("stopped", "crashed", "idle"))
+            if disabled:  # starting it would run a process nobody can reach: enable it instead
+                start_btn.setText("Abilita")
+                start_btn.setToolTip("Abilita il server e lo avvia.")
+                start_btn.setEnabled(not busy)
             # "restarting": Stop cancels the pending automatic restart.
             stop_btn.setEnabled(not busy and status in ("starting", "running", "restarting"))
             edit_btn = QPushButton("Edit")
             remove_btn = QPushButton("Remove")
-            start_btn.clicked.connect(lambda _, n=name: self._start(n))
+            start_btn.clicked.connect(
+                (lambda _, n=name: self._enable(n)) if disabled else (lambda _, n=name: self._start(n)))
             stop_btn.clicked.connect(lambda _, n=name: self._stop(n))
             edit_btn.clicked.connect(lambda _, n=name: self._edit(n))
             remove_btn.clicked.connect(lambda _, n=name: self._remove(n))
@@ -676,6 +686,23 @@ class MainWindow(QMainWindow):
 
     def _stop(self, name: str) -> None:
         self._run_action(self.client.stop, name)
+
+    def _enable(self, name: str) -> None:
+        """Turns a disabled server on (the hub mounts its endpoints and starts it). The whole
+        stored config is sent back with only `enabled` changed, so nothing else is lost."""
+        from dataclasses import asdict
+        from mcp_hub.config import load_config
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            stored = load_config().servers.get(name)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, name, f"Non riesco a leggere la configurazione: {exc}")
+            return
+        if stored is None:
+            QMessageBox.warning(self, name, "Server non trovato nella configurazione.")
+            return
+        config = {**asdict(stored), "enabled": True}
+        self._run_action(lambda n: self.client.upsert(n, config), name)
 
     def _run_action(self, action, name: str) -> None:
         if name in self._busy:
